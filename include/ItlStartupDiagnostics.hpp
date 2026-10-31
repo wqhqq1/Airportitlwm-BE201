@@ -4,6 +4,13 @@
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
 #include <kern/clock.h>
+#include <pexpert/pexpert.h>
+
+inline bool ItlDiagnosticFlag(const char *name)
+{
+    int enabled = 0;
+    return PE_parse_boot_argn(name, &enabled, sizeof(enabled)) && enabled == 1;
+}
 
 // Persist startup state on the PCI provider: a controller that fails start()
 // may disappear before a user can inspect it. Do not log network payloads.
@@ -12,6 +19,8 @@ inline void ItlStartupStage(IOService *provider, const char *stage)
     if (!provider || !stage)
         return;
     provider->setProperty("ItlwmStartupStage", stage);
+    if (!ItlDiagnosticFlag("be201_diag"))
+        return;
     // Last uptime at each checkpoint survives ring-buffer rollover. This
     // helper is used on startup/workloop paths, never the interrupt filter.
     char key[96] = "ItlwmStageTime";
@@ -49,7 +58,8 @@ inline void ItlStartupResult(IOService *provider, const char *result)
         provider->removeProperty("ItlwmStartupError");
     }
     provider->setProperty("ItlwmStartupResult", result);
-    IOLog("itlwm startup result: %s\n", result);
+    if (ItlDiagnosticFlag("be201_diag"))
+        IOLog("itlwm startup result: %s\n", result);
 }
 
 inline void ItlStartupFailure(IOService *provider, const char *checkpoint, int error)

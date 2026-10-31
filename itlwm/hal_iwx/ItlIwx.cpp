@@ -112,6 +112,7 @@
 #include "ItlIwx.hpp"
 #include "ItlStartupDiagnostics.hpp"
 #include "iwx_boot_checks.h"
+#include "ItlFirmwareEnvelope.hpp"
 #include <linux/types.h>
 
 /* Retained timestamps; no allocation or property publication in IRQ actions. */
@@ -1606,6 +1607,12 @@ iwx_read_firmware(struct iwx_softc *sc)
         err = EINVAL;
         goto out;
     }
+    if (!ItlFirmwareEnvelopeValid(
+            static_cast<const uint8_t *>(fw->fw_rawdata) + sizeof(*uhdr),
+            fw->fw_rawsize - sizeof(*uhdr))) {
+        err = EINVAL;
+        goto out;
+    }
     XYLog("load firmware %s done\n", sc->sc_fwname);
     
     sc->sc_capaflags = 0;
@@ -2379,7 +2386,7 @@ iwx_read_pnvm(struct iwx_softc *sc)
     sc->sc_pcitag->setProperty("ItlwmPnvmInflateCap", inflate_cap, 32);
     sc->sc_pcitag->setProperty("ItlwmPnvmInflatedLength",
         static_cast<UInt32>(fw->pnvm_rawsize), 32);
-    if (!inflated) {
+    if (!inflated || !ItlFirmwareEnvelopeValid(fw->pnvm_rawdata, fw->pnvm_rawsize)) {
         err = EINVAL;
         sc->sc_pcitag->setProperty("ItlwmPnvmFailStep", static_cast<UInt32>(3), 32);
         goto out;
@@ -2411,6 +2418,10 @@ iwx_read_pnvm(struct iwx_softc *sc)
         }
 
         if (tlv_type == IWX_UCODE_TLV_PNVM_SKU) {
+            if (tlv_len != sizeof(struct iwx_sku_id)) {
+                err = EINVAL;
+                goto out;
+            }
             struct iwx_sku_id *sku_id =
                 (struct iwx_sku_id *)(data + sizeof(*tlv));
 
@@ -15944,6 +15955,11 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
         if (msix_setup == kIOReturnSuccess) {
             sc->sc_msix = 1;
             XYLog("msix intr mode\n");
+        } else {
+            // BZ cannot receive firmware RX through the legacy MSI path.
+            // Fail before any interrupt source or firmware DMA is started.
+            ItlStartupFailure(sc->sc_pcitag, "hal:pci-configure-msix", msix_setup);
+            return false;
         }
     }
     if (!sc->sc_msix && (err = pci_intr_map_msi(pa, &sc->ih))) {

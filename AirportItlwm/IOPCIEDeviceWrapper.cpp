@@ -61,10 +61,14 @@ probe(IOService *provider, SInt32 *score)
     XYLog("%s\n", __PRETTY_FUNCTION__);
     bool isMatch = false;
     super::probe(provider, score);
-    UInt8 msiCap;
-    UInt8 msixCap;
+    UInt8 msiCap = 0;
+    UInt8 msixCap = 0;
     IOPCIDevice* device = OSDynamicCast(IOPCIDevice, provider);
     if (!device)
+        return NULL;
+    // This build is qualified only for the local BE201 PCI function.
+    if (device->configRead16(kIOPCIConfigVendorID) != 0x8086 ||
+        device->configRead16(kIOPCIConfigDeviceID) != 0x7740)
         return NULL;
     if (ItlIwx::iwx_match(device)) {
         isMatch = true;

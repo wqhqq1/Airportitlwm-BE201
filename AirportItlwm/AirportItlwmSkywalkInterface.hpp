@@ -25,6 +25,9 @@ class AirportItlwmSkywalkInterface : public IO80211InfraProtocol {
     OSDeclareDefaultStructors(AirportItlwmSkywalkInterface)
     
 public:
+    // Instrument unsupported native requests without changing their ABI/result.
+    // IDs 0..5 are ranging; ID 6 is AWDL radio capability discovery.
+    IOReturn unsupportedContinuityRequest(unsigned id);
 #ifdef AIRPORT_WCL
     IOReturn getBSS_BLACKLIST(bss_blacklist*) override { return kIOReturnUnsupported; }
     IOReturn getHE_COUNTERS(apple80211_he_counters_ctl*) override { return kIOReturnUnsupported; }
@@ -175,9 +178,9 @@ public:
     virtual IOReturn getLEAKY_AP_STATS_MODE(apple80211_leaky_ap_setting *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getCOUNTRY_CHANNELS(apple80211_country_channel_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getPRIVATE_MAC(apple80211_private_mac_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-    virtual IOReturn getRANGING_ENABLE(apple80211_ranging_enable_request_t *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-    virtual IOReturn getRANGING_START(apple80211_ranging_start_request_t *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-    virtual IOReturn getAWDL_RSDB_CAPS(apple80211_rsdb_capability *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
+    virtual IOReturn getRANGING_ENABLE(apple80211_ranging_enable_request_t *) AIRPORT_SKYWALK_OVERRIDE { return unsupportedContinuityRequest(0); }
+    virtual IOReturn getRANGING_START(apple80211_ranging_start_request_t *) AIRPORT_SKYWALK_OVERRIDE { return unsupportedContinuityRequest(1); }
+    virtual IOReturn getAWDL_RSDB_CAPS(apple80211_rsdb_capability *) AIRPORT_SKYWALK_OVERRIDE { return unsupportedContinuityRequest(6); }
     virtual IOReturn getTKO_PARAMS(apple80211_tko_params *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getTKO_DUMP(apple80211_tko_dump *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
 #ifdef AIRPORT_WCL
@@ -193,7 +196,7 @@ public:
     virtual IOReturn getBTCOEX_2G_CHAIN_DISABLE(apple80211_btcoex_2g_chain_disable *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getPOWER_BUDGET(apple80211_power_budget_t *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getOFFLOAD_TCPKA_ENABLE(apple80211_offload_tcpka_enable_t *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-    virtual IOReturn getRANGING_CAPS(apple80211_ranging_capabilities_t *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
+    virtual IOReturn getRANGING_CAPS(apple80211_ranging_capabilities_t *) AIRPORT_SKYWALK_OVERRIDE { return unsupportedContinuityRequest(2); }
     virtual IOReturn getSUPPRESS_SCANS(apple80211_suppress_scans_t *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getHOST_AP_MODE_HIDDEN(apple80211_host_ap_mode_hidden_t *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getLQM_CONFIG(apple80211_lqm_config_t *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
@@ -320,9 +323,9 @@ public:
     virtual IOReturn setPRIVATE_MAC(apple80211_private_mac_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setRESET_CHIP(apple80211_reset_command *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setCRASH(apple80211_crash_command *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-    virtual IOReturn setRANGING_ENABLE(apple80211_ranging_enable_request_t *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-    virtual IOReturn setRANGING_START(apple80211_ranging_start_request_t *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-    virtual IOReturn setRANGING_AUTHENTICATE(apple80211_ranging_authenticate_request_t *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
+    virtual IOReturn setRANGING_ENABLE(apple80211_ranging_enable_request_t *) AIRPORT_SKYWALK_OVERRIDE { return unsupportedContinuityRequest(3); }
+    virtual IOReturn setRANGING_START(apple80211_ranging_start_request_t *) AIRPORT_SKYWALK_OVERRIDE { return unsupportedContinuityRequest(4); }
+    virtual IOReturn setRANGING_AUTHENTICATE(apple80211_ranging_authenticate_request_t *) AIRPORT_SKYWALK_OVERRIDE { return unsupportedContinuityRequest(5); }
     virtual IOReturn setTKO_PARAMS(apple80211_tko_params *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setBTCOEX_PROFILE(apple80211_btcoex_profile *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setBTCOEX_PROFILE_ACTIVE(apple80211_btcoex_profile_active_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
@@ -423,6 +426,7 @@ public:
     void handleWCLLink(bool);
     void completeWCLScan();
 private:
+    uint32_t be201ContinuityRequests[7] = {};
     static IOReturn wclCommand(OSObject *, void *, void *, void *, void *);
     struct CountryUpdate;
     static void wclCountryUpdateThread(void *, void *);

@@ -7,6 +7,7 @@
 //
 #include "AirportItlwmV2.hpp"
 #include "AirportItlwmSkywalkInterface.hpp"
+#include "ItlStartupDiagnostics.hpp"
 #include <sys/CTimeout.hpp>
 #include <libkern/c++/OSMetaClass.h>
 #include <crypto/sha1.h>
@@ -20,6 +21,26 @@ extern IOCommandGate *_fCommandGate;
 
 #define super IO80211InfraProtocol
 OSDefineMetaClassAndStructors(AirportItlwmSkywalkInterface, IO80211InfraProtocol);
+
+IOReturn AirportItlwmSkywalkInterface::unsupportedContinuityRequest(unsigned id)
+{
+#ifdef AIRPORT_WCL
+    if (id < 7 && instance && ItlDiagnosticFlag(id == 6 ?
+            "be201_awdl_diag" : "be201_ranging_diag")) {
+        const uint32_t count = __atomic_add_fetch(&be201ContinuityRequests[id],
+                                                  1U, __ATOMIC_RELAXED);
+        const char *names[7] = {
+            "BE201RangingGetEnableRequests", "BE201RangingGetStartRequests",
+            "BE201RangingGetCapsRequests", "BE201RangingSetEnableRequests",
+            "BE201RangingSetStartRequests", "BE201RangingAuthenticateRequests",
+            "BE201AWDLGetRadioCapsRequests"
+        };
+        instance->setProperty(names[id], count, 32);
+    }
+#endif
+    // No buffers, authentication data, capabilities or firmware state changed.
+    return kIOReturnUnsupported;
+}
 
 const char* hexdump(uint8_t *buf, size_t len) {
     ssize_t str_len = len * 3 + 1;

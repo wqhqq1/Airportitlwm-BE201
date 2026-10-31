@@ -70,11 +70,13 @@ void AirportItlwm::releaseAll()
             scanSource->release();
             scanSource = NULL;
         }
-        if (fWatchdogWorkLoop && watchdogTimer) {
-            watchdogTimer->cancelTimeout();
-            fWatchdogWorkLoop->removeEventSource(watchdogTimer);
-            watchdogTimer->release();
-            watchdogTimer = NULL;
+        if (fWatchdogWorkLoop) {
+            if (watchdogTimer) {
+                watchdogTimer->cancelTimeout();
+                fWatchdogWorkLoop->removeEventSource(watchdogTimer);
+                watchdogTimer->release();
+                watchdogTimer = NULL;
+            }
             fWatchdogWorkLoop->release();
             fWatchdogWorkLoop = NULL;
         }
@@ -140,7 +142,7 @@ bool AirportItlwm::init(OSDictionary *properties)
 {
     XYLog("%s\n", __PRETTY_FUNCTION__);
     bool ret = super::init(properties);
-    awdlSyncEnable = true;
+    awdlSyncEnable = false;
     power_state = 0;
     memset(geo_location_cc, 0, sizeof(geo_location_cc));
     return ret;
@@ -287,7 +289,10 @@ initCCLogs()
 bool AirportItlwm::start(IOService *provider)
 {
     ItlStartupResult(pciNub, "starting");
-    pciNub->setProperty("ItlwmStartupRevision", "be201-pure-bz-20261023");
+    pciNub->setProperty("ItlwmStartupRevision", "be201-local-ac-1.0.1");
+    pciNub->setProperty("BE201ProtocolLimit", "a/b/g/n/ac; HE/EHT disabled");
+    pciNub->setProperty("BE201AWDLStatus", "not implemented; disabled");
+    pciNub->setProperty("BE201RangingStatus", "not implemented; disabled");
     ItlStartupStage(pciNub, "controller-start");
 #if __IO80211_TARGET == __MAC_15_2
     if (version_major != 24 || version_minor < 2) {
@@ -358,8 +363,13 @@ bool AirportItlwm::start(IOService *provider)
     }
     ItlStartupStage(pciNub, "command-gate-add");
     const IOReturn gateAddResult = _fWorkloop->addEventSource(_fCommandGate);
-    // Keep the existing nonfatal handling; expose the previously ignored result.
     pciNub->setProperty("ItlwmStartupGateAddResult", static_cast<UInt32>(gateAddResult), 32);
+    if (gateAddResult != kIOReturnSuccess) {
+        ItlStartupFailure(pciNub, "command-gate-add", gateAddResult);
+        super::stop(provider);
+        releaseAll();
+        return false;
+    }
     ItlStartupStage(pciNub, "medium-setup");
     const IONetworkMedium *primaryMedium;
     if (!createMediumTables(&primaryMedium) ||
@@ -372,6 +382,12 @@ bool AirportItlwm::start(IOService *provider)
     ItlStartupStage(pciNub, "hal-controller-init");
     const bool halInitResult = fHalService->initWithController(this, _fWorkloop, _fCommandGate);
     pciNub->setProperty("ItlwmStartupHalInitResult", static_cast<UInt32>(halInitResult), 32);
+    if (!halInitResult) {
+        ItlStartupFailure(pciNub, "hal-controller-init", kIOReturnError);
+        super::stop(provider);
+        releaseAll();
+        return false;
+    }
     fHalService->get80211Controller()->ic_event_handler = eventHandler;
 
     if (PE_parse_boot_argn("-novht", &boot_value, sizeof(boot_value)))
@@ -380,9 +396,9 @@ bool AirportItlwm::start(IOService *provider)
         fHalService->get80211Controller()->ic_userflags |= IEEE80211_F_NOHT40;
 
 #ifdef AIRPORT_WCL
-    int he_enabled = 0;
-    if (PE_parse_boot_argn("itlwm_he", &he_enabled, sizeof(he_enabled)) && he_enabled == 1)
-        fHalService->get80211Controller()->ic_userflags |= IEEE80211_F_HEON;
+    // Keep this hardware-validation build in the VHT/ac path even if an old
+    // experimental itlwm_he argument remains in NVRAM.
+    fHalService->get80211Controller()->ic_userflags &= ~IEEE80211_F_HEON;
 #endif
 
     ItlStartupStage(pciNub, "hal-attach");
@@ -416,6 +432,13 @@ bool AirportItlwm::start(IOService *provider)
     }
     const IOReturn watchdogAddResult = fWatchdogWorkLoop->addEventSource(watchdogTimer);
     pciNub->setProperty("ItlwmStartupWatchdogAddResult", static_cast<UInt32>(watchdogAddResult), 32);
+    if (watchdogAddResult != kIOReturnSuccess) {
+        ItlStartupFailure(pciNub, "watchdog-timer-add", watchdogAddResult);
+        fHalService->detach(pciNub);
+        super::stop(provider);
+        releaseAll();
+        return false;
+    }
     ItlStartupStage(pciNub, "scan-timer-create");
     scanSource = IOTimerEventSource::timerEventSource(this, &fakeScanDone);
 #ifdef AIRPORT_WCL
