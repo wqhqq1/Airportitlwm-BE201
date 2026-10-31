@@ -4912,6 +4912,10 @@ static_assert(sizeof(struct iwx_mac_config_cmd) == 52,
 #define IWX_LINK_CONTEXT_MODIFY_BSS_COLOR_DISABLE (1 << 6)
 #define IWX_LINK_CONTEXT_MODIFY_EHT_PARAMS      (1 << 7)
 
+/* Linux v6.12 fw/api/mac-cfg.h LINK_CONTEXT_FLAG_E_VER_1. */
+#define IWX_LINK_FLG_BSS_COLOR_DIS              (1U << 0)
+#define IWX_LINK_FLG_MU_EDCA_CW                 (1U << 1)
+
 #define IWX_LINK_PROT_FLG_TGG_PROTECT   (1 << 0)
 #define IWX_LINK_PROT_FLG_HT_PROT       (1 << 1)
 #define IWX_LINK_PROT_FLG_FAT_PROT      (1 << 2)
@@ -4970,6 +4974,12 @@ struct iwx_link_config_cmd {
 
 static_assert(sizeof(struct iwx_link_config_cmd) == 208,
               "LINK_CONFIG_CMD v2 must be 208 bytes");
+static_assert(__offsetof(struct iwx_link_config_cmd, trig_based_txf) == 104,
+              "LINK_CONFIG_CMD v2 MU EDCA offset");
+static_assert(__offsetof(struct iwx_link_config_cmd, frame_time_rts_th) == 146,
+              "LINK_CONFIG_CMD v2 HE RTS offset");
+static_assert(__offsetof(struct iwx_link_config_cmd, bss_color) == 165,
+              "LINK_CONFIG_CMD v2 BSS color offset");
 
 #define IWX_STATION_TYPE_PEER       0
 #define IWX_STATION_TYPE_BCAST_MGMT 1
@@ -5016,6 +5026,10 @@ struct iwx_sta_cfg_cmd {
 
 static_assert(sizeof(struct iwx_sta_cfg_cmd) == 96,
               "STA_CONFIG_CMD v1 must be 96 bytes");
+static_assert(__offsetof(struct iwx_sta_cfg_cmd, pkt_ext) == 72,
+              "STA_CONFIG_CMD v1 PPE offset");
+static_assert(__offsetof(struct iwx_sta_cfg_cmd, htc_flags) == 92,
+              "STA_CONFIG_CMD v1 HTC offset");
 
 struct iwx_sta_remove_cmd {
     uint32_t sta_id;

@@ -29,6 +29,8 @@
 	<dict>
 		<key>NetworkController</key>
 		<dict>
+			<key>BE201EnableHE</key>
+			<false/>
 			<key>CFBundleIdentifier</key>
 			<string>com.zxystd.AirportItlwm</string>
 			<key>IOClass</key>
@@ -51,7 +53,7 @@
 			<key>IOClass</key>
 			<string>IOPCIEDeviceWrapper</string>
 			<key>IOPCIMatch</key>
-			<string>0x77408086 0x272b8086</string>
+			<string>0x77408086</string>
 			<key>IOProbeScore</key>
 			<integer>70000</integer>
 			<key>IOProviderClass</key>

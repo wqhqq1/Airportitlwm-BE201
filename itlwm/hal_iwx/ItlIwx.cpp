@@ -4791,6 +4791,7 @@ iwx_setup_he_rates(struct iwx_softc *sc)
 {
     struct ieee80211com *ic = &sc->sc_ic;
     ic->ic_flags &= ~IEEE80211_F_HEON;
+    sc->sc_pcitag->setProperty("BE201HECapabilitiesEnabled", false);
     memset(&ic->ic_he_cap_elem, 0, sizeof(ic->ic_he_cap_elem));
     memset(&ic->ic_he_mcs_nss_supp, 0xff, sizeof(ic->ic_he_mcs_nss_supp));
     memset(ic->ic_ppe_thres, 0, sizeof(ic->ic_ppe_thres));
@@ -4798,10 +4799,26 @@ iwx_setup_he_rates(struct iwx_softc *sc)
     /* Preinit builds modecaps before media_init enables HT. Requiring HTON
      * here would omit 11ax from the initial capability table permanently.
      * Negotiation still requires HT and QoS on the associated node. */
+    const bool mld = iwx_use_mld_api(sc);
+    const uint8_t staVersion = iwx_lookup_cmd_ver(sc,
+        IWX_MAC_CONF_GROUP, IWX_STA_CONFIG_CMD);
+    // API92 has no STA_HE_CTXT_CMD. Its HE data travels in LINK_CONFIG v2
+    // and STA_CONFIG v1. The pinned API92 omits the STA_CONFIG entry entirely;
+    // Linux sends the fixed v1 structure, as the proven ac baseline also does.
+    const bool mldHE = mld && sc->sc_device_family == IWX_DEVICE_FAMILY_BZ &&
+        strncmp(sc->sc_fwver, "92.", 3) == 0 &&
+        iwx_lookup_cmd_ver(sc, IWX_MAC_CONF_GROUP, IWX_MAC_CONFIG_CMD) == 2 &&
+        iwx_lookup_cmd_ver(sc, IWX_MAC_CONF_GROUP, IWX_LINK_CONFIG_CMD) == 2 &&
+        (staVersion == 1 || staVersion == IWX_FW_CMD_VER_UNKNOWN) &&
+        iwx_lookup_cmd_ver(sc, IWX_DATA_PATH_GROUP, IWX_TLC_MNG_CONFIG_CMD) == 4;
+    const bool apiSupported = mld ? mldHE : (version == 1 || version == 2);
+    sc->sc_pcitag->setProperty("BE201HEFirmwareCompatible", apiSupported);
+    sc->sc_pcitag->setProperty("BE201HELegacyContextVersion", version, 32);
+    sc->sc_pcitag->setProperty("BE201HEProfile", "HE SU; <=80MHz; no EHT/6GHz/MLO/TWT");
     if (!sc->sc_nvm.sku_cap_11ax_enable ||
         !(ic->ic_userflags & IEEE80211_F_HEON) ||
         (ic->ic_userflags & IEEE80211_F_NOVHT) ||
-        (version != 1 && version != 2))
+        !apiSupported)
         return;
     unsigned rx = iwx_num_of_ant(iwx_fw_valid_rx_ant(sc));
     unsigned tx = iwx_num_of_ant(iwx_fw_valid_tx_ant(sc));
@@ -4828,12 +4845,13 @@ iwx_setup_he_rates(struct iwx_softc *sc)
         IEEE80211_HE_PHY_CAP9_RX_FULL_BW_SU_USING_MU_WITH_NON_COMP_SIGB;
     ic->ic_he_mcs_nss_supp.rx_mcs_80 = htole16(rx > 1 ? 0xfffa : 0xfffe);
     ic->ic_he_mcs_nss_supp.tx_mcs_80 = htole16(tx > 1 ? 0xfffa : 0xfffe);
-    if (sc->sc_nvm.vht160_supported) {
+    if (sc->sc_nvm.vht160_supported && !mld) {
         ic->ic_he_cap_elem.phy_cap_info[0] |= IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_160MHZ_IN_5G;
         ic->ic_he_mcs_nss_supp.rx_mcs_160 = ic->ic_he_mcs_nss_supp.rx_mcs_80;
         ic->ic_he_mcs_nss_supp.tx_mcs_160 = ic->ic_he_mcs_nss_supp.tx_mcs_80;
     }
     ic->ic_flags |= IEEE80211_F_HEON;
+    sc->sc_pcitag->setProperty("BE201HECapabilitiesEnabled", true);
     XYLog("Experimental HE enabled: context-v%u rx80=%04x tx80=%04x width-bits=%02x\n",
         version, le16toh(ic->ic_he_mcs_nss_supp.rx_mcs_80),
         le16toh(ic->ic_he_mcs_nss_supp.tx_mcs_80), ic->ic_he_cap_elem.phy_cap_info[0]);
@@ -6957,6 +6975,12 @@ iwx_rx_mpdu_mq(struct iwx_softc *sc, mbuf_t m, void *pktdata,
         rxi.rxi_tstamp = (uint32_t)le64toh(desc->v1.tsf_on_air_rise);
     }
     rxi.rxi_chan = chanidx;
+
+    if (sc->sc_device_family == IWX_DEVICE_FAMILY_BZ &&
+        (rate_n_flags & IWX_RATE_MCS_MOD_TYPE_MSK) == IWX_RATE_MCS_HE_MSK) {
+        __atomic_add_fetch(&sc->sc_he_rx_observations, 1ULL, __ATOMIC_RELAXED);
+        __atomic_store_n(&sc->sc_he_rx_last_rate, rate_n_flags, __ATOMIC_RELAXED);
+    }
     
     if (iwx_rx_reorder(sc, m, chanidx, desc,
                        (phy_info & IWX_RX_MPDU_PHY_SHORT_PREAMBLE),
@@ -10638,6 +10662,63 @@ iwx_build_he_sta(const struct ieee80211_node *ni, struct iwx_he_sta_context_cmd 
     cmd->flags = htole32(flags);
 }
 
+/* API92 MLD HE fields, following Linux v6.12 mvm/{link,mld-sta,mac80211}.c
+ * (Intel, GPL-2.0 OR BSD-3-Clause). No old HE context command is sent.
+ * Share the checked HE/PPE translation with the legacy path, but preserve
+ * the v2 packet-extension stride: five bandwidths per NSS instead of four.
+ */
+static void
+iwx_mld_fill_he_sta(const struct ieee80211_node *ni, struct iwx_sta_cfg_cmd *cmd)
+{
+    if (!(ni->ni_flags & IEEE80211_NODE_HE))
+        return;
+    struct iwx_he_sta_context_cmd he;
+    iwx_build_he_sta(ni, &he);
+    memset(cmd->pkt_ext, 7, sizeof(cmd->pkt_ext));
+    for (unsigned ss = 0; ss < 2; ss++)
+        for (unsigned bw = 0; bw < 4; bw++)
+            memcpy(cmd->pkt_ext[ss][bw], he.pkt_ext[ss][bw], 2);
+    cmd->htc_flags = he.htc_flags;
+    cmd->ack_enabled = htole32(
+        (ni->ni_he_cap_elem.mac_cap_info[2] & IEEE80211_HE_MAC_CAP2_ACK_EN) ? 1 : 0);
+    // No UORA/TWT is advertised by this station profile.
+}
+
+static void
+iwx_mld_fill_he_link(const struct ieee80211_node *ni, struct iwx_link_config_cmd *cmd)
+{
+    if (!(ni->ni_flags & IEEE80211_NODE_HE))
+        return;
+    const uint32_t updates = le32toh(cmd->modify_mask);
+    // Keep ADD, REMOVE and link deactivation identical to the ac baseline.
+    if (le32toh(cmd->action) != IWX_FW_CTXT_ACTION_MODIFY ||
+        !le32toh(cmd->active) ||
+        !(updates & (IWX_LINK_CONTEXT_MODIFY_QOS_PARAMS |
+                     IWX_LINK_CONTEXT_MODIFY_BEACON_TIMING |
+                     IWX_LINK_CONTEXT_MODIFY_PROTECT_FLAGS)))
+        return;
+    struct iwx_he_sta_context_cmd he;
+    iwx_build_he_sta(ni, &he);
+    cmd->modify_mask = htole32(updates | IWX_LINK_CONTEXT_MODIFY_HE_PARAMS |
+                             IWX_LINK_CONTEXT_MODIFY_BSS_COLOR_DISABLE);
+    cmd->htc_trig_based_pkt_ext = he.htc_trig_based_pkt_ext;
+    cmd->frame_time_rts_th = he.frame_time_rts_th;
+    cmd->bss_color = he.bss_color;
+    cmd->ul_mu_data_disable =
+        (ni->ni_he_cap_elem.mac_cap_info[5] &
+         IEEE80211_HE_MAC_CAP5_OM_CTRL_UL_MU_DATA_DIS_RX) ? 1 : 0;
+    memcpy(cmd->trig_based_txf, he.trig_based_txf, sizeof(cmd->trig_based_txf));
+    uint32_t flags = le32toh(cmd->flags);
+    flags &= ~(IWX_LINK_FLG_BSS_COLOR_DIS | IWX_LINK_FLG_MU_EDCA_CW);
+    if (ni->ni_he_oper_params & IEEE80211_HE_OPERATION_BSS_COLOR_DISABLED)
+        flags |= IWX_LINK_FLG_BSS_COLOR_DIS;
+    if (ni->ni_flags & IEEE80211_NODE_HE_MU_EDCA)
+        flags |= IWX_LINK_FLG_MU_EDCA_CW;
+    cmd->flags = htole32(flags);
+    cmd->flags_mask = htole32(le32toh(cmd->flags_mask) |
+        IWX_LINK_FLG_BSS_COLOR_DIS | IWX_LINK_FLG_MU_EDCA_CW);
+}
+
 int ItlIwx::
 iwx_config_he_sta(struct iwx_softc *sc, struct ieee80211_node *ni)
 {
@@ -10646,6 +10727,8 @@ iwx_config_he_sta(struct iwx_softc *sc, struct ieee80211_node *ni)
     if ((ni->ni_flags & (IEEE80211_NODE_HECAP | IEEE80211_NODE_HEOP)) !=
         (IEEE80211_NODE_HECAP | IEEE80211_NODE_HEOP))
         return EINVAL;
+    if (iwx_use_mld_api(sc))
+        return EOPNOTSUPP; // MLD callers must use LINK_CONFIG/STA_CONFIG.
     struct iwx_he_sta_context_cmd cmd;
     static_assert(sizeof(cmd) == 88, "HE context v2 ABI");
     static_assert(__offsetof(struct iwx_he_sta_context_cmd, max_bssid_indicator) == 80, "HE context v1 ABI");
@@ -10891,6 +10974,12 @@ iwx_rs_update(struct iwx_softc *sc, struct iwx_tlc_update_notif *notif)
     ni->ni_he_txrate_kbps = iwx_he_rate_kbps(rate_n_flags);
     ni->ni_he_tx_nss = format == IWX_RATE_MCS_HE_MSK ?
         ((rate_n_flags & IWX_RATE_MCS_NSS_MSK) >> IWX_RATE_MCS_NSS_POS) + 1 : 0;
+    if (sc->sc_device_family == IWX_DEVICE_FAMILY_BZ) {
+        sc->sc_pcitag->setProperty("BE201TxRateNFlags", rate_n_flags, 32);
+        sc->sc_pcitag->setProperty("BE201TxRateIsHE", format == IWX_RATE_MCS_HE_MSK);
+        sc->sc_pcitag->setProperty("BE201HETxRateKbps", ni->ni_he_txrate_kbps, 32);
+        sc->sc_pcitag->setProperty("BE201HETxNSS", ni->ni_he_tx_nss, 32);
+    }
     if (format == IWX_RATE_MCS_VHT_MSK ||
         format == IWX_RATE_MCS_HE_MSK ||
         format == IWX_RATE_MCS_EHT_MSK) {
@@ -11190,6 +11279,9 @@ iwx_mld_mac_config_cmd(struct iwx_softc *sc, struct iwx_node *in,
             cmd.filter_flags |= htole32(IWX_MAC_CFG_FILTER_ACCEPT_BEACON);
         if (in->in_ni.ni_flags & IEEE80211_NODE_HE)
             cmd.he_support = htole16(1);
+        if (in->in_ni.ni_flags & IEEE80211_NODE_HE)
+            cmd.nic_not_ack_enabled = htole32(
+                !(ic->ic_he_cap_elem.mac_cap_info[2] & IEEE80211_HE_MAC_CAP2_ACK_EN));
         if (assoc) {
             cmd.client.is_assoc = 1;
             cmd.client.assoc_id = htole16(in->in_ni.ni_associd & 0x3fff);
@@ -11283,6 +11375,8 @@ iwx_mld_link_config_cmd(struct iwx_softc *sc, struct iwx_node *in,
     cmd.bi = htole32(ni->ni_intval);
     cmd.dtim_interval = htole32(ni->ni_intval * ni->ni_dtimperiod);
 
+    iwx_mld_fill_he_link(ni, &cmd);
+
     return iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_LINK_CONFIG_CMD,
         IWX_MAC_CONF_GROUP, 0), 0, sizeof(cmd), &cmd);
 #undef IWX_EXP2
@@ -11336,6 +11430,7 @@ iwx_mld_sta_config_cmd(struct iwx_softc *sc, struct iwx_node *in, int assoc)
         cmd.tx_ampdu_max_size = htole32(agg_size);
         if (ni->ni_flags & IEEE80211_NODE_QOS)
             cmd.sp_length = htole32(128);
+        iwx_mld_fill_he_sta(ni, &cmd);
     }
 
     return iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_STA_CONFIG_CMD,
@@ -11479,6 +11574,9 @@ iwx_mld_auth(struct iwx_softc *sc, struct iwx_node *in)
 {
     uint32_t step, duration;
     int generation = sc->sc_generation, err;
+    sc->sc_pcitag->setProperty("BE201HENegotiated", false);
+    sc->sc_pcitag->setProperty("BE201TxRateIsHE", false);
+    sc->sc_pcitag->setProperty("BE201HETxRateKbps", 0ULL, 32);
 
     /* Channel 44 was flagged passive in an earlier run; record what we join. */
     if (in->in_ni.ni_chan && in->in_ni.ni_chan != IEEE80211_CHAN_ANYC) {
@@ -11810,6 +11908,9 @@ iwx_mld_run(struct iwx_softc *sc, struct iwx_node *in)
         sc->sc_pcitag->setProperty("ItlwmMldDataQueues", allocated, 32);
     }
 
+    sc->sc_pcitag->setProperty("BE201HENegotiated",
+        (in->in_ni.ni_flags & IEEE80211_NODE_HE) != 0);
+    sc->sc_pcitag->setProperty("BE201NegotiatedWidth", in->in_ni.ni_chw, 32);
     iwx_mld_probe(sc, step, 0);
     return 0;
 
@@ -11824,6 +11925,7 @@ int ItlIwx::
 iwx_mld_run_stop(struct iwx_softc *sc, struct iwx_node *in)
 {
     int err, i, generation = sc->sc_generation;
+    sc->sc_pcitag->setProperty("BE201HENegotiated", false);
 
     iwx_mld_probe(sc, IWX_MLD_STEP_RUN_STOP, 0);
 
@@ -13224,6 +13326,12 @@ iwx_watchdog(struct _ifnet *ifp)
 {
     struct iwx_softc *sc = (struct iwx_softc *)ifp->if_softc;
     ItlIwx *that = container_of(sc, ItlIwx, com);
+    if (sc->sc_device_family == IWX_DEVICE_FAMILY_BZ) {
+        sc->sc_pcitag->setProperty("BE201HERxDescriptorObservations",
+            __atomic_load_n(&sc->sc_he_rx_observations, __ATOMIC_RELAXED), 64);
+        sc->sc_pcitag->setProperty("BE201HERxLastRateNFlags",
+            __atomic_load_n(&sc->sc_he_rx_last_rate, __ATOMIC_RELAXED), 32);
+    }
     
     ifp->if_timer = 0;
     if (sc->sc_tx_timer > 0) {

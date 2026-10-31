@@ -779,6 +779,9 @@ struct iwx_softc {
 	uint32_t sc_mld_key_removed;	/* ItlwmMldKeyRemoved: removed before the station */
 	uint32_t sc_preauth_mgmtq;	/* ItlwmTxPreAuthMgmtQ: data before port opened */
 	uint32_t sc_mld_leave_frames;	/* ItlwmMldLeaveFrames: DISASSOC/DEAUTH sent before teardown */
+    /* Cumulative descriptor observations, not delivered IP packet counts. */
+    uint64_t sc_he_rx_observations;
+    uint32_t sc_he_rx_last_rate;
 	uint32_t sc_tx_noqueue_drops;	/* ItlwmTxNoQueueDrop: frames without an MLD queue */
 	uint32_t sc_fw_errors;		/* ItlwmFwErrors: firmware asserts */
 	uint32_t sc_gate_stall_max_ms;	/* ItlwmGateStallMaxMs: longest gate sleep */

@@ -396,9 +396,19 @@ bool AirportItlwm::start(IOService *provider)
         fHalService->get80211Controller()->ic_userflags |= IEEE80211_F_NOHT40;
 
 #ifdef AIRPORT_WCL
-    // Keep this hardware-validation build in the VHT/ac path even if an old
-    // experimental itlwm_he argument remains in NVRAM.
+    // HE is opt-in per bundle; a boot override can force the ac recovery path.
+    // Do not reuse itlwm_he: old installs may retain that unrelated argument.
+    bool requestHE = getProperty("BE201EnableHE") == kOSBooleanTrue;
+    int heOverride = 0;
+    if (PE_parse_boot_argn("be201_he", &heOverride, sizeof(heOverride)))
+        requestHE = heOverride == 1;
     fHalService->get80211Controller()->ic_userflags &= ~IEEE80211_F_HEON;
+    if (requestHE)
+        fHalService->get80211Controller()->ic_userflags |= IEEE80211_F_HEON;
+    pciNub->setProperty("BE201HERequested", requestHE);
+    pciNub->setProperty("BE201ProtocolLimit", requestHE ?
+        "a/b/g/n/ac; HE <=80MHz requested; EHT/6GHz/MLO disabled" :
+        "a/b/g/n/ac; HE/EHT disabled");
 #endif
 
     ItlStartupStage(pciNub, "hal-attach");
