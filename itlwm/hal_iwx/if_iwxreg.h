@@ -4873,6 +4873,14 @@ struct iwx_mac_client_data {
     uint32_t ctwin;
 } __packed; /* MAC_CONTEXT_CONFIG_CLIENT_DATA_API_S_VER_1 */
 
+/* API92 MAC_CONTEXT_CONFIG_P2P_DEV_DATA_API_S_VER_1; Linux v6.12 mac-cfg.h.
+ * This occupies the same union as station client data. It does not enable
+ * another MAC or change receive filters until an explicit command is sent.
+ */
+struct iwx_mac_p2p_dev_data {
+    uint32_t is_disc_extended;
+} __packed;
+
 /**
  * struct iwx_mac_config_cmd - MAC_CONFIG_CMD (MAC_CONF_GROUP 0x8)
  * @id_and_color: MAC ID (no color on MLD firmware)
@@ -4897,7 +4905,10 @@ struct iwx_mac_config_cmd {
     uint16_t he_ap_support;
     uint32_t eht_support;
     uint32_t nic_not_ack_enabled;
-    struct iwx_mac_client_data client;
+    union {
+        struct iwx_mac_client_data client;
+        struct iwx_mac_p2p_dev_data p2p_dev;
+    };
 } __packed; /* MAC_CONTEXT_CONFIG_CMD_API_S_VER_2 */
 
 static_assert(sizeof(struct iwx_mac_config_cmd) == 52,
