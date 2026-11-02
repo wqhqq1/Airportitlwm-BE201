@@ -7003,6 +7003,10 @@ iwx_rx_tx_cmd_single(struct iwx_softc *sc, struct iwx_rx_packet *pkt,
     int txfail;
     
     KASSERT(tx_resp->frame_count == 1, "tx_resp->frame_count == 1");
+#ifdef AIRPORT_WCL
+    wcl_rsn_tx_completed(&ic->ic_wcl_rsn_trace, txd->wcl_rsn_cookie,
+        ic->ic_wcl_rsn_cookie, txd->wcl_rsn_kind, status);
+#endif
     
     txfail = (status != IWX_TX_STATUS_SUCCESS);
     
@@ -7043,6 +7047,9 @@ iwx_txd_done(struct iwx_softc *sc, struct iwx_tx_data *txd)
     //    bus_dmamap_unload(sc->sc_dmat, txd->map);
     mbuf_freem(txd->m);
     txd->m = NULL;
+#ifdef AIRPORT_WCL
+    txd->wcl_rsn_kind = txd->wcl_rsn_cookie = 0;
+#endif
     
     KASSERT(txd->in, "txd->in");
     ieee80211_release_node(ic, &txd->in->in_ni);
@@ -8163,6 +8170,22 @@ iwx_tx(struct iwx_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)
     else
         hdrlen = ieee80211_get_hdrlen(wh);
     
+#ifdef AIRPORT_WCL
+    uint32_t rsnKind = 0;
+    if (ic->ic_wcl_rsn_trace.enabled && !ni->ni_port_valid &&
+        !(wh->i_fc[1] & IEEE80211_FC1_PROTECTED) &&
+        type == IEEE80211_FC0_TYPE_DATA &&
+        !(subtype & IEEE80211_FC0_SUBTYPE_NODATA) &&
+        mbuf_pkthdr_len(m) >= hdrlen + 8) {
+        uint8_t snap[8];
+        if (mbuf_copydata(m, hdrlen, sizeof(snap), snap) == 0) {
+            unsigned stage = ni->ni_rsn_supp_state == RSNA_SUPP_PTKNEGOTIATING ? 2 :
+                (ni->ni_rsn_supp_state == RNSA_SUPP_PTKDONE ? 4 : 0);
+            rsnKind = wcl_rsn_tx_kind(snap, sizeof(snap), stage,
+                ni->ni_port_valid, wh->i_fc[1] & IEEE80211_FC1_PROTECTED);
+        }
+    }
+#endif
     tid = IWX_MGMT_TID;
     qid = sc->first_data_qid;
 
@@ -8329,6 +8352,10 @@ iwx_tx(struct iwx_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)
     data->m = m;
     data->in = in;
     data->type = type;
+#ifdef AIRPORT_WCL
+    data->wcl_rsn_kind = rsnKind;
+    data->wcl_rsn_cookie = rsnKind ? ic->ic_wcl_rsn_cookie : 0;
+#endif
 
     DPRINTFN(3, ("sending data: pkt tid=%d qid=%d idx=%d queued=%d len=%d nsegs=%d flags=0x%08x rate_n_flags=0x%08x offload_assist=%u\n",
           tid, ring->qid, ring->cur, ring->queued, totlen, nsegs, le32toh(flags),
@@ -8373,6 +8400,11 @@ iwx_tx(struct iwx_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)
     
     iwx_tx_update_byte_tbl(sc, ring, idx, totlen, num_tbs);
     
+#ifdef AIRPORT_WCL
+    if (rsnKind)
+        WCL_RSN_NOTE(ic, rsnKind == 2 ? 22 : 25,
+            (uint32_t(ring->qid) << 16) | (uint32_t(tid) << 8));
+#endif
     /* Kick TX ring. */
     ring->cur = (ring->cur + 1) % getTxQueueSize();
     IWX_WRITE(sc, IWX_HBUS_TARG_WRPTR, ring->qid << 16 | ring->cur);
@@ -11303,9 +11335,14 @@ iwx_mld_mac_config_cmd(struct iwx_softc *sc, struct iwx_node *in,
         IEEE80211_ADDR_COPY(cmd.local_mld_addr,
             iwx_mld_context_address(sc, action == IWX_FW_CTXT_ACTION_ADD));
         cmd.filter_flags = htole32(IWX_MAC_CFG_FILTER_ACCEPT_GRP);
-        /* Beacons must reach the host until association completes. */
+        /* WCL needs real associated beacons for FirstBeacon, BEACON_INFO
+         * and LQM. Firmware beacon filtering is disabled on this path. */
+#ifdef AIRPORT_WCL
+        cmd.filter_flags |= htole32(IWX_MAC_CFG_FILTER_ACCEPT_BEACON);
+#else
         if (!assoc)
             cmd.filter_flags |= htole32(IWX_MAC_CFG_FILTER_ACCEPT_BEACON);
+#endif
         if (in->in_ni.ni_flags & IEEE80211_NODE_HE)
             cmd.he_support = htole16(1);
         if (in->in_ni.ni_flags & IEEE80211_NODE_HE)

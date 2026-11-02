@@ -150,6 +150,7 @@ mac_harness = r'''
 #define htole16 OSSwapHostToLittleInt16
 #define htole32 OSSwapHostToLittleInt32
 #define __packed __attribute__((packed))
+#define AIRPORT_WCL 1
 #define ETHER_ADDR_LEN 6
 #define IEEE80211_ADDR_COPY(a,b) memcpy(a,b,6)
 ''' + defines + '\n' + decls + r'''
@@ -167,8 +168,10 @@ int main(){
  uint8_t old[6];memcpy(old,sc.sc_ic.ic_myaddr,6);
  assert(!hal.iwx_mld_mac_config_cmd(&sc,&node,IWX_FW_CTXT_ACTION_ADD,0));
  assert(sc.sc_mld_context_addr_valid && !memcmp(old,hal.wire.local_mld_addr,6));
+ assert(hal.wire.filter_flags & IWX_MAC_CFG_FILTER_ACCEPT_BEACON);
  sc.sc_ic.ic_myaddr[5]=2;
- assert(!hal.iwx_mld_mac_config_cmd(&sc,&node,IWX_FW_CTXT_ACTION_MODIFY,0));
+ assert(!hal.iwx_mld_mac_config_cmd(&sc,&node,IWX_FW_CTXT_ACTION_MODIFY,1));
+ assert(hal.wire.filter_flags & IWX_MAC_CFG_FILTER_ACCEPT_BEACON);
  assert(!memcmp(old,hal.wire.local_mld_addr,6));
  assert(!memcmp(old,iwx_mld_context_address(&sc,false),6));
  hal.result=5;assert(hal.iwx_mld_mac_config_cmd(&sc,&node,IWX_FW_CTXT_ACTION_REMOVE,0)==5);

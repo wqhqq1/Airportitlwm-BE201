@@ -346,6 +346,9 @@ struct iwx_tx_data {
 #define IWX_TXDATA_FLAG_CMD_PENDING    0x02
 #define IWX_TXDATA_FLAG_CMD_WAITING    0x04
     uint8_t type;
+#ifdef AIRPORT_WCL
+    uint32_t wcl_rsn_kind, wcl_rsn_cookie;
+#endif
 };
 
 struct iwx_tx_ring {

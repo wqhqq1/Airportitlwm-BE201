@@ -331,6 +331,21 @@ ieee80211_inputm(struct _ifnet *ifp, mbuf_t m, struct ieee80211_node *ni,
         tid = 0;
     }
     
+#ifdef AIRPORT_WCL
+    /* BE201 peer-teardown filter BEGIN: before duplicate state or callbacks. */
+    if (ic->ic_opmode == IEEE80211_M_STA && ic->ic_state >= IEEE80211_S_AUTH &&
+        type == IEEE80211_FC0_TYPE_MGT &&
+        (subtype == IEEE80211_FC0_SUBTYPE_DEAUTH ||
+         subtype == IEEE80211_FC0_SUBTYPE_DISASSOC) &&
+        (!ic->ic_bss || !wcl_sta_teardown_matches(wh->i_addr1, wh->i_addr2,
+            wh->i_addr3, ic->ic_myaddr, ic->ic_bss->ni_macaddr,
+            ic->ic_bss->ni_bssid))) {
+        ++ic->ic_stats.is_rx_wrongbss;
+        WCL_RSN_NOTE(ic, 21, 1);
+        goto out;
+    }
+    /* BE201 peer-teardown filter END */
+#endif
     if (ic->ic_state == IEEE80211_S_RUN &&
         type == IEEE80211_FC0_TYPE_DATA && hasqos &&
         (subtype & IEEE80211_FC0_SUBTYPE_NODATA) == 0 &&

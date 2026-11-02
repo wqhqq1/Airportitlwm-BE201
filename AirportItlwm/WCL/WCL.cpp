@@ -90,6 +90,7 @@ bool AirportItlwmSkywalkInterface::initWCL()
     int diag = 0;
     PE_parse_boot_argn("be201_tlc_diag", &diag, sizeof(diag));
     diagIC->ic_wcl_rsn_trace.enabled = diag == 1;
+    diagIC->ic_wcl_rsn_cookie = 0;
     diagIC->ic_wcl_diag_key_cipher = diagIC->ic_wcl_diag_rsn_length = 0;
     scanPending = false;
     scanCompleted = false;
@@ -742,6 +743,7 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
     uint32_t diagEnabled = ic->ic_wcl_rsn_trace.enabled;
     bzero(&ic->ic_wcl_rsn_trace, sizeof(ic->ic_wcl_rsn_trace));
     ic->ic_wcl_rsn_trace.enabled = diagEnabled;
+    if (diagEnabled && !++ic->ic_wcl_rsn_cookie) ++ic->ic_wcl_rsn_cookie;
     ic->ic_wcl_diag_key_cipher = join.keyCipher;
     ic->ic_wcl_diag_rsn_length = join.rsnLength;
     ++wclJoinStarts;

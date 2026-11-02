@@ -4,7 +4,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SDK=${MAC_KERNEL_SDK:?Set MAC_KERNEL_SDK to the MacKernelSDK directory}
 TOOLCHAIN=${DARWIN_TOOLCHAIN:-/Library/Developer/CommandLineTools/usr/bin}
 OUT=${BUILD_OUTPUT:-$ROOT/build}
-VERSION=${BE201_BUILD_VERSION:-1.1.4}
+VERSION=${BE201_BUILD_VERSION:-1.1.5}
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 2
 /bin/sh "$ROOT/scripts/prepare-mackernelsdk.sh" "$SDK"
 mkdir -p "$OUT/objects"
@@ -40,7 +40,7 @@ common=(-target x86_64-apple-macos15.2 -mkernel -fapple-kext
   -nostdinc -D__PRIVATE_SPI__ -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE
   -DIEEE80211_STA_ONLY -DAIRPORT -DAIRPORT_WCL -DAIRPORT_VTD
   -DIO80211FAMILY_V2 -D__IO80211_TARGET=150200
-  "-DITLWM_VERSION=\"$VERSION\"" '-DGIT_COMMIT="be201-join-rsn-diag"'
+  "-DITLWM_VERSION=\"$VERSION\"" '-DGIT_COMMIT="be201-associated-beacon-peer-filter"'
   -isystem "$SDK/Headers" -isystem "$(clang -print-resource-dir)/include"
   -I . -I itlwm -I itlwm/hal_iwx
   -I itl80211 -I itl80211/openbsd -I itl80211/linux -I include
