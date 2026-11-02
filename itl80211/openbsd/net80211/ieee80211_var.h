@@ -45,6 +45,7 @@
  */
 #ifndef _NET80211_IEEE80211_VAR_H_
 #define _NET80211_IEEE80211_VAR_H_
+#include <net80211/ieee80211_wcl_rsn_diag.h>
 
 /*
  * Definitions for IEEE 802.11 drivers.
@@ -440,6 +441,8 @@ struct ieee80211com {
     /* The channel width has changed (20<->2040) */
     void            (*ic_update_chw)(struct ieee80211com *);
 #ifdef AIRPORT_WCL
+    struct wcl_rsn_trace ic_wcl_rsn_trace;
+    uint32_t ic_wcl_diag_key_cipher, ic_wcl_diag_rsn_length;
     bool ic_wcl_mac_reconfig;
     bool ic_wcl_enterprise;
     bool ic_wcl_join_requested;

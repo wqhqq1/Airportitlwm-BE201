@@ -452,6 +452,8 @@ private:
     void kickWCLScanQueue();
     void flushWCLScanQueue(IOReturn);
     void finishWCLJoin(uint16_t, uint16_t, IOReturn);
+    void publishWCLJoinDiagnostic(uint16_t, uint16_t, IOReturn);
+    bool wclJoinFirstFailurePublished;
     void publishWCLBeacon(const ieee80211_node *, const uint8_t *, size_t);
     IOTimerEventSource *joinTimer;
     uint8_t joinBSSID[6];

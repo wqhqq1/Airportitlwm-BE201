@@ -202,6 +202,7 @@ void
 ieee80211_recv_4way_msg1(struct ieee80211com *ic,
                          struct ieee80211_eapol_key *key, struct ieee80211_node *ni)
 {
+    WCL_RSN_NOTE(ic, 1, ni->ni_rsn_supp_state);
     XYLog("%s\n", __FUNCTION__);
     struct ieee80211_ptk tptk;
     struct ieee80211_pmk *pmk;
@@ -288,7 +289,9 @@ ieee80211_recv_4way_msg1(struct ieee80211com *ic,
               ether_sprintf(ni->ni_macaddr));
     
     /* send message 2 to authenticator using TPTK */
+    WCL_RSN_NOTE(ic, 2, 0);
     (void)ieee80211_send_4way_msg2(ic, ni, key->replaycnt, &tptk);
+    WCL_RSN_NOTE(ic, 3, ni->ni_rsn_supp_state);
 }
 
 #ifndef IEEE80211_STA_ONLY
@@ -379,6 +382,7 @@ void
 ieee80211_recv_4way_msg3(struct ieee80211com *ic,
                          struct ieee80211_eapol_key *key, struct ieee80211_node *ni)
 {
+    WCL_RSN_NOTE(ic, 4, ni->ni_rsn_supp_state);
     XYLog("%s\n", __FUNCTION__);
     struct ieee80211_ptk tptk;
     struct ieee80211_key *k;
@@ -427,6 +431,7 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
         ic->ic_stats.is_rx_eapol_badmic++;
         return;
     }
+    WCL_RSN_NOTE(ic, 5, 0);
     /* install TPTK as PTK now that MIC is verified */
     memcpy(&ni->ni_ptk, &tptk, sizeof(tptk));
     
@@ -437,6 +442,7 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
         return;
     }
     
+    WCL_RSN_NOTE(ic, 6, 0);
     /* parse key data field */
     frm = (const u_int8_t *)&key[1];
     efrm = frm + BE_READ_2(key->paylen);
@@ -550,8 +556,10 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
               ether_sprintf(ni->ni_macaddr));
     
     /* send message 4 to authenticator */
+    WCL_RSN_NOTE(ic, 7, 0);
     if (ieee80211_send_4way_msg4(ic, ni) != 0)
         return;    /* ..authenticator will retry */
+    WCL_RSN_NOTE(ic, 8, 0);
     
     /*
      * Only install a new pairwise key if we are still expecting a new key,
@@ -584,6 +592,7 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
         k->k_len = keylen;
         memcpy(k->k_key, ni->ni_ptk.tk, k->k_len);
         /* install the PTK */
+        WCL_RSN_NOTE(ic, 9, 0);
         switch ((*ic->ic_set_key)(ic, ni, k)) {
             case 0:
                 break;
@@ -594,6 +603,7 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
                 reason = IEEE80211_REASON_AUTH_LEAVE;
                 goto deauth;
         }
+        WCL_RSN_NOTE(ic, 10, deferlink);
         ni->ni_flags &= ~IEEE80211_NODE_RSN_NEW_PTK;
         ni->ni_flags &= ~IEEE80211_NODE_TXRXPROT;
         ni->ni_flags |= IEEE80211_NODE_RXPROT;
@@ -626,6 +636,7 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
             k->k_len = keylen;
             memcpy(k->k_key, &gtk[8], k->k_len);
             /* install the GTK */
+            WCL_RSN_NOTE(ic, 11, 0);
             switch ((*ic->ic_set_key)(ic, ni, k)) {
                 case 0:
                     break;
@@ -663,6 +674,7 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
             k->k_len = 16;
             memcpy(k->k_key, &igtk[14], k->k_len);
             /* install the IGTK */
+            WCL_RSN_NOTE(ic, 13, 0);
             switch ((*ic->ic_set_key)(ic, ni, k)) {
                 case 0:
                     break;
@@ -688,6 +700,7 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
             if (deferlink == 0) {
                 DPRINTF(("marking port %s valid\n",
                          ether_sprintf(ni->ni_macaddr)));
+                WCL_RSN_NOTE(ic, 15, 0);
                 ni->ni_port_valid = 1;
                 ieee80211_set_link_state(ic, LINK_STATE_UP);
             }
@@ -698,6 +711,7 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
     }
 deauth:
     if (reason != 0) {
+        WCL_RSN_NOTE(ic, 16, reason);
         IEEE80211_SEND_MGMT(ic, ni, IEEE80211_FC0_SUBTYPE_DEAUTH,
                             reason);
         ieee80211_new_state(ic, IEEE80211_S_SCAN, -1);

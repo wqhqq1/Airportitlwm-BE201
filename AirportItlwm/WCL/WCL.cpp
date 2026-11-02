@@ -84,6 +84,13 @@ bool AirportItlwmSkywalkInterface::initWCL()
      * SCAN_MANAGER_STATE_HALTED and hides every network from the UI.
      */
     wclStopping = false;
+    wclJoinFirstFailurePublished = false;
+    auto diagIC = fHalService->get80211Controller();
+    bzero(&diagIC->ic_wcl_rsn_trace, sizeof(diagIC->ic_wcl_rsn_trace));
+    int diag = 0;
+    PE_parse_boot_argn("be201_tlc_diag", &diag, sizeof(diag));
+    diagIC->ic_wcl_rsn_trace.enabled = diag == 1;
+    diagIC->ic_wcl_diag_key_cipher = diagIC->ic_wcl_diag_rsn_length = 0;
     scanPending = false;
     scanCompleted = false;
     wclReadyEvents = 0;
@@ -732,6 +739,11 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
      */
     stashedJoin = join;
     stashedJoinValid = true;
+    uint32_t diagEnabled = ic->ic_wcl_rsn_trace.enabled;
+    bzero(&ic->ic_wcl_rsn_trace, sizeof(ic->ic_wcl_rsn_trace));
+    ic->ic_wcl_rsn_trace.enabled = diagEnabled;
+    ic->ic_wcl_diag_key_cipher = join.keyCipher;
+    ic->ic_wcl_diag_rsn_length = join.rsnLength;
     ++wclJoinStarts;
     if (instance && instance->pciNub)
         instance->pciNub->setProperty("ItlwmWclJoinStarts", wclJoinStarts, 32);
@@ -885,6 +897,48 @@ void AirportItlwmSkywalkInterface::resumeWCLJoin()
     }
 }
 
+void AirportItlwmSkywalkInterface::publishWCLJoinDiagnostic(uint16_t status, uint16_t reason, IOReturn driverStatus)
+{
+    auto ic = fHalService->get80211Controller();
+    if (!ic->ic_wcl_rsn_trace.enabled || !instance || !instance->pciNub)
+        return;
+    struct wcl_join_snapshot out = {};
+    auto ni = ic->ic_bss;
+    out.magic = 0x314e4f4a; // JON1, x86 little endian.
+    out.version = 1;
+    out.request = wclJoinRequests;
+    out.starts = wclJoinStarts;
+    out.status = status;
+    out.reason = reason;
+    out.driver_status = uint32_t(driverStatus);
+    out.state = ic->ic_state;
+    out.node_flags = ni ? ni->ni_flags : 0;
+    out.assoc = assocNotified;
+    out.beacon = firstBeaconNotified;
+    out.port = portAuthorized;
+    out.channel = ni && ni->ni_chan ? ieee80211_chan2ieee(ic, ni->ni_chan) : 0;
+    out.akm = ni ? ni->ni_rsnakms : 0;
+    out.cipher = ni ? ni->ni_rsncipher : 0;
+    out.proto = ni ? ni->ni_rsnprotos : 0;
+    out.eapol = ic->ic_stats.is_rx_eapol_key;
+    out.badmic = ic->ic_stats.is_rx_eapol_badmic;
+    out.replay = ic->ic_stats.is_rx_eapol_replay;
+    out.deauth = ic->ic_stats.is_rx_deauth;
+    out.deferred = joinDeferred;
+    if (!joinDeferred) {
+        out.key_cipher = ic->ic_wcl_diag_key_cipher;
+        out.rsn_length = ic->ic_wcl_diag_rsn_length;
+        out.rsn = ic->ic_wcl_rsn_trace;
+    } else {
+        out.rsn.enabled = 1; // Previous peer's trace is not this deferred join.
+    }
+    instance->pciNub->setProperty(status ? "ItlwmWclJoinLastFailure" : "ItlwmWclJoinLastSuccess", &out, sizeof(out));
+    if (status && !wclJoinFirstFailurePublished) {
+        instance->pciNub->setProperty("ItlwmWclJoinFirstFailure", &out, sizeof(out));
+        wclJoinFirstFailurePublished = true;
+    }
+}
+
 void AirportItlwmSkywalkInterface::finishWCLJoin(uint16_t status, uint16_t reason, IOReturn driverStatus)
 {
     stashedJoinValid = false;
@@ -896,6 +950,7 @@ void AirportItlwmSkywalkInterface::finishWCLJoin(uint16_t status, uint16_t reaso
     }
     if (!joinPending)
         return;
+    publishWCLJoinDiagnostic(status, reason, driverStatus);
     AirportWCL::ConnectionEvent event = {};
     event.status = status;
     event.reason = reason;
@@ -983,6 +1038,7 @@ void AirportItlwmSkywalkInterface::handleWCLLink(bool up)
 {
     if (wclStopping || (joinWaitingForInit && up))
         return;
+    WCL_RSN_NOTE(fHalService->get80211Controller(), 20, up);
     portAuthorized = up;
     if (!up && wclLinkIndicated) {
         AirportWCL::LinkStatusEvent event = {};
@@ -1191,6 +1247,7 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
             }
             break;
         case IEEE80211_EVT_STA_ASSOC_DONE:
+            WCL_RSN_NOTE(ic, 19, ic->ic_assoc_status);
             if (joinPending && !assocNotified) {
                 AirportWCL::AssociationEvent event = {};
                 event.status = ic->ic_assoc_status;

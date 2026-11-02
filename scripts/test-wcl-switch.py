@@ -38,6 +38,7 @@ harness = r'''
 #include <string>
 #include "WCL.hpp"
 #include "iwx_boot_checks.h"
+#include "ieee80211_wcl_rsn_diag.h"
 void explicit_bzero(void *p,size_t n){memset(p,0,n);}
 using IOReturn=int;
 constexpr int kIOReturnSuccess=0,kIOReturnTimeout=60;
@@ -187,5 +188,5 @@ with tempfile.TemporaryDirectory() as d:
     for name,source in [('switch',harness),('mac',mac_harness)]:
         (p/(name+'.cpp')).write_text(source)
         subprocess.run(['clang++','-std=c++14','-fsanitize=address,undefined','-Wall','-Wextra','-Werror',
-            '-I',str(root/'AirportItlwm/WCL'),'-I',str(root/'itlwm/hal_iwx'),str(p/(name+'.cpp')),'-o',str(p/name)],check=True)
+            '-I',str(root/'AirportItlwm/WCL'),'-I',str(root/'itlwm/hal_iwx'),'-I',str(root/'itl80211/openbsd/net80211'),str(p/(name+'.cpp')),'-o',str(p/name)],check=True)
         subprocess.run([str(p/name)],check=True)

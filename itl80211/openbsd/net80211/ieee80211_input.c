@@ -2946,6 +2946,8 @@ ieee80211_recv_deauth(struct ieee80211com *ic, mbuf_t m,
     reason = LE_READ_2(frm);
 
     XYLog("Deauth received, reason %d\n", reason);
+    WCL_RSN_NOTE(ic, 17, reason);
+    WCL_RSN_NOTE(ic, 18, (IEEE80211_ADDR_EQ(wh->i_addr1, ic->ic_myaddr) ? 1 : 0) | (IEEE80211_ADDR_EQ(wh->i_addr2, ni->ni_macaddr) ? 2 : 0) | (IEEE80211_ADDR_EQ(wh->i_addr3, ni->ni_bssid) ? 4 : 0));
     ic->ic_deauth_reason = reason;
     if (ic->ic_event_handler) {
         (*ic->ic_event_handler)(ic, IEEE80211_EVT_STA_DEAUTH, NULL);
