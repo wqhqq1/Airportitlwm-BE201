@@ -2941,6 +2941,21 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, mbuf_t m,
  * Deauthentication frame format:
  * [2] Reason code
  */
+#ifdef AIRPORT_WCL
+/* System WCL owns reconnects; fence cleanup before notifying its callbacks. */
+static bool
+ieee80211_wcl_peer_disconnect(struct ieee80211com *ic, u_int16_t reason)
+{
+    if (ic->ic_opmode != IEEE80211_M_STA)
+        return false;
+    ic->ic_deauth_reason = reason;
+    ieee80211_new_state(ic, IEEE80211_S_INIT, -1);
+    if (ic->ic_event_handler)
+        ic->ic_event_handler(ic, IEEE80211_EVT_STA_DEAUTH, NULL);
+    return true;
+}
+#endif
+
 void
 ieee80211_recv_deauth(struct ieee80211com *ic, mbuf_t m,
                       struct ieee80211_node *ni)
@@ -2963,6 +2978,12 @@ ieee80211_recv_deauth(struct ieee80211com *ic, mbuf_t m,
     XYLog("Deauth received, reason %d\n", reason);
     WCL_RSN_NOTE(ic, 17, reason);
     WCL_RSN_NOTE(ic, 18, (IEEE80211_ADDR_EQ(wh->i_addr1, ic->ic_myaddr) ? 1 : 0) | (IEEE80211_ADDR_EQ(wh->i_addr2, ni->ni_macaddr) ? 2 : 0) | (IEEE80211_ADDR_EQ(wh->i_addr3, ni->ni_bssid) ? 4 : 0));
+#ifdef AIRPORT_WCL
+    if (ieee80211_wcl_peer_disconnect(ic, reason)) {
+        ++ic->ic_stats.is_rx_deauth;
+        return;
+    }
+#endif
     ic->ic_deauth_reason = reason;
     if (ic->ic_event_handler) {
         (*ic->ic_event_handler)(ic, IEEE80211_EVT_STA_DEAUTH, NULL);
@@ -3030,6 +3051,15 @@ ieee80211_recv_disassoc(struct ieee80211com *ic, mbuf_t m,
     
     XYLog("Disassoc received, reason %d\n", reason);
     
+#ifdef AIRPORT_WCL
+    WCL_RSN_NOTE(ic, 17, reason);
+    WCL_RSN_NOTE(ic, 18, (IEEE80211_ADDR_EQ(wh->i_addr1, ic->ic_myaddr) ? 1 : 0) | (IEEE80211_ADDR_EQ(wh->i_addr2, ni->ni_macaddr) ? 2 : 0) | (IEEE80211_ADDR_EQ(wh->i_addr3, ni->ni_bssid) ? 4 : 0));
+    if (ieee80211_wcl_peer_disconnect(ic, reason)) {
+        ++ic->ic_stats.is_rx_disassoc;
+        return;
+    }
+#endif
+
     ic->ic_stats.is_rx_disassoc++;
     switch (ic->ic_opmode) {
         case IEEE80211_M_STA: {

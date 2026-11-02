@@ -1748,6 +1748,11 @@ ieee80211_set_link_state(struct ieee80211com *ic, int nstate)
 	default:
 		break;
 	}
+#ifdef AIRPORT_WCL
+    /* Late key/RX completion from the departing peer cannot resurrect it. */
+    if (nstate == LINK_STATE_UP && ic->ic_wcl_teardown_pending)
+        return;
+#endif
     link_state = nstate;
     if (link_state != ifp->if_link_state) {
         ifp->if_link_state = link_state;

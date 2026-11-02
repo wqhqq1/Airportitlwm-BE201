@@ -1,7 +1,7 @@
 """Strict reader for the fixed public numeric-only WCL join snapshot."""
 import struct
 FIELDS = 'magic version request starts status reason driver_status state node_flags assoc beacon port channel akm cipher proto eapol badmic replay deauth key_cipher rsn_length deferred'.split()
-EVENTS = {1:'msg1_enter',2:'msg2_send_attempt',3:'msg2_call_returned',4:'msg3_enter',5:'msg3_mic_verified',6:'msg3_decrypted_or_plain',7:'msg4_send_attempt',8:'msg4_send_returned_zero',9:'ptk_install_attempt',10:'ptk_install_accepted_or_deferred',11:'gtk_install_attempt',13:'igtk_install_attempt',15:'port_valid',16:'local_msg3_deauth',17:'remote_deauth_reason',18:'remote_address_match_mask',19:'association_status',20:'link_change',21:'foreign_teardown_ignored',22:'msg2_submitted_to_firmware',23:'msg2_firmware_tx_status',24:'msg4_firmware_tx_status',25:'msg4_submitted_to_firmware'}
+EVENTS = {1:'msg1_enter',2:'msg2_send_attempt',3:'msg2_call_returned',4:'msg3_enter',5:'msg3_mic_verified',6:'msg3_decrypted_or_plain',7:'msg4_send_attempt',8:'msg4_send_returned_zero',9:'ptk_install_attempt',10:'ptk_install_accepted_or_deferred',11:'gtk_install_attempt',13:'igtk_install_attempt',15:'port_valid',16:'local_msg3_deauth',17:'remote_deauth_reason',18:'remote_address_match_mask',19:'association_status',20:'link_change',21:'foreign_teardown_ignored',22:'msg2_submitted_to_firmware',23:'msg2_firmware_tx_status',24:'msg4_firmware_tx_status',25:'msg4_submitted_to_firmware',26:'key_command_submitted',27:'key_command_reply_observed',28:'key_command_explicit_failure'}
 def decode_join_trace(blob):
     if not isinstance(blob,bytes) or len(blob)!=360:raise ValueError('Expected 360-byte join snapshot')
     values=struct.unpack('<90I',blob)

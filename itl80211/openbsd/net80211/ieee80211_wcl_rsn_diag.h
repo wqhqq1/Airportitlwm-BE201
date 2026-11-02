@@ -50,6 +50,23 @@ static inline void wcl_rsn_tx_completed(struct wcl_rsn_trace *trace,
     if (marked_cookie && marked_cookie == current_cookie && (kind == 2 || kind == 4))
         wcl_rsn_note(trace, kind == 2 ? 23 : 24, status);
 }
+/* SEC_KEY v1: inspect only action/key-id/flags; skip the secret key bytes. */
+static inline uint32_t wcl_key_read32(const uint8_t *p) {
+    return uint32_t(p[0]) | (uint32_t(p[1]) << 8) |
+        (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
+}
+static inline uint32_t wcl_key_command_tag(uint32_t code, const uint8_t *p, unsigned length) {
+    if ((code & 0xffff) != 0x0518 || !p || length != 80) return 0;
+    uint32_t action = wcl_key_read32(p), key_id = wcl_key_read32(p + 8);
+    if ((action != 1 && action != 3) || key_id > 5) return 0;
+    return (action << 24) | (key_id << 16) | (wcl_key_read32(p + 12) & 0xffff);
+}
+static inline void wcl_key_command_completed(struct wcl_rsn_trace *trace,
+    uint32_t marked_cookie, uint32_t current_cookie, uint32_t tag, int failed) {
+    if (marked_cookie && marked_cookie == current_cookie &&
+        ((tag >> 24) == 1 || (tag >> 24) == 3))
+        wcl_rsn_note(trace, failed ? 28 : 27, tag);
+}
 #ifdef __cplusplus
 static_assert(sizeof(wcl_rsn_trace) == 268, "numeric trace wire size");
 static_assert(sizeof(wcl_join_snapshot) == 360, "numeric join snapshot wire size");

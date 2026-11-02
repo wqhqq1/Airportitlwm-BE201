@@ -7801,6 +7801,16 @@ iwx_send_cmd(struct iwx_softc *sc, struct iwx_host_cmd *hcmd)
     //        sizeof (*desc), BUS_DMASYNC_PREWRITE);
     /* Kick command ring. */
     DPRINTF(("%s: Sending command (%.2x.%.2x), %d bytes at [%d]:%d ver: %d\n", __func__, group_id, cmd->hdr.cmd, cmd->hdr_wide.length, cmd->hdr.idx, cmd->hdr.qid, cmd->hdr_wide.version));
+#ifdef AIRPORT_WCL
+    txdata->wcl_rsn_kind = txdata->wcl_rsn_cookie = 0;
+    if (sc->sc_ic.ic_wcl_rsn_trace.enabled && async) {
+        txdata->wcl_rsn_kind = wcl_key_command_tag(code, data, paylen);
+        if (txdata->wcl_rsn_kind) {
+            txdata->wcl_rsn_cookie = sc->sc_ic.ic_wcl_rsn_cookie;
+            WCL_RSN_NOTE(&sc->sc_ic, 26, txdata->wcl_rsn_kind);
+        }
+    }
+#endif
     txdata->flags |= IWX_TXDATA_FLAG_CMD_PENDING;
     if (!async)
         txdata->flags |= IWX_TXDATA_FLAG_CMD_WAITING;
@@ -7944,6 +7954,13 @@ iwx_cmd_done(struct iwx_softc *sc, int qid, int idx, int code)
     data = &ring->data[idx];
     if (!(data->flags & IWX_TXDATA_FLAG_CMD_PENDING))
         return;
+#ifdef AIRPORT_WCL
+    if (code == IWX_WIDE_ID(IWX_DATA_PATH_GROUP, IWX_SEC_KEY_CMD))
+        wcl_key_command_completed(&sc->sc_ic.ic_wcl_rsn_trace,
+            data->wcl_rsn_cookie, sc->sc_ic.ic_wcl_rsn_cookie,
+            data->wcl_rsn_kind, false);
+    data->wcl_rsn_kind = data->wcl_rsn_cookie = 0;
+#endif
     data->flags &= ~IWX_TXDATA_FLAG_CMD_PENDING;
     
     if (data->m != NULL) {
@@ -13927,6 +13944,17 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data,
             KASSERT(data->m != m0, "data->m != m0");
         }
         
+#ifdef AIRPORT_WCL
+        // Observe an explicit key-command failure without changing transport handling.
+        if (code == IWX_WIDE_ID(IWX_DATA_PATH_GROUP | IWX_CMD_FAILED_MSK, IWX_SEC_KEY_CMD) &&
+            qid == IWX_DQA_CMD_QUEUE && idx < sc->txq[IWX_DQA_CMD_QUEUE].ring_count) {
+            auto marked = &sc->txq[IWX_DQA_CMD_QUEUE].data[idx];
+            if (marked->flags & IWX_TXDATA_FLAG_CMD_PENDING)
+                wcl_key_command_completed(&sc->sc_ic.ic_wcl_rsn_trace,
+                    marked->wcl_rsn_cookie, sc->sc_ic.ic_wcl_rsn_cookie,
+                    marked->wcl_rsn_kind, true);
+        }
+#endif
         switch (code) {
             case IWX_REPLY_RX_PHY_CMD:
                 iwx_rx_rx_phy_cmd(sc, pkt, data);

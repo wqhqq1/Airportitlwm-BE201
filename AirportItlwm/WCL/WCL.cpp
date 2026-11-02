@@ -1262,6 +1262,8 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
             }
             break;
         case IEEE80211_EVT_STA_DEAUTH: {
+            if (!joinPending)
+                publishWCLJoinDiagnostic(1, ic->ic_deauth_reason, kIOReturnOffline);
             portAuthorized = false;
             updateWCLLinkQuality(true);
             AirportWCL::DeauthEvent event = {};
