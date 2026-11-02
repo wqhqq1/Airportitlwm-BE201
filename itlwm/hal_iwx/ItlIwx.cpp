@@ -7799,6 +7799,18 @@ iwx_send_cmd(struct iwx_softc *sc, struct iwx_host_cmd *hcmd)
         txdata->flags |= IWX_TXDATA_FLAG_CMD_WAITING;
     ring->queued++;
     ring->cur = (ring->cur + 1) % getTxQueueSize();
+    if (sc->sc_tlc_trace_enabled &&
+        (code & 0xffff) == iwx_cmd_id(IWX_TLC_MNG_CONFIG_CMD, IWX_DATA_PATH_GROUP, 0)) {
+        static_assert(sizeof(iwx_tlc_config_cmd_v4) == 28, "TLC v4 wire ABI");
+        const ieee80211_node *ni = sc->sc_ic.ic_bss;
+        uint32_t header;
+        memcpy(&header, &cmd->hdr_wide, sizeof(header));
+        iwx_tlc_trace_append(sc->sc_tlc_trace, sc->sc_generation,
+            sc->sc_ic.ic_state, ni ? ni->ni_flags : 0,
+            ni ? ni->ni_chw : 0, ni ? ni->ni_rx_nss : 0, header,
+            iwx_lookup_cmd_ver(sc, IWX_DATA_PATH_GROUP, IWX_TLC_MNG_CONFIG_CMD),
+            data, paylen);
+    }
     IWX_WRITE(sc, IWX_HBUS_TARG_WRPTR, ring->qid << 16 | ring->cur);
     
     if (!async) {
@@ -13599,6 +13611,12 @@ iwx_nic_umac_error(struct iwx_softc *sc)
     sc->sc_pcitag->setProperty("ItlwmFwErrorId", table.error_id, 32);
     sc->sc_pcitag->setProperty("ItlwmFwErrorData1", table.data1, 32);
     sc->sc_pcitag->setProperty("ItlwmFwErrorCmd", table.cmd_header, 32);
+    if (sc->sc_tlc_trace_enabled && iwx_tlc_trace_freeze(sc->sc_tlc_trace,
+        table.error_id, table.data1, table.cmd_header, sc->sc_generation)) {
+        // Keep the first assert intact across firmware recovery and retries.
+        sc->sc_pcitag->setProperty("ItlwmTlcFirstFaultTrace",
+            &sc->sc_tlc_trace, sizeof(sc->sc_tlc_trace));
+    }
 }
 
 #define IWX_FW_SYSASSERT_CPU_MASK 0xf0000000
@@ -16010,6 +16028,9 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
     sc->sc_pct = pa->pa_pc;
     sc->sc_pcitag = pa->pa_tag;
     sc->sc_dmat = pa->pa_dmat;
+    sc->sc_tlc_trace_enabled = ItlDiagnosticFlag("be201_tlc_diag");
+    memset(&sc->sc_tlc_trace, 0, sizeof(sc->sc_tlc_trace));
+    sc->sc_pcitag->setProperty("ItlwmTlcTraceEnabled", sc->sc_tlc_trace_enabled);
     
     //    rw_init(&sc->ioctl_rwl, "iwxioctl");
     

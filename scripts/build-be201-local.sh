@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-export MAC_KERNEL_SDK="${MAC_KERNEL_SDK:-$ROOT/../MacKernelSDK}"
+export MAC_KERNEL_SDK="${MAC_KERNEL_SDK:-$ROOT/../airportbz-deps/MacKernelSDK}"
 cd "$ROOT"
 python3 - <<'PY'
 from pathlib import Path

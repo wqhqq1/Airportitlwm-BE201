@@ -4,6 +4,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SDK=${MAC_KERNEL_SDK:?Set MAC_KERNEL_SDK to the MacKernelSDK directory}
 TOOLCHAIN=${DARWIN_TOOLCHAIN:-/Library/Developer/CommandLineTools/usr/bin}
 OUT=${BUILD_OUTPUT:-$ROOT/build}
+VERSION=${BE201_BUILD_VERSION:-1.1.1}
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 2
 /bin/sh "$ROOT/scripts/prepare-mackernelsdk.sh" "$SDK"
 mkdir -p "$OUT/objects"
 cd "$ROOT"
@@ -38,7 +40,7 @@ common=(-target x86_64-apple-macos15.2 -mkernel -fapple-kext
   -nostdinc -D__PRIVATE_SPI__ -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE
   -DIEEE80211_STA_ONLY -DAIRPORT -DAIRPORT_WCL -DAIRPORT_VTD
   -DIO80211FAMILY_V2 -D__IO80211_TARGET=150200
-  '-DITLWM_VERSION="1.1.0"' '-DGIT_COMMIT="be201-he-mld-api92"'
+  "-DITLWM_VERSION=\"$VERSION\"" '-DGIT_COMMIT="be201-hotspot-directed-scan-tlc"'
   -isystem "$SDK/Headers" -isystem "$(clang -print-resource-dir)/include"
   -I . -I itlwm -I itlwm/hal_iwx
   -I itl80211 -I itl80211/openbsd -I itl80211/linux -I include
@@ -70,12 +72,12 @@ if failed:
     sys.exit(1)
 PY
 
-cat > "$OUT/module.cpp" <<'EOF'
+cat > "$OUT/module.cpp" <<EOF
 #include <mach/mach_types.h>
 extern "C" {
 extern kern_return_t _start(kmod_info_t *, void *);
 extern kern_return_t _stop(kmod_info_t *, void *);
-KMOD_EXPLICIT_DECL(com.zxystd.AirportItlwm, "1.1.0", _start, _stop)
+KMOD_EXPLICIT_DECL(com.zxystd.AirportItlwm, "$VERSION", _start, _stop)
 __private_extern__ kmod_start_func_t *_realmain = 0;
 __private_extern__ kmod_stop_func_t *_antimain = 0;
 __private_extern__ int _kext_apple_cc = 1;

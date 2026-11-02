@@ -636,6 +636,22 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLJoin(apple80211AssocCandidates *r
     return startWCLJoin(join);
 }
 
+static void airport_wcl_prepare_join_scan(ieee80211com *ic, uint16_t channel)
+{
+    // An uncached join owns a new active, directed scan. Do not inherit a
+    // previous WCL request's passive mode, SSID or channel bitmap. A zero
+    // channel means all regulatory-allowed channels, not an empty restriction.
+    ic->ic_wcl_scan_active = true;
+    bzero(ic->ic_wcl_scan_ssid, sizeof(ic->ic_wcl_scan_ssid));
+    ic->ic_wcl_scan_ssid_length = ic->ic_des_esslen;
+    memcpy(ic->ic_wcl_scan_ssid, ic->ic_des_essid, ic->ic_des_esslen);
+    bzero(ic->ic_wcl_scan_channels, sizeof(ic->ic_wcl_scan_channels));
+    ic->ic_wcl_scan_restricted = channel != 0;
+    if (channel)
+        ic->ic_wcl_scan_channels[channel >> 3] |= (1u << (channel & 7));
+    ic->ic_wcl_scan_requested = true;
+}
+
 IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &join)
 {
     auto auth = AirportWCL::classifyLegacyAuth(join);
@@ -783,11 +799,13 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
         instance->pciNub->setProperty("ItlwmWclJoinFast", (uint32_t) 0, 32);
 
     uint16_t targetChan = join.channelSpec & 0x03ff;
-    if (targetChan >= 1 && targetChan <= IEEE80211_CHAN_MAX && ic->ic_channels[targetChan].ic_flags) {
-        bzero(ic->ic_wcl_scan_channels, sizeof(ic->ic_wcl_scan_channels));
-        ic->ic_wcl_scan_channels[targetChan >> 3] |= (1u << (targetChan & 7));
-        ic->ic_wcl_scan_restricted = true;
-        ic->ic_wcl_scan_requested = true;
+    if (targetChan > IEEE80211_CHAN_MAX || !ic->ic_channels[targetChan].ic_flags)
+        targetChan = 0;
+    airport_wcl_prepare_join_scan(ic, targetChan);
+    if (instance && instance->pciNub) {
+        instance->pciNub->setProperty("ItlwmWclJoinScanSSIDLength",
+            ic->ic_wcl_scan_ssid_length, 32);
+        instance->pciNub->setProperty("ItlwmWclJoinScanChannel", targetChan, 32);
     }
     explicit_bzero(&join, sizeof(join));
 
