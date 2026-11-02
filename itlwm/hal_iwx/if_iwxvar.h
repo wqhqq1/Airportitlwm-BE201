@@ -698,6 +698,11 @@ struct iwx_softc {
     /* Task for ERP/HT prot/slot-time/EDCA updates. */
     struct task        mac_ctxt_task;
     struct task        chan_ctxt_task;
+#ifdef AIRPORT_WCL
+    struct task        mld_authorized_task;
+    uint32_t sc_mld_assoc_epoch, sc_mld_authorized_epoch;
+    uint32_t sc_mld_authorized_done_epoch, sc_mld_authorized_updates;
+#endif
 
 	bus_space_tag_t sc_st;
 	bus_space_handle_t sc_sh;

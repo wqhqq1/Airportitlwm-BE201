@@ -444,6 +444,7 @@ struct ieee80211com {
     struct wcl_rsn_trace ic_wcl_rsn_trace;
     uint32_t ic_wcl_rsn_cookie;
     uint32_t ic_wcl_diag_key_cipher, ic_wcl_diag_rsn_length;
+    void (*ic_wcl_port_authorized)(struct ieee80211com *);
     bool ic_wcl_mac_reconfig;
     bool ic_wcl_enterprise;
     bool ic_wcl_join_requested;

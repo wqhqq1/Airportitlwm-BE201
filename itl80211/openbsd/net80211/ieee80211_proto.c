@@ -1757,6 +1757,10 @@ ieee80211_set_link_state(struct ieee80211com *ic, int nstate)
     if (link_state != ifp->if_link_state) {
         ifp->if_link_state = link_state;
         if (link_state == LINK_STATE_UP) {
+#ifdef AIRPORT_WCL
+            if (ic->ic_wcl_port_authorized)
+                ic->ic_wcl_port_authorized(ic);
+#endif
             XYLog("%s LINK_STATE_IS_UP\n", __FUNCTION__);
             ifp->controller->setLinkStatus(kIONetworkLinkValid | kIONetworkLinkActive, ifp->controller->getCurrentMedium());
         } else {

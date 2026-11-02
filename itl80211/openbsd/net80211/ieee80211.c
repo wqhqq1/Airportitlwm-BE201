@@ -224,6 +224,9 @@ ieee80211_ifattach(struct _ifnet *ifp, IOEthernetController *controller)
 {
     IOLog("ieee80211_ifattach\n");
     struct ieee80211com *ic = (struct ieee80211com *)ifp;
+#ifdef AIRPORT_WCL
+    ic->ic_wcl_port_authorized = nullptr;
+#endif
     
     ifp->controller = controller;
     ifq_init(&ifp->if_snd, ifp, 2048);

@@ -302,6 +302,10 @@ public:
     void    iwx_setup_he_rates(struct iwx_softc *);
     int     iwx_config_he_sta(struct iwx_softc *, struct ieee80211_node *);
     int    iwx_mimo_enabled(struct iwx_softc *);
+#ifdef AIRPORT_WCL
+    static void    iwx_wcl_port_authorized(struct ieee80211com *);
+    static void    iwx_mld_authorized_task(void *);
+#endif
     static void    iwx_mac_ctxt_task(void *);
     static void    iwx_chan_ctxt_task(void *);
     static void    iwx_updateprot(struct ieee80211com *);

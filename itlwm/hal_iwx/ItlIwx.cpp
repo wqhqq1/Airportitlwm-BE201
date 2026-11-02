@@ -5018,6 +5018,66 @@ iwx_sta_rx_agg(struct iwx_softc *sc, struct ieee80211_node *ni, uint8_t tid,
     return 0;
 }
 
+#ifdef AIRPORT_WCL
+void ItlIwx::
+iwx_wcl_port_authorized(struct ieee80211com *ic)
+{
+    auto sc = static_cast<iwx_softc *>(ic->ic_softc);
+    auto that = container_of(sc, ItlIwx, com);
+    if (!that->iwx_use_mld_api(sc) || ic->ic_state != IEEE80211_S_RUN ||
+        sc->ns_nstate != IEEE80211_S_RUN || ic->ic_wcl_teardown_pending ||
+        (sc->sc_flags & IWX_FLAG_SHUTDOWN) || !(sc->sc_flags & IWX_FLAG_STA_ACTIVE) ||
+        !ic->ic_bss || ((ic->ic_flags & IEEE80211_F_RSNON) && !ic->ic_bss->ni_port_valid) ||
+        sc->sc_mld_authorized_done_epoch == sc->sc_mld_assoc_epoch)
+        return;
+    sc->sc_mld_authorized_epoch = sc->sc_mld_assoc_epoch;
+    WCL_RSN_NOTE(ic, 29, sc->sc_mld_assoc_epoch);
+    that->iwx_add_task(sc, systq, &sc->mld_authorized_task);
+}
+
+void ItlIwx::
+iwx_mld_authorized_task(void *arg)
+{
+    auto sc = static_cast<iwx_softc *>(arg);
+    auto that = container_of(sc, ItlIwx, com);
+    if (!that->getMainWorkLoop()->inGate()) {
+        that->getMainCommandGate()->runAction(
+            [](OSObject *, void *arg0, void *, void *, void *) -> IOReturn {
+                iwx_mld_authorized_task(arg0);
+                return kIOReturnSuccess;
+            }, arg);
+        return;
+    }
+    auto ic = &sc->sc_ic;
+    auto in = reinterpret_cast<iwx_node *>(ic->ic_bss);
+    const uint32_t epoch = sc->sc_mld_assoc_epoch;
+    const int generation = sc->sc_generation;
+    if (!epoch || sc->sc_mld_authorized_epoch != epoch ||
+        sc->sc_mld_authorized_done_epoch == epoch ||
+        !that->iwx_use_mld_api(sc) || !in || !in->in_phyctxt ||
+        ic->ic_state != IEEE80211_S_RUN || sc->ns_nstate != IEEE80211_S_RUN ||
+        ic->ic_wcl_teardown_pending || (sc->sc_flags & IWX_FLAG_SHUTDOWN) ||
+        !(sc->sc_flags & IWX_FLAG_STA_ACTIVE) ||
+        ((ic->ic_flags & IEEE80211_F_RSNON) && !in->in_ni.ni_port_valid))
+        return;
+    WCL_RSN_NOTE(ic, 30, (in->in_ni.ni_flags & IEEE80211_NODE_MFP) ? 1 : 0);
+    int err = that->iwx_mld_sta_config_cmd(sc, in, 1);
+    // The command wait releases the gate; teardown/reset may have run meanwhile.
+    if (generation != sc->sc_generation || epoch != sc->sc_mld_assoc_epoch ||
+        ic->ic_wcl_teardown_pending || (sc->sc_flags & IWX_FLAG_SHUTDOWN) ||
+        ic->ic_state != IEEE80211_S_RUN || sc->ns_nstate != IEEE80211_S_RUN)
+        return;
+    WCL_RSN_NOTE(ic, 31, err < 0 ? -err : err);
+    sc->sc_pcitag->setProperty("ItlwmMldAuthorizedError", uint32_t(err < 0 ? -err : err), 32);
+    if (!err) {
+        sc->sc_mld_authorized_done_epoch = epoch;
+        ++sc->sc_mld_authorized_updates;
+        sc->sc_pcitag->setProperty("ItlwmMldAuthorizedUpdates", sc->sc_mld_authorized_updates, 32);
+        sc->sc_pcitag->setProperty("ItlwmMldAuthorizedMFP", uint32_t(!!(in->in_ni.ni_flags & IEEE80211_NODE_MFP)), 32);
+    }
+}
+#endif
+
 void ItlIwx::
 iwx_mac_ctxt_task(void *arg)
 {
@@ -11493,10 +11553,11 @@ iwx_mld_sta_config_cmd(struct iwx_softc *sc, struct iwx_node *in, int assoc)
     cmd.station_type = htole32(IWX_STATION_TYPE_PEER);
     /*
      * Linux sets mfp while the station is not yet authorized when the
-     * firmware has STA_EXP_MFP_SUPPORT, which covers every STA_CONFIG it
-     * sends in client mode; otherwise only for MFP associations.
+     * firmware has STA_EXP_MFP_SUPPORT. After port authorization only
+     * negotiated MFP remains, matching Linux's AUTHORIZED transition.
      */
-    if (isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_STA_EXP_MFP_SUPPORT) ||
+    bool authorized = assoc && (ni->ni_port_valid || !(sc->sc_ic.ic_flags & IEEE80211_F_RSNON));
+    if ((isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_STA_EXP_MFP_SUPPORT) && !authorized) ||
         (ni->ni_flags & IEEE80211_NODE_MFP))
         cmd.mfp = htole32(1);
 
@@ -11663,6 +11724,10 @@ iwx_mld_rm_sta(struct iwx_softc *sc, struct iwx_node *in)
 int ItlIwx::
 iwx_mld_auth(struct iwx_softc *sc, struct iwx_node *in)
 {
+#ifdef AIRPORT_WCL
+    if (!++sc->sc_mld_assoc_epoch) ++sc->sc_mld_assoc_epoch;
+    sc->sc_mld_authorized_epoch = sc->sc_mld_authorized_done_epoch = 0;
+#endif
     uint32_t step, duration;
     int generation = sc->sc_generation, err;
     sc->sc_pcitag->setProperty("BE201HENegotiated", false);
@@ -11785,6 +11850,10 @@ fail:
 int ItlIwx::
 iwx_mld_deauth(struct iwx_softc *sc, struct iwx_node *in)
 {
+#ifdef AIRPORT_WCL
+    if (!++sc->sc_mld_assoc_epoch) ++sc->sc_mld_assoc_epoch;
+    sc->sc_mld_authorized_epoch = sc->sc_mld_authorized_done_epoch = 0;
+#endif
     int err, generation = sc->sc_generation;
 
     iwx_mld_probe(sc, IWX_MLD_STEP_DEAUTH, 0);
@@ -13364,6 +13433,10 @@ iwx_stop(struct _ifnet *ifp)
     task_del(systq, &sc->init_task);
     iwx_del_task(sc, sc->sc_nswq, &sc->newstate_task);
     iwx_del_task(sc, systq, &sc->ba_task);
+#ifdef AIRPORT_WCL
+    iwx_del_task(sc, systq, &sc->mld_authorized_task);
+    sc->sc_mld_authorized_epoch = sc->sc_mld_authorized_done_epoch = 0;
+#endif
     iwx_del_task(sc, systq, &sc->mac_ctxt_task);
     iwx_del_task(sc, systq, &sc->chan_ctxt_task);
     KASSERT(sc->task_refs.refs >= 1, "sc->task_refs.refs >= 1");
@@ -16556,6 +16629,13 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
     task_set(&sc->init_task, iwx_init_task, sc, "iwx_init_task");
     task_set(&sc->newstate_task, iwx_newstate_task, sc, "iwx_newstate_task");
     task_set(&sc->ba_task, iwx_ba_task, sc, "iwx_ba_task");
+#ifdef AIRPORT_WCL
+    sc->sc_mld_assoc_epoch = 1;
+    sc->sc_mld_authorized_epoch = sc->sc_mld_authorized_done_epoch = 0;
+    sc->sc_mld_authorized_updates = 0;
+    task_set(&sc->mld_authorized_task, iwx_mld_authorized_task, sc, "iwx_mld_authorized_task");
+    ic->ic_wcl_port_authorized = iwx_wcl_port_authorized;
+#endif
     task_set(&sc->mac_ctxt_task, iwx_mac_ctxt_task, sc, "iwx_mac_ctxt_task");
     task_set(&sc->chan_ctxt_task, iwx_chan_ctxt_task, sc, "iwx_chan_ctxt_task");
     

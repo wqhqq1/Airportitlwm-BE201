@@ -24,6 +24,7 @@ struct Controller{unsigned updates=0;void *getCurrentMedium(){return nullptr;}vo
 struct _ifnet{int if_link_state=0;Controller *controller=nullptr;};
 struct ieee80211_node{uint8_t ni_macaddr[6]={2,1,2,3,4,5},ni_bssid[6]={2,1,2,3,4,5};};
 struct ieee80211com{
+ void(*ic_wcl_port_authorized)(ieee80211com *)=nullptr;
  int ic_opmode=1,ic_state=4;unsigned ic_flags=0,ic_userflags=0;uint16_t ic_deauth_reason=0;
  uint8_t ic_myaddr[6]={2,2,3,4,5,6};bool ic_wcl_teardown_pending=false;
  struct{unsigned is_rx_deauth=0,is_rx_disassoc=0;}ic_stats;
