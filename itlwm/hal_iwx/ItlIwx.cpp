@@ -10468,7 +10468,11 @@ iwx_rs_fw_get_config_flags(struct iwx_softc *sc)
     struct ieee80211_node *ni = ic->ic_bss;
     uint16_t flags = 0;
     
-    if (ic->ic_state < IEEE80211_S_ASSOC) {
+    // AUTH can run while ic_state still describes the departing RUN. The
+    // auth path has already cleared negotiated mode flags, but capability
+    // IEs remain. NON_HT TLC must not inherit LDPC/STBC/DCM from those IEs.
+    if (!(ni->ni_flags & (IEEE80211_NODE_HT | IEEE80211_NODE_VHT | IEEE80211_NODE_HE)) ||
+        ic->ic_state < IEEE80211_S_ASSOC) {
         return flags;
     }
     
