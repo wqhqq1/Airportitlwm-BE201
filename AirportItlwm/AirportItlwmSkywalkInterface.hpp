@@ -442,6 +442,7 @@ private:
     IOReturn accessWCLRSN(apple80211_rsn_ie_data *, bool);
     IOReturn beginWCLJoin(apple80211AssocCandidates *);
     IOReturn startWCLJoin(AirportWCL::JoinRequest &);
+    bool deferWCLJoinUntilIdle(AirportWCL::JoinRequest &);
     void resumeWCLJoin();
     IOReturn abortWCLJoin();
     IOReturn leaveWCLNetwork();
@@ -496,6 +497,11 @@ private:
     ifnet_t wclLinkQualityInterface = nullptr;
     bool joinPending;
     bool joinDeferred = false;
+    bool joinWaitingForInit = false;
+    uint64_t joinInitDeadlineNS = 0;
+    uint32_t wclJoinInitDeferrals = 0;
+    uint32_t wclJoinInitCompleted = 0;
+    uint32_t wclJoinInitTimeouts = 0;
     AirportWCL::JoinRequest deferredJoin = {};
     bool assocNotified;
     bool firstBeaconNotified;

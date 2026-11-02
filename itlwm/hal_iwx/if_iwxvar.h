@@ -755,6 +755,8 @@ struct iwx_softc {
     struct iwx_boot_diagnostics sc_boot_diag;
     bool sc_tlc_trace_enabled;
     struct iwx_tlc_trace sc_tlc_trace;
+    uint8_t sc_mld_context_addr[6];
+    bool sc_mld_context_addr_valid;
     /* Accessed by the hard interrupt filter: use atomic operations only. */
     uint32_t sc_boot_filter_count;
     bool sc_boot_filter_active;

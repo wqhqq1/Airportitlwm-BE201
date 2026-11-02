@@ -84,7 +84,18 @@ int main() {
  for(unsigned i=0;i<16;++i)iwx_tlc_trace_append(trace,0,0,0,0,0,0x050f,4,payload,28);
  assert(trace.count==UINT32_MAX && trace.next==0);
  trace={};assert(iwx_tlc_trace_freeze(trace,1,2,3,4));
- assert(trace.count==0 && trace.magic==0x31434c54 && trace.version==1);
+ assert(trace.count==0 && trace.magic==0x31434c54 && trace.version==2);
+ trace={};uint8_t link[208];memset(link,0xcc,sizeof(link));
+ const unsigned offsets[7]={0,4,8,12,24,28,32};
+ for(unsigned i=0;i<7;++i)for(unsigned j=0;j<4;++j)link[offsets[i]+j]=i;
+ // PROT_NONE in every unsupported size/version must remain unread.
+ iwx_tlc_trace_append(trace,0,0,0,0,0,0x0309,1,guard,208);
+ iwx_tlc_trace_append(trace,0,0,0,0,0,0x0309,2,guard,207);
+ assert(trace.count==0);
+ iwx_tlc_trace_append(trace,2,0,0,0,0,0x170309,2,link,sizeof(link));
+ assert(trace.count==1 && trace.records[0].payload_length==208);
+ for(unsigned i=0;i<28;++i)assert(trace.records[0].payload[i]==i/4);
+ assert(trace.records[0].command_header==0x170309);
  munmap(guard,page);
  puts("PASS: 384 production cold-join scan cases; TLC wire filtering, unreadable input guards, ring wrap/generation/sequence, saturation, first-fault immutability, empty trace.");
 }

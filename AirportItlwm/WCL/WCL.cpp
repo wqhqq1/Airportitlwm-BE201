@@ -101,6 +101,11 @@ bool AirportItlwmSkywalkInterface::initWCL()
     wclReconfigEvents = 0;
     joinPending = false;
     joinDeferred = false;
+    joinWaitingForInit = false;
+    joinInitDeadlineNS = 0;
+    wclJoinInitDeferrals = 0;
+    wclJoinInitCompleted = 0;
+    wclJoinInitTimeouts = 0;
     assocNotified = false;
     firstBeaconNotified = false;
     portAuthorized = false;
@@ -138,6 +143,8 @@ void AirportItlwmSkywalkInterface::stopWCL()
     scanPending = joinPending = false;
     wclScanQueueHead = wclScanQueueCount = 0;
     joinDeferred = false;
+    joinWaitingForInit = false;
+    joinInitDeadlineNS = 0;
     explicit_bzero(&deferredJoin, sizeof(deferredJoin));
     if (fHalService) {
         ieee80211com *ic = fHalService->get80211Controller();
@@ -636,6 +643,35 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLJoin(apple80211AssocCandidates *r
     return startWCLJoin(join);
 }
 
+static uint64_t airport_wcl_now_ns()
+{
+    uint64_t now = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+    return now;
+}
+
+bool AirportItlwmSkywalkInterface::deferWCLJoinUntilIdle(AirportWCL::JoinRequest &join)
+{
+    ieee80211com *ic = fHalService->get80211Controller();
+    if (ic->ic_state != IEEE80211_S_RUN && ic->ic_state != IEEE80211_S_AUTH &&
+        ic->ic_state != IEEE80211_S_ASSOC && !ic->ic_wcl_teardown_pending)
+        return false;
+    // INIT is asynchronous in iwx. Yield the native workloop before copying
+    // the new BSS or scheduling AUTH, otherwise AUTH can overwrite queued INIT
+    // and teardown reads the new peer's capabilities instead of the old ones.
+    leaveWCLNetwork();
+    deferredJoin = stashedJoin = join;
+    stashedJoinValid = true;
+    explicit_bzero(&join, sizeof(join));
+    joinDeferred = joinPending = joinWaitingForInit = true;
+    joinInitDeadlineNS = airport_wcl_now_ns() + 30000000000ULL;
+    ++wclJoinInitDeferrals;
+    if (instance && instance->pciNub)
+        instance->pciNub->setProperty("ItlwmWclJoinInitDeferrals", wclJoinInitDeferrals, 32);
+    joinTimer->setTimeoutMS(20);
+    return true;
+}
+
 static void airport_wcl_prepare_join_scan(ieee80211com *ic, uint16_t channel)
 {
     // An uncached join owns a new active, directed scan. Do not inherit a
@@ -687,6 +723,8 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
     }
     if (ic->ic_scan_abort)
         ic->ic_scan_abort(ic);
+    if (deferWCLJoinUntilIdle(join))
+        return kIOReturnSuccess;
     /*
      * Keep a copy of the accepted request: a private-MAC application can
      * restart the firmware mid-join and post DRIVER_STOPPED. Replaying the
@@ -698,8 +736,6 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
     if (instance && instance->pciNub)
         instance->pciNub->setProperty("ItlwmWclJoinStarts", wclJoinStarts, 32);
     struct ieee80211_node *selbs = ieee80211_find_node(ic, join.bssid);
-    if (ic->ic_state == IEEE80211_S_RUN || ic->ic_state == IEEE80211_S_AUTH || ic->ic_state == IEEE80211_S_ASSOC)
-        leaveWCLNetwork();
     if (!selbs)
         selbs = ieee80211_find_node(ic, join.bssid);
     ieee80211_disable_rsn(ic);
@@ -825,9 +861,21 @@ void AirportItlwmSkywalkInterface::resumeWCLJoin()
 {
     if (!joinDeferred || wclStopping)
         return;
+    ieee80211com *ic = fHalService->get80211Controller();
+    if (joinWaitingForInit &&
+        (ic->ic_state != IEEE80211_S_INIT || ic->ic_wcl_teardown_pending ||
+        !(ic->ic_if.if_flags & IFF_RUNNING)))
+        return;
+    if (joinWaitingForInit) {
+        ++wclJoinInitCompleted;
+        if (instance && instance->pciNub)
+            instance->pciNub->setProperty("ItlwmWclJoinInitCompleted", wclJoinInitCompleted, 32);
+    }
     AirportWCL::JoinRequest join = deferredJoin;
     explicit_bzero(&deferredJoin, sizeof(deferredJoin));
     joinDeferred = joinPending = false;
+    joinWaitingForInit = false;
+    joinInitDeadlineNS = 0;
     joinTimer->cancelTimeout();
     IOReturn status = startWCLJoin(join);
     explicit_bzero(&join, sizeof(join));
@@ -855,6 +903,8 @@ void AirportItlwmSkywalkInterface::finishWCLJoin(uint16_t status, uint16_t reaso
     event.peers[0].driverStatus = driverStatus;
     joinPending = false;
     joinDeferred = false;
+    joinWaitingForInit = false;
+    joinInitDeadlineNS = 0;
     explicit_bzero(&deferredJoin, sizeof(deferredJoin));
     joinTimer->cancelTimeout();
     instance->postMessage(this, AirportWCL::ConnectComplete, &event, sizeof(event), true);
@@ -873,6 +923,21 @@ void AirportItlwmSkywalkInterface::wclJoinTimeout(OSObject *owner, IOTimerEventS
 {
     auto self = OSDynamicCast(AirportItlwmSkywalkInterface, owner);
     if (self && !self->wclStopping) {
+        if (self->joinWaitingForInit) {
+            ieee80211com *ic = self->fHalService->get80211Controller();
+            if (ic->ic_state == IEEE80211_S_INIT && !ic->ic_wcl_teardown_pending &&
+                (ic->ic_if.if_flags & IFF_RUNNING)) {
+                self->resumeWCLJoin();
+                return;
+            }
+            if (airport_wcl_now_ns() < self->joinInitDeadlineNS) {
+                self->joinTimer->setTimeoutMS(20);
+                return;
+            }
+            ++self->wclJoinInitTimeouts;
+            if (self->instance && self->instance->pciNub)
+                self->instance->pciNub->setProperty("ItlwmWclJoinInitTimeouts", self->wclJoinInitTimeouts, 32);
+        }
         self->finishWCLJoin(1, 1004, kIOReturnTimeout);
         self->leaveWCLNetwork();
     }
@@ -885,6 +950,8 @@ IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork()
     updateWCLLinkQuality(true);
     joinPending = false;
     joinDeferred = false;
+    joinWaitingForInit = false;
+    joinInitDeadlineNS = 0;
     explicit_bzero(&deferredJoin, sizeof(deferredJoin));
     joinTimer->cancelTimeout();
     ic->ic_wcl_join_requested = false;
@@ -914,7 +981,7 @@ IOReturn AirportItlwmSkywalkInterface::abortWCLJoin()
 
 void AirportItlwmSkywalkInterface::handleWCLLink(bool up)
 {
-    if (wclStopping)
+    if (wclStopping || (joinWaitingForInit && up))
         return;
     portAuthorized = up;
     if (!up && wclLinkIndicated) {
@@ -943,6 +1010,10 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
         return;
     }
     ieee80211com *ic = fHalService->get80211Controller();
+    // Responses from the departing peer cannot complete/fail the queued join.
+    if (joinWaitingForInit && (code == IEEE80211_EVT_STA_ASSOC_DONE ||
+        code == IEEE80211_EVT_STA_DEAUTH))
+        return;
     switch (code) {
         case IEEE80211_EVT_COUNTRY_CODE_UPDATE:
             deferWCLCountryUpdate();
@@ -1042,6 +1113,8 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
             break;
         }
         case IEEE80211_EVT_BEACON: {
+            if (joinWaitingForInit)
+                break;
             auto beacon = static_cast<ieee80211_beacon_event *>(data);
             if (!beacon)
                 break;

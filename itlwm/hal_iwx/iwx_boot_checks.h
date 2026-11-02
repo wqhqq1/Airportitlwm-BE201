@@ -2,6 +2,18 @@
 #ifndef IWX_BOOT_CHECKS_H
 #define IWX_BOOT_CHECKS_H
 
+/* A delayed RX/auth request must not replace a queued explicit teardown. */
+static inline bool
+iwx_wcl_state_transition_allowed(bool &init_pending, bool requesting_init,
+    bool already_init)
+{
+    if (init_pending && !requesting_init)
+        return false;
+    if (requesting_init && !already_init)
+        init_pending = true;
+    return true;
+}
+
 static inline bool
 iwx_boot_io_invalid(uint32_t value)
 {

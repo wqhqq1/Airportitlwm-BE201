@@ -1,4 +1,4 @@
-/* Bounded, capability-only TLC v4 history. No allocation on the command path. */
+/* Bounded TLC v4 / sanitized LINK v2 history. No command-path allocation. */
 #ifndef IWX_TLC_TRACE_H
 #define IWX_TLC_TRACE_H
 #include <stdint.h>
@@ -23,11 +23,12 @@ inline void iwx_tlc_trace_append(iwx_tlc_trace &trace, uint32_t generation,
 {
     // The caller supplies the final command-ring bytes, immediately before
     // the doorbell. Never retain a different command (especially key material).
-    if (trace.frozen || (header & 0xffff) != 0x050f || version != 4 ||
-        length != 28 || !payload)
+    const bool tlc = (header & 0xffff) == 0x050f && version == 4 && length == 28;
+    const bool link = (header & 0xffff) == 0x0309 && version == 2 && length == 208;
+    if (trace.frozen || (!tlc && !link) || !payload)
         return;
     trace.magic = 0x31434c54; // "TLC1", little endian x86_64
-    trace.version = 1;
+    trace.version = 2;
     if (trace.count != UINT32_MAX)
         ++trace.count;
     iwx_tlc_trace_record &r = trace.records[trace.next];
@@ -41,8 +42,16 @@ inline void iwx_tlc_trace_append(iwx_tlc_trace &trace, uint32_t generation,
     r.command_version = version;
     r.payload_length = length;
     const uint8_t *bytes = static_cast<const uint8_t *>(payload);
-    for (unsigned i = 0; i < sizeof(r.payload); ++i)
-        r.payload[i] = bytes[i];
+    if (tlc) {
+        for (unsigned i = 0; i < sizeof(r.payload); ++i)
+            r.payload[i] = bytes[i];
+    } else {
+        // Exactly seven documented u32 fields. Skip all link/BSSID addresses.
+        const unsigned offsets[7] = {0, 4, 8, 12, 24, 28, 32};
+        for (unsigned i = 0; i < 7; ++i)
+            for (unsigned j = 0; j < 4; ++j)
+                r.payload[4*i+j] = bytes[offsets[i]+j];
+    }
     trace.next = (trace.next + 1) % 8;
 }
 
@@ -52,7 +61,7 @@ inline bool iwx_tlc_trace_freeze(iwx_tlc_trace &trace, uint32_t error_id,
     if (trace.frozen || !error_id)
         return false;
     trace.magic = 0x31434c54;
-    trace.version = 1;
+    trace.version = 2;
     trace.error_id = error_id;
     trace.error_data1 = data1;
     trace.error_command = command;

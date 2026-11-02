@@ -443,6 +443,7 @@ struct ieee80211com {
     bool ic_wcl_mac_reconfig;
     bool ic_wcl_enterprise;
     bool ic_wcl_join_requested;
+    bool ic_wcl_teardown_pending;
 	uint32_t ic_wcl_bss_seen;
 	uint32_t ic_wcl_bss_ok;
 	uint32_t ic_wcl_bss_des_found;

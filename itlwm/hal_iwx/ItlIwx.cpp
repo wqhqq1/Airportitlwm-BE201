@@ -7799,16 +7799,20 @@ iwx_send_cmd(struct iwx_softc *sc, struct iwx_host_cmd *hcmd)
         txdata->flags |= IWX_TXDATA_FLAG_CMD_WAITING;
     ring->queued++;
     ring->cur = (ring->cur + 1) % getTxQueueSize();
-    if (sc->sc_tlc_trace_enabled &&
-        (code & 0xffff) == iwx_cmd_id(IWX_TLC_MNG_CONFIG_CMD, IWX_DATA_PATH_GROUP, 0)) {
+    if (sc->sc_tlc_trace_enabled && ((code & 0xffff) ==
+        iwx_cmd_id(IWX_TLC_MNG_CONFIG_CMD, IWX_DATA_PATH_GROUP, 0) ||
+        (code & 0xffff) == iwx_cmd_id(IWX_LINK_CONFIG_CMD, IWX_MAC_CONF_GROUP, 0))) {
         static_assert(sizeof(iwx_tlc_config_cmd_v4) == 28, "TLC v4 wire ABI");
+        static_assert(sizeof(iwx_link_config_cmd) == 208, "LINK v2 wire ABI");
+        static_assert(__offsetof(iwx_link_config_cmd, modify_mask) == 24, "LINK trace fields");
+        static_assert(__offsetof(iwx_link_config_cmd, listen_lmac) == 32, "LINK trace fields");
         const ieee80211_node *ni = sc->sc_ic.ic_bss;
         uint32_t header;
         memcpy(&header, &cmd->hdr_wide, sizeof(header));
         iwx_tlc_trace_append(sc->sc_tlc_trace, sc->sc_generation,
             sc->sc_ic.ic_state, ni ? ni->ni_flags : 0,
             ni ? ni->ni_chw : 0, ni ? ni->ni_rx_nss : 0, header,
-            iwx_lookup_cmd_ver(sc, IWX_DATA_PATH_GROUP, IWX_TLC_MNG_CONFIG_CMD),
+            iwx_lookup_cmd_ver(sc, group_id, code & 0xff),
             data, paylen);
     }
     IWX_WRITE(sc, IWX_HBUS_TARG_WRPTR, ring->qid << 16 | ring->cur);
@@ -11272,6 +11276,14 @@ iwx_mld_probe(struct iwx_softc *sc, uint32_t step, int err)
         static_cast<UInt32>(err < 0 ? -err : err), 32);
 }
 
+static const uint8_t *iwx_mld_context_address(const iwx_softc *sc, bool fresh)
+{
+    // WCL may already have installed the next network's private BSD address.
+    // Existing firmware MAC/link contexts retain their address until REMOVE.
+    return !fresh && sc->sc_mld_context_addr_valid ?
+        sc->sc_mld_context_addr : sc->sc_ic.ic_myaddr;
+}
+
 int ItlIwx::
 iwx_mld_mac_config_cmd(struct iwx_softc *sc, struct iwx_node *in,
                        uint32_t action, int assoc)
@@ -11284,7 +11296,8 @@ iwx_mld_mac_config_cmd(struct iwx_softc *sc, struct iwx_node *in,
     cmd.action = htole32(action);
     if (action != IWX_FW_CTXT_ACTION_REMOVE) {
         cmd.mac_type = htole32(IWX_FW_MAC_TYPE_BSS_STA);
-        IEEE80211_ADDR_COPY(cmd.local_mld_addr, ic->ic_myaddr);
+        IEEE80211_ADDR_COPY(cmd.local_mld_addr,
+            iwx_mld_context_address(sc, action == IWX_FW_CTXT_ACTION_ADD));
         cmd.filter_flags = htole32(IWX_MAC_CFG_FILTER_ACCEPT_GRP);
         /* Beacons must reach the host until association completes. */
         if (!assoc)
@@ -11300,8 +11313,16 @@ iwx_mld_mac_config_cmd(struct iwx_softc *sc, struct iwx_node *in,
         }
     }
 
-    return iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_MAC_CONFIG_CMD,
+    int err = iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_MAC_CONFIG_CMD,
         IWX_MAC_CONF_GROUP, 0), 0, sizeof(cmd), &cmd);
+    if (!err && action == IWX_FW_CTXT_ACTION_ADD) {
+        IEEE80211_ADDR_COPY(sc->sc_mld_context_addr, cmd.local_mld_addr);
+        sc->sc_mld_context_addr_valid = true;
+    } else if (!err && action == IWX_FW_CTXT_ACTION_REMOVE) {
+        sc->sc_mld_context_addr_valid = false;
+        bzero(sc->sc_mld_context_addr, sizeof(sc->sc_mld_context_addr));
+    }
+    return err;
 }
 
 int ItlIwx::
@@ -11327,7 +11348,7 @@ iwx_mld_link_config_cmd(struct iwx_softc *sc, struct iwx_node *in,
     } else
         cmd.phy_id = htole32(in->in_phyctxt->id);
 
-    IEEE80211_ADDR_COPY(cmd.local_link_addr, ic->ic_myaddr);
+    IEEE80211_ADDR_COPY(cmd.local_link_addr, iwx_mld_context_address(sc, false));
     cmd.modify_mask = htole32(modify_mask);
     cmd.active = htole32(active ? 1 : 0);
 
@@ -12474,6 +12495,10 @@ out:
         else {
             sc->sc_newstate(ic, nstate, arg);
 #ifdef AIRPORT_WCL
+            if (nstate == IEEE80211_S_INIT && ic->ic_state == IEEE80211_S_INIT)
+                ic->ic_wcl_teardown_pending = false;
+#endif
+#ifdef AIRPORT_WCL
             /* EAPOL frames held until RUN and processed after it (net80211) */
             if (ic->ic_wcl_eapol_held) {
                 sc->sc_pcitag->setProperty("ItlwmEapolHeld", ic->ic_wcl_eapol_held, 32);
@@ -12494,6 +12519,12 @@ iwx_newstate(struct ieee80211com *ic, enum ieee80211_state nstate, int arg)
     struct iwx_softc *sc = (struct iwx_softc *)ifp->if_softc;
     ItlIwx *that = container_of(sc, ItlIwx, com);
     struct ieee80211_node *ni = ic->ic_bss;
+
+#ifdef AIRPORT_WCL
+    if (!iwx_wcl_state_transition_allowed(ic->ic_wcl_teardown_pending,
+        nstate == IEEE80211_S_INIT, ic->ic_state == IEEE80211_S_INIT))
+        return EBUSY;
+#endif
 
     if (sc->sc_last_state != (uint32_t) nstate) {
         sc->sc_last_state = (uint32_t) nstate;
@@ -13312,6 +13343,11 @@ iwx_stop(struct _ifnet *ifp)
     sc->sc_flags &= ~IWX_FLAG_TE_ACTIVE;
     sc->sc_flags &= ~IWX_FLAG_HW_ERR;
     sc->sc_flags &= ~IWX_FLAG_TXFLUSH;
+    sc->sc_mld_context_addr_valid = false;
+    bzero(sc->sc_mld_context_addr, sizeof(sc->sc_mld_context_addr));
+#ifdef AIRPORT_WCL
+    ic->ic_wcl_teardown_pending = false;
+#endif
 
     sc->sc_rx_ba_sessions = 0;
     sc->ba_rx.start_tidmask = 0;
@@ -16030,6 +16066,11 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
     sc->sc_dmat = pa->pa_dmat;
     sc->sc_tlc_trace_enabled = ItlDiagnosticFlag("be201_tlc_diag");
     memset(&sc->sc_tlc_trace, 0, sizeof(sc->sc_tlc_trace));
+#ifdef AIRPORT_WCL
+    ic->ic_wcl_teardown_pending = false;
+#endif
+    sc->sc_mld_context_addr_valid = false;
+    bzero(sc->sc_mld_context_addr, sizeof(sc->sc_mld_context_addr));
     sc->sc_pcitag->setProperty("ItlwmTlcTraceEnabled", sc->sc_tlc_trace_enabled);
     
     //    rw_init(&sc->ioctl_rwl, "iwxioctl");
