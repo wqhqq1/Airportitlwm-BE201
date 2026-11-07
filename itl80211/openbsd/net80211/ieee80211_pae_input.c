@@ -557,6 +557,9 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
     
     /* send message 4 to authenticator */
     WCL_RSN_NOTE(ic, 7, 0);
+#ifdef AIRPORT_WCL
+    ic->ic_wcl_m4_abs = mach_absolute_time();
+#endif
     if (ieee80211_send_4way_msg4(ic, ni) != 0)
         return;    /* ..authenticator will retry */
     WCL_RSN_NOTE(ic, 8, 0);
@@ -692,6 +695,11 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
     
     if (info & EAPOL_KEY_SECURE) {
         ni->ni_flags |= IEEE80211_NODE_TXRXPROT;
+#ifdef AIRPORT_WCL
+        // The peer protects robust management frames once this PTK is in use.
+        if (ni->ni_flags & IEEE80211_NODE_MFP)
+            ni->ni_flags |= IEEE80211_NODE_RXMGMTPROT | IEEE80211_NODE_TXMGMTPROT;
+#endif
 #ifndef IEEE80211_STA_ONLY
         if (ic->ic_opmode != IEEE80211_M_IBSS ||
             ++ni->ni_key_count == 2)

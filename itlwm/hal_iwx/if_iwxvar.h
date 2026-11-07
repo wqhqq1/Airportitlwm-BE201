@@ -348,6 +348,9 @@ struct iwx_tx_data {
     uint8_t type;
 #ifdef AIRPORT_WCL
     uint32_t wcl_rsn_kind, wcl_rsn_cookie;
+    uint8_t awdl_kind; /* 0 other, 1 multicast, 2 unicast AWDL frame, 3 unicast on the peer's own queue, 4 A-MSDU. */
+    uint8_t awdl_umi; /* The family waits for this frame's ACK result. */
+    uint8_t awdl_umi_peer[6];
 #endif
 };
 
@@ -674,6 +677,10 @@ struct iwx_ba_task_data {
     uint32_t        stop_tidmask;
 };
 
+#ifdef AIRPORT_WCL
+#include "iwx_awdl_probe.h"
+#endif
+
 struct iwx_softc {
 	struct device sc_dev;
 	struct ieee80211com sc_ic;
@@ -700,6 +707,14 @@ struct iwx_softc {
     struct task        chan_ctxt_task;
 #ifdef AIRPORT_WCL
     struct task        mld_authorized_task;
+    struct task        awdl_native_task;
+    struct task        awdl_peer_task;
+    struct task        awdl_ba_task;
+    struct task        awdl_ownq_task;
+    struct task        awdl_phy2_task;
+    struct task        awdl_umi_task;
+    bool sc_awdl_native_requested;
+    struct iwx_awdl_probe sc_awdl_probe;
     uint32_t sc_mld_assoc_epoch, sc_mld_authorized_epoch;
     uint32_t sc_mld_authorized_done_epoch, sc_mld_authorized_updates;
 #endif

@@ -22,7 +22,7 @@ def block(text, signature, terminate=''):
     return text[start:end] + terminate
 
 functions = '\n'.join(block(source, name) for name in [
-    'static uint8_t iwx_mvm_mac80211_ac_to_ucode_ac(',
+    'static uint8_t iwx_mvm_mac80211_ac_to_ucode_ac(enum ieee80211_edca_ac ac)\n{',
     'static uint8_t\niwx_he_ppe_value(',
     'static void\niwx_build_he_sta(',
     'static void\niwx_mld_fill_he_sta(',

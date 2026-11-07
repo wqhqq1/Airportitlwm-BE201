@@ -23,6 +23,7 @@ class IO80211NetworkPacket;
 class PacketSkywalkScratch;
 typedef UInt64 IO80211FlowQueueHash;
 class IO80211Peer;
+class IO80211VirtualInterface;
 class CCPipe;
 class IO80211APIUserClient;
 struct apple80211_wme_ac;
@@ -201,6 +202,10 @@ public:
     OSString *setInterfaceRole(unsigned int);
     void *setInterfaceId(unsigned int);
     int getInterfaceRole();
+    unsigned getInterfaceId();
+    void setLowLatencyEnabled(bool);
+    void setParentInterface(IO80211VirtualInterface *);
+    void setCompanionInterfaceId(unsigned int);
 };
 static_assert(sizeof(IO80211SkywalkInterface) == 0x118, "WCL ABI size");
 #endif

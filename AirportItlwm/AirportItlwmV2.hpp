@@ -49,6 +49,9 @@ extern "C" {
 const char *convertApple80211IOCTLToString(signed int cmd);
 }
 
+class AirportItlwmAWDLInterface;
+class AirportItlwmLowLatencyInterface;
+
 class AirportItlwm : public IO80211Controller {
     OSDeclareDefaultStructors(AirportItlwm)
 #define IOCTL(REQ_TYPE, REQ, DATA_TYPE) \
@@ -76,6 +79,64 @@ IOReturn set##REQ(OSObject *object, struct DATA_TYPE *data);
     
 public:
     virtual bool init(OSDictionary *properties) override;
+#ifdef AIRPORT_WCL
+    IOReturn createAWDLInterface(apple80211_virt_if_create_data *);
+    void stopAWDLInterface();
+    void registerAWDLArmControl();
+    static bool awdlVifCapabilityArmed();
+    static uint32_t awdlVifPoolFlags();
+    static bool awdlVifAcceptSets();
+    static bool awdlVifLinkAllowed();
+    static bool awdlVifAwAllowed();
+    void reloadAWDLCapabilities();
+    // IO80211Controller ivars +0xb20 on 24G824: the cached apple80211_capability_data.
+    const uint8_t *nativeCapabilityCache() const {
+        auto ivars = *reinterpret_cast<const uint8_t *const *>(reinterpret_cast<const uint8_t *>(this) + 0x120);
+        return ivars ? ivars + 0xb20 : nullptr;
+    }
+    static bool awdlVifRadioAllowed();
+    static bool awdlVifRxAllowed();
+    static bool awdlVifTxAllowed();
+    static bool awdlVifDataAllowed();
+    IOReturn sendAWDLData(const uint8_t *, size_t);
+    IOReturn setAWDLTemplate(bool mif, const uint8_t *data, size_t length);
+    IOReturn enableAWDLTransmit();
+    IOReturn requestAWDLMonitor(const ether_addr &);
+    bool awdlSyncNext(uint16_t *seq, uint32_t *wait_us) { return fHalService && fHalService->awdlSyncNext(seq, wait_us); }
+    void inputAWDLActionFrame(const uint8_t *, size_t, uint8_t, int, uint32_t);
+    void awdlTxRoom();
+    void startAWDLAuto();
+    void awdlPeerCache(const uint8_t *mac, uint32_t op) { if (fHalService) fHalService->awdlPeerCache(mac, op); }
+    void awdlPeerCacheDone(const uint8_t *mac, bool added);
+    static bool awdlCacheOn();
+    static bool awdlUmiOn();
+    static bool awdlLlwOn();
+    void sendAWDLUmi(const uint8_t *peer, const uint8_t *tlvs, size_t length) { if (fHalService) fHalService->sendAwdlUmi(peer, tlvs, length); }
+    void awdlUmiDone(const uint8_t *mac, bool acked);
+    IOReturn createLowLatencyInterface(AirportItlwmAWDLInterface *, const ether_addr &, char *name, size_t nameLength);
+    static IOReturn createLowLatencyInterfaceGated(OSObject *, void *, void *, void *, void *);
+    AirportItlwmLowLatencyInterface *llwInterface = nullptr;
+    bool llwCreating = false;
+    bool llwFailed = false;
+    static bool awdlLastBootPanicked();
+    static bool awdlOwnQueueWanted();
+    static bool awdlTxAggWanted();
+    static uint32_t awdlOwnFixWanted();
+    void setAWDLOwnQueue(bool on, bool agg, uint32_t fix) { if (fHalService) fHalService->setAwdlOwnQueue(on, agg, fix); }
+    static void awdlRadioTest(bool *hold, uint32_t *phy2, uint32_t *te, bool *amsdu);
+    void setAWDLRadioTest(bool hold, uint32_t phy2, uint32_t te, bool amsdu) { if (fHalService) fHalService->setAwdlRadioTest(hold, phy2, te, amsdu); }
+    bool awdlAmsduReady(const uint8_t *eth) { return fHalService && fHalService->awdlAmsduReady(eth); }
+    IOReturn sendAWDLAmsdu(const uint8_t *const *eths, const size_t *lengths, unsigned count) { return fHalService ? fHalService->sendAwdlAmsdu(eths, lengths, count) : kIOReturnNotReady; }
+    static IOReturn createAWDLInterfaceGated(OSObject *, void *, void *, void *, void *);
+    static IOReturn takeAWDLInterfaceGated(OSObject *, void *, void *, void *, void *);
+    AirportItlwmAWDLInterface *awdlInterface = nullptr;
+    bool awdlCreating = false;
+    bool awdlStopping = false;
+    bool awdlArmRegistered = false;
+    bool awdlFailed = false;
+    uint32_t awdlUnarmedRefusals = 0;
+    uint32_t awdlAttempts = 0;
+#endif
     virtual void free() override;
     virtual IOService* probe(IOService* provider, SInt32* score) override;
     virtual bool start(IOService *provider) override;

@@ -154,6 +154,29 @@ public:
     IOReturn disable(IONetworkInterface *netif) override;
     virtual struct ieee80211com *get80211Controller() override;
 #ifdef AIRPORT_WCL
+    IOReturn requestAwdlMonitor(const uint8_t *) override;
+    bool awdlSyncNext(uint16_t *, uint32_t *) override;
+    IOReturn setAwdlNativeTemplate(bool, const uint8_t *, size_t) override;
+    IOReturn enableAwdlNativeTx() override;
+    IOReturn sendAwdlData(const uint8_t *, size_t) override;
+    static void iwx_awdl_native_task(void *);
+    static void iwx_awdl_peer_task(void *);
+    static void iwx_awdl_ba_task(void *);
+    static void iwx_awdl_ownq_task(void *);
+    int iwx_awdl_own_release(struct iwx_softc *);
+    int iwx_awdl_peer_agg(struct iwx_softc *, uint32_t index);
+    int iwx_awdl_ba_cmd(struct iwx_softc *, const struct iwx_awdl_ba *, const struct iwx_awdl_ba_req *, uint32_t *);
+    void iwx_awdl_ba_send_resp(struct iwx_softc *, const struct iwx_awdl_ba_req *, uint16_t);
+    void setAwdlOwnQueue(bool, bool, uint32_t) override;
+    static void iwx_awdl_phy2_task(void *);
+    static void iwx_awdl_umi_task(void *);
+    void setAwdlRadioTest(bool, uint32_t, uint32_t, bool) override;
+    bool awdlAmsduReady(const uint8_t *) override;
+    void awdlPeerCache(const uint8_t *, uint32_t) override;
+    void sendAwdlUmi(const uint8_t *, const uint8_t *, size_t) override;
+    IOReturn sendAwdlAmsdu(const uint8_t *const *, const size_t *, unsigned) override;
+    IOReturn iwx_awdl_data_gate(struct iwx_softc *, const uint8_t *);
+    IOReturn iwx_awdl_data_enqueue(struct iwx_softc *, mbuf_t, size_t);
     IOReturn setScanHomeAwayTime(uint32_t milliseconds) override {
         com.sc_ic.ic_wcl_scan_away_time_ms = milliseconds;
         return kIOReturnSuccess;
@@ -285,7 +308,7 @@ public:
     int    iwx_nic_init(struct iwx_softc *);
     int    iwx_enable_txq(struct iwx_softc *, int, int, int, int);
     int     iwx_tvqm_alloc_txq(struct iwx_softc *, int, int);
-    int     iwx_tvqm_enable_txq(struct iwx_softc *, int, int, uint32_t);
+    int     iwx_tvqm_enable_txq(struct iwx_softc *, int, int, uint32_t, int sta_id = IWX_STATION_ID);
     void    iwx_post_alive(struct iwx_softc *);
     int iwx_send_time_event_cmd(struct iwx_softc *sc,
                             const struct iwx_time_event_cmd *cmd);
@@ -305,6 +328,12 @@ public:
 #ifdef AIRPORT_WCL
     static void    iwx_wcl_port_authorized(struct ieee80211com *);
     static void    iwx_mld_authorized_task(void *);
+    void    iwx_awdl_probe_publish(struct iwx_softc *);
+    void    iwx_awdl_tx_maybe(struct iwx_softc *);
+    void    iwx_awdl_ctx_publish(struct iwx_softc *);
+    void    iwx_awdl_ctx_add(struct iwx_softc *, struct iwx_node *);
+    void    iwx_awdl_ctx_remove(struct iwx_softc *);
+    int     iwx_awdl_ctx_link_cmd(struct iwx_softc *, struct iwx_node *, uint32_t, uint32_t, uint32_t);
 #endif
     static void    iwx_mac_ctxt_task(void *);
     static void    iwx_chan_ctxt_task(void *);

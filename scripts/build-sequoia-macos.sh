@@ -4,7 +4,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SDK=${MAC_KERNEL_SDK:?Set MAC_KERNEL_SDK to the MacKernelSDK directory}
 TOOLCHAIN=${DARWIN_TOOLCHAIN:-/Library/Developer/CommandLineTools/usr/bin}
 OUT=${BUILD_OUTPUT:-$ROOT/build}
-VERSION=${BE201_BUILD_VERSION:-1.1.7}
+VERSION=${BE201_BUILD_VERSION:-1.1.53}
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 2
 /bin/sh "$ROOT/scripts/prepare-mackernelsdk.sh" "$SDK"
 mkdir -p "$OUT/objects"
@@ -30,7 +30,7 @@ for name in re.findall(r'[A-F0-9]{24} /\* (.*?) in Sources \*/', phase):
     matches = inventory.get(name, [])
     assert len(matches) == 1, (name, matches)
     files.append(matches[0].relative_to(root).as_posix())
-assert len(files) == 57, len(files)
+assert len(files) == 58, len(files)
 (root / 'sources-sequoia.json').write_text(json.dumps(files, indent=2) + '\n')
 PY
 
@@ -88,4 +88,4 @@ clang++ "${common[@]}" -std=gnu++14 -fno-exceptions -fno-rtti \
 "$TOOLCHAIN/ld" -no_fixup_chains \
   -arch x86_64 -kext -undefined dynamic_lookup -macos_version_min 15.2 \
   -o "$OUT/AirportItlwm" "$OUT"/objects/*.o "$SDK/Library/x86_64/libkmod.a"
-printf 'Compiled 57 Sequoia sources and linked %s\n' "$OUT/AirportItlwm"
+printf 'Compiled 58 Sequoia sources and linked %s\n' "$OUT/AirportItlwm"

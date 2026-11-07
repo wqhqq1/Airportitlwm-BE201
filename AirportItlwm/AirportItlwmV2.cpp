@@ -7,12 +7,19 @@
 //
 
 #include "AirportItlwmV2.hpp"
+#include <IOKit/IODeviceTreeSupport.h>
 #include <sys/_netstat.h>
 #include <crypto/sha1.h>
 #include <net80211/ieee80211_priv.h>
 #include <net80211/ieee80211_var.h>
 
 #include "AirportItlwmSkywalkInterface.hpp"
+#ifdef AIRPORT_WCL
+#include "AirportItlwmAWDLInterface.hpp"
+#ifdef AIRPORT_WCL
+#include <sys/sysctl.h>
+#endif
+#endif
 #include "IOPCIEDeviceWrapper.hpp"
 #include "ItlStartupDiagnostics.hpp"
 
@@ -26,6 +33,7 @@ IOCommandGate *_fCommandGate;
 void AirportItlwm::releaseAll()
 {
 #ifdef AIRPORT_WCL
+    stopAWDLInterface();
     if (fNetIf)
         static_cast<AirportItlwmSkywalkInterface *>(fNetIf)->stopWCL();
     OSSafeReleaseNULL(driverFaultReporter);
@@ -576,6 +584,8 @@ bool AirportItlwm::start(IOService *provider)
         fHalService->get80211Controller()->ic_flags |= IEEE80211_F_AUTO_JOIN;
 #ifdef AIRPORT_WCL
     bsdInterface->registerService();
+    registerAWDLArmControl();
+    startAWDLAuto();
 #endif
     registerService();
     ItlStartupStage(pciNub, "ready");
@@ -585,6 +595,9 @@ bool AirportItlwm::start(IOService *provider)
 
 void AirportItlwm::stop(IOService *provider)
 {
+#ifdef AIRPORT_WCL
+    stopAWDLInterface();
+#endif
     XYLog("%s\n", __PRETTY_FUNCTION__);XYLog("%s\n", __PRETTY_FUNCTION__);
     struct _ifnet *ifp = &fHalService->get80211Controller()->ic_ac.ac_if;
 #ifdef AIRPORT_WCL
@@ -1129,6 +1142,16 @@ getCARD_CAPABILITIES(OSObject *object,
     // WCL uses this capability together with the BSS HE IE for PHY reporting.
     if (caps & IEEE80211_C_HE)
         cd->capabilities[17] |= 0x80;
+    // Capability bit 32 is what wifip2pd checks before VIRTUAL_IF_CREATE with role 6.
+    // be201_awdl_vif alone stays silent until armed, so a normal boot behaves as if it were off.
+    if (ItlDiagnosticFlag("be201_awdl_if") || (ItlDiagnosticFlag("be201_awdl_vif") && awdlVifCapabilityArmed()))
+        cd->capabilities[4] |= 0x01;
+    // The AWDL manager tests these through its cached copy: capabilities[0] bit 2 in configure,
+    // and capabilities[3] bit 5 as dual band; without that AWDL stays on 2.4 GHz.
+    if (ItlDiagnosticFlag("be201_awdl_vif") && awdlVifCapabilityArmed()) {
+        cd->capabilities[0] |= 0x04;
+        cd->capabilities[3] |= 0x20;
+    }
 #else
     cd->capabilities[2] = 0xFF; // BURST, WME, SHORT_GI_40MHZ, SHORT_GI_20MHZ, WOW, TSN, ?, ?
     cd->capabilities[3] = 0x2B;
@@ -1309,7 +1332,7 @@ SInt32 AirportItlwm::apple80211_ioctl(IO80211SkywalkInterface *interface,unsigne
     if (!ml_at_interrupt_context())
         XYLog("%s cmd: %s b1: %d b2: %d\n", __FUNCTION__, convertApple80211IOCTLToString((unsigned int)cmd), b1, b2);
 #ifdef AIRPORT_WCL
-    if (cmd == APPLE80211_IOC_WCL_EXTENDED_BSS_INFO && interface)
+    if (cmd == APPLE80211_IOC_WCL_EXTENDED_BSS_INFO && interface == fNetIf && interface)
         return static_cast<AirportItlwmSkywalkInterface *>(interface)->getWCL_EXTENDED_BSS_INFO((apple80211_extended_bss_info *)data);
     return kIOReturnUnsupported;
 #else
@@ -1321,7 +1344,7 @@ SInt32 AirportItlwm::apple80211SkywalkRequest(UInt request,int cmd,IO80211Skywal
 {
     if (!ml_at_interrupt_context())
         XYLog("%s 1 cmd: %s request: %d\n", __FUNCTION__, convertApple80211IOCTLToString(cmd), request);
-    if (cmd == APPLE80211_IOC_WCL_EXTENDED_BSS_INFO && interface)
+    if (cmd == APPLE80211_IOC_WCL_EXTENDED_BSS_INFO && interface == fNetIf && interface)
         return static_cast<AirportItlwmSkywalkInterface *>(interface)->getWCL_EXTENDED_BSS_INFO((apple80211_extended_bss_info *)data);
     return kIOReturnUnsupported;
 }
@@ -1330,7 +1353,7 @@ SInt32 AirportItlwm::apple80211SkywalkRequest(UInt request,int cmd,IO80211Skywal
 {
     if (!ml_at_interrupt_context())
         XYLog("%s 2 cmd: %s request: %d\n", __FUNCTION__, convertApple80211IOCTLToString(cmd), request);
-    if (cmd == APPLE80211_IOC_WCL_EXTENDED_BSS_INFO && interface)
+    if (cmd == APPLE80211_IOC_WCL_EXTENDED_BSS_INFO && interface == fNetIf && interface)
         return static_cast<AirportItlwmSkywalkInterface *>(interface)->getWCL_EXTENDED_BSS_INFO((apple80211_extended_bss_info *)data);
     return kIOReturnUnsupported;
 }
@@ -1526,3 +1549,464 @@ void AirportItlwm::setPowerStateOn()
     pmPowerState = kPowerStateOn;
     pmPolicyMaker->acknowledgeSetPowerState();
 }
+
+#ifdef AIRPORT_WCL
+/*
+ * wifip2pd asks for awdl0 by itself during every boot, so creation must not depend on the
+ * boot argument alone: a fault there would leave the Mac unable to start. Root arms one
+ * attempt from a running session with sysctl. Kept in RAM, so every boot starts unarmed.
+ */
+static int be201AwdlVifArm;
+static bool be201AwdlVifAttempted;
+SYSCTL_DECL(_debug);
+SYSCTL_INT(_debug, OID_AUTO, be201_awdl_vif_arm, CTLFLAG_RW | CTLFLAG_LOCKED, &be201AwdlVifArm, 0, "");
+static int be201AwdlVifPoolFlagsValue;
+SYSCTL_INT(_debug, OID_AUTO, be201_awdl_vif_poolflags, CTLFLAG_RW | CTLFLAG_LOCKED, &be201AwdlVifPoolFlagsValue, 0, "");
+
+static int be201AwdlVifAcceptSetsValue;
+SYSCTL_INT(_debug, OID_AUTO, be201_awdl_vif_accept, CTLFLAG_RW | CTLFLAG_LOCKED, &be201AwdlVifAcceptSetsValue, 0, "");
+
+static int be201AwdlVifLinkValue;
+SYSCTL_INT(_debug, OID_AUTO, be201_awdl_vif_link, CTLFLAG_RW | CTLFLAG_LOCKED, &be201AwdlVifLinkValue, 0, "");
+
+static int be201AwdlVifAwValue;
+SYSCTL_INT(_debug, OID_AUTO, be201_awdl_vif_aw, CTLFLAG_RW | CTLFLAG_LOCKED, &be201AwdlVifAwValue, 0, "");
+
+static int be201AwdlVifRadioValue;
+SYSCTL_INT(_debug, OID_AUTO, be201_awdl_vif_radio, CTLFLAG_RW | CTLFLAG_LOCKED, &be201AwdlVifRadioValue, 0, "");
+static int be201AwdlVifDataValue;
+SYSCTL_INT(_debug, OID_AUTO, be201_awdl_vif_data, CTLFLAG_RW | CTLFLAG_LOCKED, &be201AwdlVifDataValue, 0, "");
+
+bool AirportItlwm::awdlVifDataAllowed()
+{
+    return __atomic_load_n(&be201AwdlVifDataValue, __ATOMIC_ACQUIRE) == 1;
+}
+
+IOReturn AirportItlwm::sendAWDLData(const uint8_t *eth, size_t length)
+{
+    return fHalService ? fHalService->sendAwdlData(eth, length) : kIOReturnNotReady;
+}
+
+static int be201AwdlVifTxValue;
+SYSCTL_INT(_debug, OID_AUTO, be201_awdl_vif_tx, CTLFLAG_RW | CTLFLAG_LOCKED, &be201AwdlVifTxValue, 0, "");
+
+bool AirportItlwm::awdlVifTxAllowed()
+{
+    return __atomic_load_n(&be201AwdlVifTxValue, __ATOMIC_ACQUIRE) == 1;
+}
+
+// Test only, and only from RAM: data to a peer on that peer's own firmware queue, following where data goes.
+static int be201AwdlOwnQueueValue;
+SYSCTL_INT(_debug, OID_AUTO, be201_awdl_own_queue, CTLFLAG_RW | CTLFLAG_LOCKED, &be201AwdlOwnQueueValue, 0, "");
+// Test only: that queue on TID 0 with A-MPDU parameters and firmware rate control, QoS data, for Mac to phone speed.
+static int be201AwdlTxAggValue;
+SYSCTL_INT(_debug, OID_AUTO, be201_awdl_txagg, CTLFLAG_RW | CTLFLAG_LOCKED, &be201AwdlTxAggValue, 0, "");
+// Test only: fixes tried for the held own queue, by bit (1 MAC 1 without power save, 2 link 1 QoS and beacon timing).
+static int be201AwdlOwnFixValue;
+SYSCTL_INT(_debug, OID_AUTO, be201_awdl_own_fix, CTLFLAG_RW | CTLFLAG_LOCKED, &be201AwdlOwnFixValue, 0, "");
+
+// Test only, from RAM too: wait out the peer's other channels; link 1 on a channel of its own, with windows.
+static int be201AwdlTxHoldValue, be201AwdlPhy2Value, be201AwdlPhy2TeValue, be201AwdlAmsduValue;
+SYSCTL_INT(_debug, OID_AUTO, be201_awdl_amsdu, CTLFLAG_RW | CTLFLAG_LOCKED, &be201AwdlAmsduValue, 0, "");
+SYSCTL_INT(_debug, OID_AUTO, be201_awdl_tx_hold, CTLFLAG_RW | CTLFLAG_LOCKED, &be201AwdlTxHoldValue, 0, "");
+SYSCTL_INT(_debug, OID_AUTO, be201_awdl_phy2, CTLFLAG_RW | CTLFLAG_LOCKED, &be201AwdlPhy2Value, 0, "");
+SYSCTL_INT(_debug, OID_AUTO, be201_awdl_phy2_te, CTLFLAG_RW | CTLFLAG_LOCKED, &be201AwdlPhy2TeValue, 0, "");
+
+void AirportItlwm::awdlRadioTest(bool *hold, uint32_t *phy2, uint32_t *te, bool *amsdu)
+{
+    *amsdu = __atomic_load_n(&be201AwdlAmsduValue, __ATOMIC_ACQUIRE) == 1;
+    *hold = __atomic_load_n(&be201AwdlTxHoldValue, __ATOMIC_ACQUIRE) == 1;
+    const int channel = __atomic_load_n(&be201AwdlPhy2Value, __ATOMIC_ACQUIRE);
+    *phy2 = channel > 0 ? static_cast<uint32_t>(channel) : 0;
+    // 1: a window once a second, as in 1.1.42. 2: windows in the reference peer's slots on that channel.
+    const int windows = __atomic_load_n(&be201AwdlPhy2TeValue, __ATOMIC_ACQUIRE);
+    *te = windows == 1 || windows == 2 ? static_cast<uint32_t>(windows) : 0;
+}
+
+bool AirportItlwm::awdlOwnQueueWanted()
+{
+    return __atomic_load_n(&be201AwdlOwnQueueValue, __ATOMIC_ACQUIRE) == 1;
+}
+
+bool AirportItlwm::awdlTxAggWanted()
+{
+    return __atomic_load_n(&be201AwdlTxAggValue, __ATOMIC_ACQUIRE) == 1;
+}
+
+uint32_t AirportItlwm::awdlOwnFixWanted()
+{
+    const int fix = __atomic_load_n(&be201AwdlOwnFixValue, __ATOMIC_ACQUIRE);
+    return fix > 0 ? static_cast<uint32_t>(fix) & 3 : 0;
+}
+
+// Test only: answer the family's peer cache requests. Off, a request is taken and never answered, as through 1.1.44.
+static int be201AwdlCacheOnValue;
+SYSCTL_INT(_debug, OID_AUTO, be201_awdl_cache_on, CTLFLAG_RW | CTLFLAG_LOCKED, &be201AwdlCacheOnValue, 0, "");
+
+static int be201AwdlUmiValue;
+SYSCTL_INT(_debug, OID_AUTO, be201_awdl_umi, CTLFLAG_RW | CTLFLAG_LOCKED, &be201AwdlUmiValue, 0, "");
+static int be201AwdlLlwValue;
+SYSCTL_INT(_debug, OID_AUTO, be201_awdl_llw, CTLFLAG_RW | CTLFLAG_LOCKED, &be201AwdlLlwValue, 0, "");
+
+bool AirportItlwm::awdlUmiOn()
+{
+    return __atomic_load_n(&be201AwdlUmiValue, __ATOMIC_ACQUIRE) == 1;
+}
+
+bool AirportItlwm::awdlLlwOn()
+{
+    return __atomic_load_n(&be201AwdlLlwValue, __ATOMIC_ACQUIRE) == 1;
+}
+
+bool AirportItlwm::awdlCacheOn()
+{
+    return __atomic_load_n(&be201AwdlCacheOnValue, __ATOMIC_ACQUIRE) == 1;
+}
+
+static int be201AwdlVifRxValue;
+SYSCTL_INT(_debug, OID_AUTO, be201_awdl_vif_rx, CTLFLAG_RW | CTLFLAG_LOCKED, &be201AwdlVifRxValue, 0, "");
+
+bool AirportItlwm::awdlVifRxAllowed()
+{
+    return __atomic_load_n(&be201AwdlVifRxValue, __ATOMIC_ACQUIRE) == 1;
+}
+
+void AirportItlwm::inputAWDLActionFrame(const uint8_t *frame, size_t length,
+    uint8_t channel, int rssi, uint32_t device_us)
+{
+    // HAL RX and interface teardown use this same workloop gate. No cached child pointer in HAL.
+    if (!getWorkLoop() || !getWorkLoop()->inGate() || awdlStopping || awdlCreating ||
+        !awdlInterface || !awdlVifRxAllowed())
+        return;
+    awdlInterface->inputActionFrame(frame, length, channel, rssi, device_us);
+}
+
+// A completion made room on the radio. Same gate as receive; the wake itself only signals the queue.
+void AirportItlwm::awdlTxRoom()
+{
+    if (!getWorkLoop() || !getWorkLoop()->inGate() || awdlStopping || awdlCreating || !awdlInterface)
+        return;
+    awdlInterface->txRoom();
+    if (llwInterface)
+        llwInterface->txRoom();
+}
+
+void AirportItlwm::awdlUmiDone(const uint8_t *mac, bool acked)
+{
+    if (!getWorkLoop() || !getWorkLoop()->inGate() || awdlStopping || awdlCreating || !awdlInterface)
+        return;
+    awdlInterface->umiDone(mac, acked);
+}
+
+void AirportItlwm::awdlPeerCacheDone(const uint8_t *mac, bool added)
+{
+    if (!getWorkLoop() || !getWorkLoop()->inGate() || awdlStopping || awdlCreating || !awdlInterface)
+        return;
+    awdlInterface->peerCacheDone(mac, added);
+}
+
+bool AirportItlwm::awdlVifRadioAllowed()
+{
+    return __atomic_load_n(&be201AwdlVifRadioValue, __ATOMIC_ACQUIRE) == 1;
+}
+
+IOReturn AirportItlwm::setAWDLTemplate(bool mif, const uint8_t *data, size_t length)
+{
+    return fHalService ? fHalService->setAwdlNativeTemplate(mif, data, length) : kIOReturnNotReady;
+}
+
+IOReturn AirportItlwm::enableAWDLTransmit()
+{
+    return fHalService ? fHalService->enableAwdlNativeTx() : kIOReturnNotReady;
+}
+
+IOReturn AirportItlwm::requestAWDLMonitor(const ether_addr &address)
+{
+    return fHalService ? fHalService->requestAwdlMonitor(reinterpret_cast<const uint8_t *>(&address)) : kIOReturnNotReady;
+}
+
+bool AirportItlwm::awdlVifAwAllowed()
+{
+    return __atomic_load_n(&be201AwdlVifAwValue, __ATOMIC_ACQUIRE) != 0;
+}
+
+void AirportItlwm::reloadAWDLCapabilities()
+{
+    if (!fNetIf)
+        return;
+    loadCardCapabilities(fNetIf);
+    if (const uint8_t *cache = nativeCapabilityCache())
+        setProperty("ItlwmAwdlCapabilityCache", const_cast<uint8_t *>(cache), 0x18);
+}
+
+bool AirportItlwm::awdlVifLinkAllowed()
+{
+    return __atomic_load_n(&be201AwdlVifLinkValue, __ATOMIC_ACQUIRE) != 0;
+}
+
+bool AirportItlwm::awdlVifAcceptSets()
+{
+    return __atomic_load_n(&be201AwdlVifAcceptSetsValue, __ATOMIC_ACQUIRE) != 0;
+}
+
+uint32_t AirportItlwm::awdlVifPoolFlags()
+{
+    return __atomic_load_n(&be201AwdlVifPoolFlagsValue, __ATOMIC_ACQUIRE) & 1;
+}
+
+bool AirportItlwm::awdlVifCapabilityArmed()
+{
+    return __atomic_load_n(&be201AwdlVifArm, __ATOMIC_ACQUIRE) || be201AwdlVifAttempted;
+}
+
+void AirportItlwm::registerAWDLArmControl()
+{
+    if (awdlArmRegistered || !ItlDiagnosticFlag("be201_awdl_vif")) return;
+    sysctl_register_oid(&sysctl__debug_be201_awdl_vif_arm);
+    sysctl_register_oid(&sysctl__debug_be201_awdl_vif_poolflags);
+    sysctl_register_oid(&sysctl__debug_be201_awdl_vif_accept);
+    sysctl_register_oid(&sysctl__debug_be201_awdl_vif_link);
+    sysctl_register_oid(&sysctl__debug_be201_awdl_vif_aw);
+    sysctl_register_oid(&sysctl__debug_be201_awdl_vif_tx);
+    sysctl_register_oid(&sysctl__debug_be201_awdl_vif_data);
+    sysctl_register_oid(&sysctl__debug_be201_awdl_vif_radio);
+    sysctl_register_oid(&sysctl__debug_be201_awdl_vif_rx);
+    sysctl_register_oid(&sysctl__debug_be201_awdl_own_queue);
+    sysctl_register_oid(&sysctl__debug_be201_awdl_txagg);
+    sysctl_register_oid(&sysctl__debug_be201_awdl_own_fix);
+    sysctl_register_oid(&sysctl__debug_be201_awdl_tx_hold);
+    sysctl_register_oid(&sysctl__debug_be201_awdl_phy2);
+    sysctl_register_oid(&sysctl__debug_be201_awdl_phy2_te);
+    sysctl_register_oid(&sysctl__debug_be201_awdl_amsdu);
+    sysctl_register_oid(&sysctl__debug_be201_awdl_cache_on);
+    sysctl_register_oid(&sysctl__debug_be201_awdl_umi);
+    sysctl_register_oid(&sysctl__debug_be201_awdl_llw);
+    awdlArmRegistered = true;
+}
+
+// What the test tool did by hand, now at load. The same single attempt per boot; the test switches stay off.
+// After a panic the record is still in NVRAM at this point, read only here: a panic must not repeat every boot.
+void AirportItlwm::startAWDLAuto()
+{
+    if (!awdlArmRegistered || !ItlDiagnosticFlag("be201_awdl_auto")) return;
+    if (awdlLastBootPanicked()) {
+        setProperty("ItlwmAwdlAutoSkippedAfterPanic", true);
+        return;
+    }
+    __atomic_store_n(&be201AwdlVifAcceptSetsValue, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&be201AwdlVifLinkValue, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&be201AwdlVifAwValue, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&be201AwdlVifRadioValue, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&be201AwdlVifRxValue, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&be201AwdlVifTxValue, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&be201AwdlVifDataValue, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&be201AwdlVifArm, 1, __ATOMIC_RELEASE);
+    setProperty("ItlwmAwdlAuto", true);
+}
+
+bool AirportItlwm::awdlLastBootPanicked()
+{
+    IORegistryEntry *options = IORegistryEntry::fromPath("/options", gIODTPlane);
+    if (!options) return false;
+    OSObject *record = options->copyProperty("aapl,panic-info");
+    const bool panicked = record != nullptr;
+    OSSafeReleaseNULL(record);
+    options->release();
+    return panicked;
+}
+
+IOReturn AirportItlwm::createAWDLInterface(apple80211_virt_if_create_data *request)
+{
+    if (!request || !ItlDiagnosticFlag("be201_awdl_vif")) return kIOReturnUnsupported;
+    if (!_fCommandGate) return kIOReturnNotReady;
+    return _fCommandGate->runAction(createAWDLInterfaceGated, request);
+}
+
+IOReturn AirportItlwm::createAWDLInterfaceGated(OSObject *owner, void *arg0, void *, void *, void *)
+{
+    auto controller = OSDynamicCast(AirportItlwm, owner);
+    auto request = static_cast<apple80211_virt_if_create_data *>(arg0);
+    if (!controller || !request) return kIOReturnBadArgument;
+    if (controller->awdlStopping || controller->awdlCreating) return kIOReturnNotReady;
+    if (request->role != APPLE80211_VIF_AWDL || (request->version != 0 && request->version != APPLE80211_VERSION))
+        return kIOReturnUnsupported;
+    uint8_t nonzero = 0;
+    for (unsigned i = 0; i < APPLE80211_ADDR_LEN; ++i) nonzero |= request->mac[i];
+    if (!nonzero || (request->mac[0] & 1)) return kIOReturnBadArgument;
+    if (controller->awdlFailed) return kIOReturnNotReady;
+    if (controller->awdlInterface) {
+        ether_addr old = controller->awdlInterface->getSelfMacAddr();
+        if (memcmp(&old, request->mac, sizeof(old))) return kIOReturnBusy;
+        const char *name = controller->awdlInterface->getBSDName();
+        if (!name || !controller->awdlInterface->getBSDInterface()) return kIOReturnNotReady;
+        strlcpy(reinterpret_cast<char *>(request->bsd_name), name, sizeof(request->bsd_name));
+        return kIOReturnSuccess;
+    }
+    // Each arm allows one attempt, so a failure cannot repeat on wifip2pd's next request.
+    if (!__atomic_exchange_n(&be201AwdlVifArm, 0, __ATOMIC_ACQ_REL)) {
+        controller->setProperty("ItlwmAwdlVifUnarmedRefusals", ++controller->awdlUnarmedRefusals, 32);
+        return kIOReturnUnsupported;
+    }
+    be201AwdlVifAttempted = true;
+    controller->setProperty("ItlwmAwdlVifAttempts", ++controller->awdlAttempts, 32);
+    IOLog("BE201VIF create attempt=%u\n", controller->awdlAttempts);
+    controller->awdlCreating = true;
+    auto interface = new AirportItlwmAWDLInterface;
+    IOReturn result = kIOReturnNoMemory;
+    if (interface) {
+        ether_addr mac = {}; memcpy(&mac, request->mac, sizeof(mac));
+        result = kIOReturnError;
+        if (interface->initForController(controller, mac) && interface->attach(controller) && interface->start(controller)) {
+            // The BSD client attaches from the matching thread and may need this gate, so the
+            // wait gives it up. Bounded, because a failure here must not hold wifip2pd forever.
+            result = kIOReturnNotReady;
+            for (int i = 0; i < 100 && !controller->awdlStopping && !interface->getBSDInterface(); ++i) {
+                AbsoluteTime deadline;
+                clock_interval_to_deadline(100, kMillisecondScale, &deadline);
+                _fCommandGate->commandSleep(&controller->awdlCreating, deadline, THREAD_UNINT);
+            }
+            const char *name = interface->getBSDName();
+            if (!controller->awdlStopping && name && !strncmp(name, "awdl", 4) && interface->getBSDInterface()) {
+                interface->markDown();
+                strlcpy(reinterpret_cast<char *>(request->bsd_name), name, sizeof(request->bsd_name));
+                interface->setProperty("ItlwmAwdlVifStage", 6, 32);
+                controller->setProperty("ItlwmAwdlVifStep", "ready");
+                IOLog("BE201VIF step=ready name=%s\n", name);
+                result = kIOReturnSuccess;
+            }
+        }
+        if (result != kIOReturnSuccess) {
+            auto stage = OSDynamicCast(OSNumber, interface->getProperty("ItlwmAwdlVifStage"));
+            controller->setProperty("ItlwmAwdlVifFailedStage", stage ? stage->unsigned32BitValue() : 0, 32);
+        }
+        if (result == kIOReturnSuccess || interface->holdsNativeState()) {
+            // Retain the creation reference for controller lifetime. A failed object stays too:
+            // freeing it left the controller's AWDL pointer dangling, which panicked 1.1.21.
+            controller->awdlInterface = interface;
+            controller->awdlFailed = result != kIOReturnSuccess;
+        } else {
+            interface->release();
+        }
+    }
+    controller->setProperty("ItlwmAwdlVifCreateResult", static_cast<uint32_t>(result), 32);
+    IOLog("BE201VIF create result=0x%x\n", result);
+    controller->awdlCreating = false;
+    _fCommandGate->commandWakeup(&controller->awdlCreating);
+    return result;
+}
+
+struct LowLatencyRequest {
+    AirportItlwmAWDLInterface *parent;
+    const ether_addr *address;
+    char *name;
+    size_t nameLength;
+};
+
+IOReturn AirportItlwm::createLowLatencyInterface(AirportItlwmAWDLInterface *parent, const ether_addr &address, char *name, size_t nameLength)
+{
+    if (!_fCommandGate) return kIOReturnNotReady;
+    LowLatencyRequest request = {parent, &address, name, nameLength};
+    return _fCommandGate->runAction(createLowLatencyInterfaceGated, &request);
+}
+
+IOReturn AirportItlwm::createLowLatencyInterfaceGated(OSObject *owner, void *arg0, void *, void *, void *)
+{
+    auto controller = OSDynamicCast(AirportItlwm, owner);
+    auto request = static_cast<LowLatencyRequest *>(arg0);
+    if (!controller || !request || !request->parent || request->parent != controller->awdlInterface) return kIOReturnBadArgument;
+    if (controller->awdlStopping || controller->llwCreating) return kIOReturnNotReady;
+    if (controller->llwFailed) return kIOReturnNotReady;
+    // 1.1.47 waited here for the BSD interface and never got it: the request comes on awdl0's path, which the
+    // attach may need. Native answers at once, and wifip2pd waits for the name to appear, so this answers at once
+    // and the interface finishes from its own timer.
+    if (controller->llwInterface) {
+        const char *existing = controller->llwInterface->getBSDInterface() ? controller->llwInterface->getBSDName() : nullptr;
+        strlcpy(request->name, existing && existing[0] ? existing : "llw0", request->nameLength);
+        return kIOReturnSuccess;
+    }
+    controller->setProperty("ItlwmAwdlLlwAttempts", 1, 32);
+    controller->llwCreating = true;
+    auto interface = new AirportItlwmLowLatencyInterface;
+    IOReturn result = kIOReturnNoMemory;
+    if (interface) {
+        result = kIOReturnError;
+        const bool ok = interface->initForParent(controller, request->parent, *request->address) &&
+            (controller->setProperty("ItlwmAwdlLlwStage", 2, 32), interface->attach(controller)) &&
+            (controller->setProperty("ItlwmAwdlLlwStage", 3, 32), interface->start(controller));
+        if (ok) {
+            // The name native would give; the interface publishes the real one when it attaches.
+            strlcpy(request->name, "llw0", request->nameLength);
+            interface->bringUp();
+            result = kIOReturnSuccess;
+        } else {
+            auto stage = OSDynamicCast(OSNumber, controller->getProperty("ItlwmAwdlLlwStage"));
+            controller->setProperty("ItlwmAwdlLlwFailedStage", stage ? stage->unsigned32BitValue() : 0, 32);
+        }
+        // The parent points at it after init, so a failed object stays too, like awdl0's.
+        if (result == kIOReturnSuccess || interface->holdsNativeState()) {
+            controller->llwInterface = interface;
+            controller->llwFailed = result != kIOReturnSuccess;
+        } else {
+            interface->release();
+        }
+    }
+    controller->setProperty("ItlwmAwdlLlwCreateResult", static_cast<uint32_t>(result), 32);
+    controller->llwCreating = false;
+    _fCommandGate->commandWakeup(&controller->llwCreating);
+    return result;
+}
+
+IOReturn AirportItlwm::takeAWDLInterfaceGated(OSObject *owner, void *arg0, void *, void *, void *)
+{
+    auto controller = static_cast<AirportItlwm *>(owner);
+    controller->awdlStopping = true;
+    while (controller->awdlCreating || controller->llwCreating)
+        _fCommandGate->commandSleep(controller->awdlCreating ? &controller->awdlCreating : &controller->llwCreating, THREAD_UNINT);
+    *static_cast<AirportItlwmAWDLInterface **>(arg0) = controller->awdlInterface;
+    controller->awdlInterface = nullptr;
+    return kIOReturnSuccess;
+}
+
+void AirportItlwm::stopAWDLInterface()
+{
+    if (awdlArmRegistered) {
+        sysctl_unregister_oid(&sysctl__debug_be201_awdl_vif_arm);
+        sysctl_unregister_oid(&sysctl__debug_be201_awdl_vif_poolflags);
+        sysctl_unregister_oid(&sysctl__debug_be201_awdl_vif_accept);
+        sysctl_unregister_oid(&sysctl__debug_be201_awdl_vif_link);
+        sysctl_unregister_oid(&sysctl__debug_be201_awdl_vif_aw);
+        sysctl_unregister_oid(&sysctl__debug_be201_awdl_vif_tx);
+        sysctl_unregister_oid(&sysctl__debug_be201_awdl_vif_data);
+        sysctl_unregister_oid(&sysctl__debug_be201_awdl_vif_radio);
+        sysctl_unregister_oid(&sysctl__debug_be201_awdl_vif_rx);
+        sysctl_unregister_oid(&sysctl__debug_be201_awdl_own_queue);
+        sysctl_unregister_oid(&sysctl__debug_be201_awdl_txagg);
+        sysctl_unregister_oid(&sysctl__debug_be201_awdl_own_fix);
+        sysctl_unregister_oid(&sysctl__debug_be201_awdl_tx_hold);
+        sysctl_unregister_oid(&sysctl__debug_be201_awdl_phy2);
+        sysctl_unregister_oid(&sysctl__debug_be201_awdl_phy2_te);
+        sysctl_unregister_oid(&sysctl__debug_be201_awdl_amsdu);
+        sysctl_unregister_oid(&sysctl__debug_be201_awdl_cache_on);
+        sysctl_unregister_oid(&sysctl__debug_be201_awdl_umi);
+        sysctl_unregister_oid(&sysctl__debug_be201_awdl_llw);
+        awdlArmRegistered = false;
+    }
+    AirportItlwmAWDLInterface *interface = nullptr;
+    if (_fCommandGate) _fCommandGate->runAction(takeAWDLInterfaceGated, &interface);
+    else { awdlStopping = true; interface = awdlInterface; awdlInterface = nullptr; }
+    if (!interface) return;
+    // Before its parent, whose peer manager it borrows.
+    if (auto *lowLatency = llwInterface) {
+        llwInterface = nullptr;
+        interface->setCompanion(nullptr);
+        lowLatency->terminate(kIOServiceRequired | kIOServiceSynchronous);
+        lowLatency->stop(this);
+        lowLatency->release();
+    }
+    // This is a controller stop/release path, never the create ioctl or RX callback.
+    // Required synchronous termination closes clients, invokes child stop and detaches it.
+    interface->terminate(kIOServiceRequired | kIOServiceSynchronous);
+    interface->stop(this); // Idempotent if IOKit already performed stop during termination.
+    interface->release();
+}
+#endif

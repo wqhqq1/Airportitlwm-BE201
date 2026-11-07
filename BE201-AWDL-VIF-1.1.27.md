@@ -1,0 +1,17 @@
+# BE201 1.1.27: staged OS-address receive monitor; isolate daemon refresh
+
+Pinned Sequoia 24G824/API92. Experimental, requires manual arm after normal boot.
+
+1.1.26 observations, boot B75725B9 at 22:25:23: actual new interface exists after the script; host AW timer counter >14k but native logs still say no AW start, and still select 6-only sequence / report no dual band. No RF TX/RX connected. Watch at 22:34:09 fails with SFAutoUnlockErrorDomain 138 (Ranging Timeout, Couldn't Find Peer). That does not establish whether firmware ranging can work once peer discovery/data exist.
+
+Hotspot observation: sharingd recorded an SFRemoteHotspotDevice including battery 100 at 22:30:20 and 22:30:44, before script start 22:31:18. The old script restarted sharingd and Finder around 22:31:42. Therefore the AWDL arm is not necessary for obtaining battery data. The earlier missing UI and the effect of refreshing the daemons versus elapsed time are not separated by this sample. Handoff briefly worked then failed per user; no repeatable causal pattern established. No account, pairing, Bluetooth or NVRAM reset performed.
+
+New: debug.be201_awdl_vif_radio gates a receive-only HAL binding requested after successful native link setup. It uses the exact OS-selected AWDL MAC, stages mode 6 / probe mode 3 / TX mode 0, then queues a dedicated task. The request callback never issues firmware commands inline. The worker marshals to the existing HAL command gate without assuming the gate owner is the HAL object. It waits for a valid associated, authorized STA and uses the already-tested mode-6 MAC/link commands on the AP's PHY. A later authorized transition reuses the existing ctx_add hook; Wi-Fi stop cancels the new task and marks readiness false. Address conflicts / old experimental contexts are rejected without altering their bytes. No dedicated TX queue, no AP filter widening, no main station MAC replacement, no new transmission.
+
+ItlwmAwdlNativeMonitorQueueResult reports only queueing. Firmware readiness is separately ItlwmAwdlNativeMonitorReady plus context stage/error. Context removal and firmware stop clear readiness. Counters in the PCI provider prove only monitor RX, not delivery into the native peer manager. No HAL->virtual-interface pointer/callback is retained, so this stage does not introduce a receiver-lifetime dependency.
+
+The test script sets the radio gate but leaves synthetic host AW events off. It still restarts wifip2pd to request the armed interface; it no longer restarts sharingd/Finder. An independent, user-invoked refresh script only restarts the current user's sharingd/Finder and never touches sysctls/driver/EFI. This separates the hotspot UI refresh from the interface experiment. No automatic refresh or persistent service is installed.
+
+Validation: all 22 suites, actual 563-slot/63-handler ABI, ASan/UBSan binding/worker cases including a deliberately unrelated command-gate owner and a six-readable-byte boundary, existing lifecycle tests plus gated radio forwarding; 58-unit build and all native imports, pinned 1232-file SDK/firmware. These checks do not prove firmware command success on this boot. Source remains uncommitted.
+
+Expected next reboot experiment: baseline hotspot visibility/battery before scripts, optionally refresh-only; manually arm and open AirDrop on the nearby phone while staying on the same AP/channel; then read monitor Ready/stage/error and actual Action/Data counters. No file transfer or Watch success claim: native RX forwarding, TX, scheduling, data and ranging are still incomplete.

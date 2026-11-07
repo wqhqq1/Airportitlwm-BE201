@@ -4,9 +4,15 @@
 #pragma once
 #include "IO80211SkywalkInterface.h"
 #include "../apple_private_spi.h"
+class IO80211Buffer;
+class IO80211BufferPool;
 class IO80211VirtualInterface : public IO80211SkywalkInterface {
     OSDeclareDefaultStructors(IO80211VirtualInterface)
 public:
+    // Nonvirtual native exports. These do not change the virtual dispatch table.
+    IO80211BufferPool *getMgmtFramePool();
+    void setCompanionLowLatencySkywalkInterface(IO80211SkywalkInterface *);
+    void bpfTapInput(IO80211Buffer *, unsigned, void *, unsigned long);
     virtual void free() override; // slot 18
     virtual IOReturn configureReport(IOReportChannelList*, unsigned int, void*, void*) override; // slot 133
     virtual IOReturn updateReport(IOReportChannelList*, unsigned int, void*, void*) override; // slot 134
@@ -106,6 +112,14 @@ public:
     OSMetaClassDeclareReservedUnused(IO80211VirtualInterface, 13);
     OSMetaClassDeclareReservedUnused(IO80211VirtualInterface, 14);
     OSMetaClassDeclareReservedUnused(IO80211VirtualInterface, 15);
+protected:
+    // Partial native init can already hold a controller open / PM interest and BPF list.
+    // Only test pointer presence; cleanup remains in the native terminate/free methods.
+    bool hasNativeVirtualState() const {
+        void *state = nullptr;
+        memcpy(&state, _virtualExpansion, sizeof(state));
+        return state != nullptr;
+    }
 private:
     uint8_t _virtualExpansion[8];
 };

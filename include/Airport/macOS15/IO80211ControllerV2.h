@@ -126,6 +126,11 @@ class IO80211InterfaceAVCAdvisory;
 
 
 class IO80211Controller : public IOEthernetController {
+public:
+    // Non-virtual. Native createPeerManager stores a role 6 interface here and nothing clears it.
+    IO80211VirtualInterface *getAwdlInterface();
+    void setAwdlInterface(IO80211VirtualInterface *);
+    void loadCardCapabilities(IO80211SkywalkInterface *);
     OSDeclareAbstractStructors(IO80211Controller)
 public:
     IOReturn postMessage(IO80211SkywalkInterface *, unsigned int, void *, unsigned long, bool);

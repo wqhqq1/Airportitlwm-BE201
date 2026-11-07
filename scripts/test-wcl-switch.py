@@ -155,7 +155,7 @@ mac_harness = r'''
 #define IEEE80211_ADDR_COPY(a,b) memcpy(a,b,6)
 ''' + defines + '\n' + decls + r'''
 struct ieee80211com {uint8_t ic_myaddr[6]={2,1,1,1,1,1};struct {uint8_t mac_cap_info[6]={};}ic_he_cap_elem;};
-struct iwx_softc {ieee80211com sc_ic;uint8_t sc_mld_context_addr[6]={};bool sc_mld_context_addr_valid=false;};
+struct iwx_softc {struct{unsigned mode=0;}sc_awdl_probe;ieee80211com sc_ic;uint8_t sc_mld_context_addr[6]={};bool sc_mld_context_addr_valid=false;};
 struct iwx_node {struct {unsigned ni_flags=0,ni_associd=1;}in_ni;};
 struct ItlIwx {iwx_mac_config_cmd wire={};int result=0;
  uint32_t iwx_cmd_id(unsigned c,unsigned g,unsigned v){return c|(g<<8)|(v<<16);}

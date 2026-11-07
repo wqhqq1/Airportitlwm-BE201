@@ -746,12 +746,33 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
     if (diagEnabled && !++ic->ic_wcl_rsn_cookie) ++ic->ic_wcl_rsn_cookie;
     ic->ic_wcl_diag_key_cipher = join.keyCipher;
     ic->ic_wcl_diag_rsn_length = join.rsnLength;
+    ic->ic_wcl_m4_abs = 0;
+    ic->ic_wcl_unprot_noted = false;
+    ic->ic_wcl_assoc_ie_len = uint8_t(AirportWCL::buildHotspotClientIE(join.assocFlags, ic->ic_wcl_assoc_ie));
+    WCL_RSN_NOTE(ic, 35, join.assocFlags);
+    if (instance && instance->pciNub) {
+        instance->pciNub->setProperty("ItlwmWclJoinAssocFlags", join.assocFlags, 32);
+        // The RSN request is public association content, never the key.
+        instance->pciNub->setProperty("ItlwmWclJoinRSN", join.rsn, join.rsnLength);
+    }
     ++wclJoinStarts;
     if (instance && instance->pciNub)
         instance->pciNub->setProperty("ItlwmWclJoinStarts", wclJoinStarts, 32);
     struct ieee80211_node *selbs = ieee80211_find_node(ic, join.bssid);
     if (!selbs)
         selbs = ieee80211_find_node(ic, join.bssid);
+    // An uncached node has no peer evidence, so it keeps the unchanged association.
+    uint32_t mfpScope = selbs ? AirportWCL::hotspotMfpScope(join.rsn, join.rsnLength, join.upperAuth,
+        selbs->ni_intval,
+        (selbs->ni_rsncaps & IEEE80211_RSNCAP_MFPC) && selbs->ni_rsngroupmgmtcipher == IEEE80211_CIPHER_BIP,
+        selbs->ni_rsnie_tlv, selbs->ni_rsnie_tlv_len) : 0;
+    if ((mfpScope & AirportWCL::HotspotMfpRequired) == AirportWCL::HotspotMfpRequired)
+        ic->ic_caps |= IEEE80211_C_MFP;
+    else
+        ic->ic_caps &= ~IEEE80211_C_MFP;
+    WCL_RSN_NOTE(ic, 32, mfpScope);
+    if (instance && instance->pciNub)
+        instance->pciNub->setProperty("ItlwmWclHotspotMfpScope", mfpScope, 32);
     ieee80211_disable_rsn(ic);
     ieee80211_disable_wep(ic);
     explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));

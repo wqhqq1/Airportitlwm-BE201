@@ -1606,6 +1606,9 @@ ieee80211_end_scan(struct _ifnet *ifp)
 void
 ieee80211_choose_rsnparams(struct ieee80211com *ic)
 {
+#ifdef AIRPORT_WCL
+    ic->ic_bss->ni_flags &= ~IEEE80211_NODE_MFP;
+#endif
     struct ieee80211_node *ni = ic->ic_bss;
     struct ieee80211_pmk *pmk;
     
@@ -3028,7 +3031,7 @@ ieee80211_node_join_rsn(struct ieee80211com *ic, struct ieee80211_node *ni)
     
     ni->ni_key_count = 0;
     ni->ni_port_valid = 0;
-    ni->ni_flags &= ~IEEE80211_NODE_TXRXPROT;
+    ni->ni_flags &= ~(IEEE80211_NODE_TXRXPROT | IEEE80211_NODE_RXMGMTPROT | IEEE80211_NODE_TXMGMTPROT);
     ni->ni_flags &= ~IEEE80211_NODE_RSN_NEW_PTK;
     ni->ni_replaycnt = -1;	/* XXX */
     ni->ni_rsn_retries = 0;
@@ -3269,7 +3272,7 @@ ieee80211_node_leave_rsn(struct ieee80211com *ic, struct ieee80211_node *ni)
     timeout_del(&ni->ni_sa_query_to);
     
     ni->ni_rsn_retries = 0;
-    ni->ni_flags &= ~IEEE80211_NODE_TXRXPROT;
+    ni->ni_flags &= ~(IEEE80211_NODE_TXRXPROT | IEEE80211_NODE_RXMGMTPROT | IEEE80211_NODE_TXMGMTPROT);
     ni->ni_port_valid = 0;
     (*ic->ic_delete_key)(ic, ni, &ni->ni_pairwise_key);
 }

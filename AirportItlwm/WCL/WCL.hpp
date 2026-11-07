@@ -327,6 +327,66 @@ inline bool validIEs(const uint8_t *data, size_t length) {
     return true;
 }
 
+// RSN capabilities and group management cipher of a version-1 RSN element.
+inline bool rsnOffersBIP(const uint8_t *ie, size_t length) {
+    if (!ie || length < 24 || ie[0] != 48 || size_t(ie[1]) + 2 != length ||
+        read16(ie + 2) != 1)
+        return false;
+    size_t offset = 8;
+    size_t pairwise = read16(ie + offset);
+    offset += 2 + pairwise * 4;
+    if (offset + 2 > length)
+        return false;
+    size_t akms = read16(ie + offset);
+    offset += 2 + akms * 4;
+    if (offset + 4 > length)
+        return false;
+    uint16_t caps = read16(ie + offset);
+    offset += 2;
+    size_t pmkids = read16(ie + offset);
+    offset += 2 + pmkids * 16;
+    return (caps & 0x80) && offset + 4 <= length &&
+        ie[offset] == 0x00 && ie[offset + 1] == 0x0f && ie[offset + 2] == 0xac &&
+        ie[offset + 3] == 6;
+}
+
+inline bool hasAppleVendorIE(const uint8_t *ies, size_t length) {
+    if (!ies)
+        return false;
+    // A stored beacon body can end in a frame check sequence, so stop at the first
+    // element that does not fit rather than rejecting the whole list.
+    for (size_t offset = 0; offset + 2 <= length; offset += size_t(ies[offset + 1]) + 2) {
+        if (offset + 2 + ies[offset + 1] > length)
+            return false;
+        if (ies[offset] == 221 && ies[offset + 1] >= 4 && ies[offset + 2] == 0x00 &&
+            ies[offset + 3] == 0x17 && ies[offset + 4] == 0xf2)
+            return true;
+    }
+    return false;
+}
+
+enum HotspotMfpBits : uint32_t {
+    HotspotMfpRequest = 1u << 0, // The OS association request offers MFPC and BIP-CMAC.
+    HotspotMfpBeacon  = 1u << 1, // iPhone hotspot beacon interval.
+    HotspotMfpPeer    = 1u << 2, // The peer's RSN offers MFPC and BIP-CMAC.
+    HotspotMfpApple   = 1u << 3, // Reported only: the peer's beacon has an Apple vendor element.
+    HotspotMfpPSK     = 1u << 4, // Personal WPA2 only.
+    HotspotMfpRequired = HotspotMfpRequest | HotspotMfpBeacon | HotspotMfpPeer | HotspotMfpPSK,
+};
+
+// Every required bit must hold, so ordinary networks keep their exact association.
+inline uint32_t hotspotMfpScope(const uint8_t *rsn, size_t rsnLength, uint32_t upperAuth,
+                                uint32_t beaconInterval, bool peerOffersBIP,
+                                const uint8_t *ies, size_t ieLength) {
+    uint32_t scope = 0;
+    if (rsnOffersBIP(rsn, rsnLength)) scope |= HotspotMfpRequest;
+    if (beaconInterval == 300) scope |= HotspotMfpBeacon;
+    if (peerOffersBIP) scope |= HotspotMfpPeer;
+    if (hasAppleVendorIE(ies, ieLength)) scope |= HotspotMfpApple;
+    if (upperAuth == (1u << 3)) scope |= HotspotMfpPSK;
+    return scope;
+}
+
 inline bool scanUsesProbes(bool requested, bool activeRequest) {
     return requested ? activeRequest : true;
 }
@@ -468,7 +528,27 @@ struct JoinRequest {
     uint16_t channelSpec;
     uint16_t rsnLength;
     uint8_t rsn[257];
+    uint16_t assocFlags;
 };
+
+enum HotspotAssocFlags : uint16_t {
+    AssocInstantHotspot = 1u << 1,
+    AssocAutoHotspot    = 1u << 2,
+};
+
+// Station marker an iPhone's hidden hotspot expects. The native AP parser needs OUI
+// 00:17:f2, type 0x0b and flags at element offset 9 (bit0, bit1). Offsets 6-8 copy the
+// sibling type 6 capability element and are not proven; the host never builds this
+// element itself on real hardware, so the flag mapping is also inferred.
+inline size_t buildHotspotClientIE(uint16_t assocFlags, uint8_t out[12]) {
+    uint8_t flags = 0;
+    if (assocFlags & AssocInstantHotspot) flags |= 1;
+    if (assocFlags & AssocAutoHotspot) flags |= 2;
+    if (!flags) return 0;
+    const uint8_t ie[12] = {221, 10, 0x00, 0x17, 0xf2, 0x0b, 1, 1, 3, flags, 0, 0};
+    memcpy(out, ie, sizeof(ie));
+    return sizeof(ie);
+}
 
 inline bool validCipherKey(uint32_t cipher, uint32_t length, uint16_t flags,
                            uint16_t index, uint32_t rscLength) {
@@ -542,6 +622,7 @@ inline bool decodeJoin(const void *buffer, size_t length, JoinRequest &out) {
     out.channelSpec = read16(p + 0x228);
     out.rsnLength = rsnLength;
     memcpy(out.rsn, p + 0xd6, rsnLength);
+    out.assocFlags = read16(p + 0x1e0);
     return true;
 }
 

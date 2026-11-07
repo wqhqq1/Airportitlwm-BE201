@@ -11,6 +11,11 @@ for name,digest in json.loads((fixtures/'rsn-1.1.3-manifest.json').read_text()).
     if name.endswith("-ieee80211_input.c"):continue
     stripped=re.sub(r'^[ \t]*WCL_RSN_NOTE\([^\n]+\);\n','',current,flags=re.M)
     stripped=re.sub(r'#ifdef AIRPORT_WCL\n    /\* BE201 peer-teardown filter BEGIN:.*?    /\* BE201 peer-teardown filter END \*/\n#endif\n','',stripped,flags=re.S)
+    # 1.1.8 adds only these negotiated-MFP flag and message4 timing blocks.
+    for block in ('#ifdef AIRPORT_WCL\n    ic->ic_wcl_m4_abs = mach_absolute_time();\n#endif\n',
+                  '#ifdef AIRPORT_WCL\n        // The peer protects robust management frames once this PTK is in use.\n        if (ni->ni_flags & IEEE80211_NODE_MFP)\n            ni->ni_flags |= IEEE80211_NODE_RXMGMTPROT | IEEE80211_NODE_TXMGMTPROT;\n#endif\n'):
+        assert stripped.count(block)==1,block
+        stripped=stripped.replace(block,'')
     assert stripped==p.read_text(),name
 s=(root/'AirportItlwm/WCL/WCL.cpp').read_text();sig='void AirportItlwmSkywalkInterface::publishWCLJoinDiagnostic('
 a=s.index(sig);b=s.index('{',a)+1;depth=1

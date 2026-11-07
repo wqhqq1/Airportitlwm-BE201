@@ -21,6 +21,7 @@
 /* End PBXAggregateTarget section */
 
 /* Begin PBXBuildFile section */
+		BE2011200000000000000001 /* AirportItlwmAWDLInterface.cpp in Sources */ = {isa = PBXBuildFile; fileRef = BE2011200000000000000002 /* AirportItlwmAWDLInterface.cpp */; };
 		A112F5371BD949CD8CA19D88 /* WCL.cpp in Sources */ = {isa = PBXBuildFile; fileRef = A112F5371BD949CD8CA19D89 /* WCL.cpp */; };
 		F8D94C842B9ABFE20081A3C4 /* CCDataPipe.h in Headers */ = {isa = PBXBuildFile; fileRef = F84AD8812A497DB200DC8DED /* CCDataPipe.h */; };
 		F8D94C852B9ABFE20081A3C4 /* debug.h in Headers */ = {isa = PBXBuildFile; fileRef = F89B6C2225027609000F77FF /* debug.h */; };
@@ -118,6 +119,7 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		BE2011200000000000000002 /* AirportItlwmAWDLInterface.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = AirportItlwm/AirportItlwmAWDLInterface.cpp; sourceTree = SOURCE_ROOT; };
 		A112F5371BD949CD8CA19D89 /* WCL.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = AirportItlwm/WCL/WCL.cpp; sourceTree = SOURCE_ROOT; };
 		024A07BA23FCBC6C009FBA6C /* compat.cpp */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.cpp; path = compat.cpp; sourceTree = "<group>"; };
 		024A07C923FCBC6C009FBA6C /* aes.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = aes.c; sourceTree = "<group>"; };
@@ -842,6 +844,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				BE2011200000000000000001 /* AirportItlwmAWDLInterface.cpp in Sources */,
 				A7D000012026100700000001 /* ItlDma.cpp in Sources */,
 				F8D94CA72B9ABFE20081A3C4 /* _mbuf.cpp in Sources */,
 				F8D94CA82B9ABFE20081A3C4 /* ieee80211_ra.c in Sources */,

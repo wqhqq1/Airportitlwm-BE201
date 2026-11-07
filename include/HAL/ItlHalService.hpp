@@ -50,6 +50,18 @@ public:
     virtual IOReturn setScanHomeAwayTime(uint32_t) { return kIOReturnUnsupported; }
     /* Whether applying a new MAC address requires a firmware restart. */
     virtual bool macChangeNeedsRestart() { return true; }
+    // Queue a receive-only AWDL context with the OS-selected address. Success means queued.
+    virtual IOReturn requestAwdlMonitor(const uint8_t *) { return kIOReturnUnsupported; }
+    virtual bool awdlSyncNext(uint16_t *, uint32_t *) { return false; }
+    virtual IOReturn setAwdlNativeTemplate(bool, const uint8_t *, size_t) { return kIOReturnUnsupported; }
+    virtual IOReturn enableAwdlNativeTx() { return kIOReturnUnsupported; }
+    virtual IOReturn sendAwdlData(const uint8_t *, size_t) { return kIOReturnUnsupported; }
+    virtual void setAwdlOwnQueue(bool, bool, uint32_t) {}
+    virtual void setAwdlRadioTest(bool, uint32_t, uint32_t, bool) {}
+    virtual bool awdlAmsduReady(const uint8_t *) { return false; }
+    virtual void awdlPeerCache(const uint8_t *, uint32_t) {}
+    virtual void sendAwdlUmi(const uint8_t *, const uint8_t *, size_t) {}
+    virtual IOReturn sendAwdlAmsdu(const uint8_t *const *, const size_t *, unsigned) { return kIOReturnUnsupported; }
 #endif
     
     virtual ItlDriverInfo *getDriverInfo() = 0;

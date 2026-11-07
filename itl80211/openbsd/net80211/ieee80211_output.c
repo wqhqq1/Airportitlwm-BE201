@@ -1533,6 +1533,9 @@ ieee80211_get_assoc_req(struct ieee80211com *ic, struct ieee80211_node *ni,
 	u_int16_t capinfo;
 
 	m = ieee80211_getmgmt(MBUF_DONTWAIT, MT_DATA,
+#ifdef AIRPORT_WCL
+	    ic->ic_wcl_assoc_ie_len +
+#endif
 	    2 + 2 +
 	    ((type == IEEE80211_FC0_SUBTYPE_REASSOC_REQ) ?
 		IEEE80211_ADDR_LEN : 0) +
@@ -1607,6 +1610,13 @@ ieee80211_get_assoc_req(struct ieee80211com *ic, struct ieee80211_node *ni,
     ni->ni_he_requested = ieee80211_he_supported(ic, ni);
     if (ni->ni_he_requested)
         frm = ieee80211_add_hecaps(frm, ic);
+
+#ifdef AIRPORT_WCL
+    if (ic->ic_wcl_assoc_ie_len) {
+        memcpy(frm, ic->ic_wcl_assoc_ie, ic->ic_wcl_assoc_ie_len);
+        frm += ic->ic_wcl_assoc_ie_len;
+    }
+#endif
 
     size_t l = frm - mtod(m, u_int8_t *);
     mbuf_pkthdr_setlen(m, l);

@@ -15,6 +15,7 @@ harness=r'''
 #include <cstdio>
 #include <sys/mman.h>
 #include <unistd.h>
+#define wcl_note_m4_to_disconnect(ic) ((void)0)
 #define IEEE80211_STA_ONLY 1
 #include "ieee80211_wcl_rsn_diag.h"
 #include "iwx_boot_checks.h"

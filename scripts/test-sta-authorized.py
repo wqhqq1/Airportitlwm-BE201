@@ -76,7 +76,7 @@ struct iwx_softc{ieee80211com sc_ic;unsigned ns_nstate=4,sc_flags=2,sc_mld_assoc
 void *systq=(void *)1;
 struct Loop{bool gated=true;bool inGate(){return gated;}};
 struct Gate{Loop *loop;template<typename F>int runAction(F f,void *p){assert(!loop->gated);loop->gated=true;auto ret=f(nullptr,p,nullptr,nullptr,nullptr);loop->gated=false;return ret;}};
-struct ItlIwx{iwx_softc com;Loop loop;Gate gate{&loop};bool mld=true;unsigned queued=0,calls=0;int change=0,error=0;
+struct ItlIwx{iwx_softc com;Loop loop;Gate gate{&loop};bool mld=true;unsigned queued=0,calls=0;int change=0,error=0;void iwx_awdl_ctx_add(iwx_softc *,iwx_node *){}
  bool iwx_use_mld_api(iwx_softc *){return mld;}Loop *getMainWorkLoop(){return &loop;}Gate *getMainCommandGate(){return &gate;}
  void iwx_add_task(iwx_softc *,void *,int *){++queued;}
  int iwx_mld_sta_config_cmd(iwx_softc *sc,iwx_node *,int assoc){assert(loop.gated&&assoc==1);++calls;

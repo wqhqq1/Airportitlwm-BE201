@@ -673,8 +673,20 @@ ieee80211_inputm(struct _ifnet *ifp, mbuf_t m, struct ieee80211_node *ni,
                     if (!IEEE80211_IS_MULTICAST(wh->i_addr1) &&
                         !(wh->i_fc[1] & IEEE80211_FC1_PROTECTED)) {
                         /* unicast mgmt not encrypted */
+#ifdef AIRPORT_WCL
+                        if (!ic->ic_wcl_unprot_noted) {
+                            ic->ic_wcl_unprot_noted = true;
+                            WCL_RSN_NOTE(ic, 34, subtype >> IEEE80211_FC0_SUBTYPE_SHIFT);
+                        }
+#endif
                         goto out;
                     }
+#ifdef AIRPORT_WCL
+                    /* The firmware already decrypted a unicast frame. */
+                    if (rxi->rxi_flags & IEEE80211_RXI_HWDEC)
+                        m = ieee80211_input_hwdecrypt(ic, ni, m, rxi);
+                    else
+#endif
                     /* do software decryption */
                     m = ieee80211_decrypt(ic, m, ni);
                     if (m == NULL) {
@@ -2956,6 +2968,19 @@ ieee80211_wcl_peer_disconnect(struct ieee80211com *ic, u_int16_t reason)
 }
 #endif
 
+static inline void
+wcl_note_m4_to_disconnect(struct ieee80211com *ic)
+{
+#ifdef AIRPORT_WCL
+    if (!ic->ic_wcl_m4_abs)
+        return;
+    uint64_t ns = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time() - ic->ic_wcl_m4_abs, &ns);
+    WCL_RSN_NOTE(ic, 33, uint32_t(ns / 1000));
+    ic->ic_wcl_m4_abs = 0;
+#endif
+}
+
 void
 ieee80211_recv_deauth(struct ieee80211com *ic, mbuf_t m,
                       struct ieee80211_node *ni)
@@ -2978,6 +3003,7 @@ ieee80211_recv_deauth(struct ieee80211com *ic, mbuf_t m,
     XYLog("Deauth received, reason %d\n", reason);
     WCL_RSN_NOTE(ic, 17, reason);
     WCL_RSN_NOTE(ic, 18, (IEEE80211_ADDR_EQ(wh->i_addr1, ic->ic_myaddr) ? 1 : 0) | (IEEE80211_ADDR_EQ(wh->i_addr2, ni->ni_macaddr) ? 2 : 0) | (IEEE80211_ADDR_EQ(wh->i_addr3, ni->ni_bssid) ? 4 : 0));
+    wcl_note_m4_to_disconnect(ic);
 #ifdef AIRPORT_WCL
     if (ieee80211_wcl_peer_disconnect(ic, reason)) {
         ++ic->ic_stats.is_rx_deauth;
@@ -3054,6 +3080,7 @@ ieee80211_recv_disassoc(struct ieee80211com *ic, mbuf_t m,
 #ifdef AIRPORT_WCL
     WCL_RSN_NOTE(ic, 17, reason);
     WCL_RSN_NOTE(ic, 18, (IEEE80211_ADDR_EQ(wh->i_addr1, ic->ic_myaddr) ? 1 : 0) | (IEEE80211_ADDR_EQ(wh->i_addr2, ni->ni_macaddr) ? 2 : 0) | (IEEE80211_ADDR_EQ(wh->i_addr3, ni->ni_bssid) ? 4 : 0));
+    wcl_note_m4_to_disconnect(ic);
     if (ieee80211_wcl_peer_disconnect(ic, reason)) {
         ++ic->ic_stats.is_rx_disassoc;
         return;

@@ -108,6 +108,7 @@
 
 #ifdef AIRPORT_WCL
 #include "../../AirportItlwm/WCL/WCL.hpp"
+#include "../../AirportItlwm/AirportItlwmV2.hpp"
 #endif
 #include "ItlIwx.hpp"
 #include "ItlStartupDiagnostics.hpp"
@@ -152,6 +153,9 @@ static void iwx_bz_record_pci_irq_mode(struct iwx_softc *sc, bool before_fw)
 #include <sys/_task.h>
 #include <sys/pcireg.h>
 #include <net80211/ieee80211_priv.h>
+#ifdef AIRPORT_WCL
+#include "iwx_awdl_ctx.h"
+#endif
 
 #define super ItlHalService
 OSDefineMetaClassAndStructors(ItlIwx, ItlHalService)
@@ -4053,16 +4057,16 @@ iwx_tvqm_alloc_txq(struct iwx_softc *sc, int tid, int ssn)
 }
 
 int ItlIwx::
-iwx_tvqm_enable_txq(struct iwx_softc *sc, int tid, int ssn, uint32_t size)
+iwx_tvqm_enable_txq(struct iwx_softc *sc, int tid, int ssn, uint32_t size, int sta_id)
 {
 #ifdef AIRPORT_VTD
     if (!getMainWorkLoop()->inGate()) {
-        struct Request { iwx_softc *sc; int tid; int ssn; uint32_t size; } request = {sc, tid, ssn, size};
+        struct Request { iwx_softc *sc; int tid; int ssn; uint32_t size; int sta_id; } request = {sc, tid, ssn, size, sta_id};
         return getMainCommandGate()->runAction(
             [](OSObject *, void *arg0, void *arg1, void *, void *) -> IOReturn {
                 auto request = static_cast<Request *>(arg1);
                 return static_cast<ItlIwx *>(arg0)->iwx_tvqm_enable_txq(
-                    request->sc, request->tid, request->ssn, request->size);
+                    request->sc, request->tid, request->ssn, request->size, request->sta_id);
             }, this, &request);
     }
     if (dmaDetaching || !size || size > IWX_MIN_256_BA_QUEUE_SIZE_GEN3 || (size & (size - 1)))
@@ -4158,7 +4162,7 @@ iwx_tvqm_enable_txq(struct iwx_softc *sc, int tid, int ssn, uint32_t size)
         /* SCD_QUEUE_CONFIG v3 takes a station mask and no enable flag. */
         memset(&mld_cmd, 0, sizeof(mld_cmd));
         mld_cmd.operation = htole32(IWX_SCD_QUEUE_ADD);
-        mld_cmd.u.add.sta_mask = htole32(1 << IWX_STATION_ID);
+        mld_cmd.u.add.sta_mask = htole32(1 << sta_id);
         mld_cmd.u.add.tid = (uint8_t)tid;
         mld_cmd.u.add.cb_size = cmd.cb_size;
         mld_cmd.u.add.bc_dram_addr = cmd.byte_cnt_addr;
@@ -5074,6 +5078,1202 @@ iwx_mld_authorized_task(void *arg)
         ++sc->sc_mld_authorized_updates;
         sc->sc_pcitag->setProperty("ItlwmMldAuthorizedUpdates", sc->sc_mld_authorized_updates, 32);
         sc->sc_pcitag->setProperty("ItlwmMldAuthorizedMFP", uint32_t(!!(in->in_ni.ni_flags & IEEE80211_NODE_MFP)), 32);
+        /* After the port opens, so a firmware problem here cannot disturb the join. */
+        that->iwx_awdl_ctx_add(sc, in);
+    }
+}
+#endif
+
+#ifdef AIRPORT_WCL
+#include "iwx_awdl_native.h"
+/* Ready to send to this destination now? Anything but success stops the caller. */
+IOReturn ItlIwx::iwx_awdl_data_gate(struct iwx_softc *sc, const uint8_t *eth)
+{
+    auto p = &sc->sc_awdl_probe;
+    struct ieee80211com *ic = &sc->sc_ic;
+    struct ieee80211_node *ni = ic->ic_bss;
+    if (!sc->sc_awdl_native_requested || p->ctx.stage < IWX_AWDL_CTX_ACTIVE || p->tx.tripped || !ni ||
+        !ni->ni_port_valid || !(sc->sc_flags & IWX_FLAG_MLD_TXQ_ACTIVE) ||
+        (sc->sc_flags & (IWX_FLAG_SHUTDOWN | IWX_FLAG_HW_ERR)))
+        return kIOReturnNotReady;
+    if (p->tx.hold) {
+        uint64_t now = 0;
+        absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+        if (iwx_awdl_peer_away(p, eth, now / 1000, uint8_t(ieee80211_chan2ieee(ic, ni->ni_chan)))) {
+            /* The AW timer runs on the peer's slot boundaries and wakes the queue. */
+            ++p->tx.away_holds;
+            p->tx.data_stalled = 1;
+            return kIOReturnBusy;
+        }
+    }
+    /* Room comes back with a completion: the caller keeps the packet and waits, TCP sees no loss. */
+    const int dataQid = p->ctx.own_active ? p->ctx.own_qid : sc->first_data_qid;
+    if ((sc->sc_flags & IWX_FLAG_TXFLUSH) || !sc->qfullmsk.empty() ||
+        sc->txq[dataQid].queued >= IWX_AWDL_DATA_MAX_QUEUED) {
+        ++p->tx.busy;
+        if (!p->tx.data_stalled) {
+            p->tx.data_stalled = 1;
+            ++p->tx.data_stalls;
+        }
+        return kIOReturnBusy;
+    }
+    return kIOReturnSuccess;
+}
+
+IOReturn ItlIwx::iwx_awdl_data_enqueue(struct iwx_softc *sc, mbuf_t m, size_t n)
+{
+    auto p = &sc->sc_awdl_probe;
+    struct ieee80211com *ic = &sc->sc_ic;
+    struct _ifnet *ifp = &ic->ic_if;
+    struct ieee80211_node *ni = ic->ic_bss;
+    mbuf_pkthdr_setlen(m, n);
+    mbuf_pkthdr_setrcvif(m, (ifnet_t)ni);
+    ieee80211_ref_node(ni);
+    if (mq_enqueue(&ic->ic_mgtq, m) != 0) {
+        ieee80211_release_node(ic, ni);
+        ++p->tx.busy;
+        return kIOReturnBusy;
+    }
+    ifp->if_start(ifp);
+    return kIOReturnSuccess;
+}
+
+IOReturn ItlIwx::sendAwdlData(const uint8_t *eth, size_t length)
+{
+    if (!getMainWorkLoop()->inGate()) return kIOReturnNotPermitted;
+    auto sc = &com;
+    auto p = &sc->sc_awdl_probe;
+    const IOReturn gate = iwx_awdl_data_gate(sc, eth);
+    if (gate != kIOReturnSuccess)
+        return gate;
+    mbuf_t m = NULL;
+    mbuf_gethdr(MBUF_DONTWAIT, MT_DATA, &m);
+    if (m) {
+        mbuf_mclget(MBUF_DONTWAIT, MT_DATA, &m);
+        if (m && !(mbuf_flags(m) & MBUF_EXT)) {
+            mbuf_freem(m);
+            m = NULL;
+        }
+    }
+    if (!m) {
+        ++p->tx.alloc_fail;
+        return kIOReturnNoMemory;
+    }
+    iwx_awdl_note_dest(p, eth);
+    const bool qos = p->ctx.own_active && p->ctx.own_agg && !memcmp(eth, p->ctx.own_peer, 6);
+    const size_t n = qos ? iwx_awdl_ether_to_qos(p, eth, length, static_cast<uint8_t *>(mbuf_data(m)), mbuf_maxlen(m))
+                         : iwx_awdl_ether_to_data(p, eth, length, static_cast<uint8_t *>(mbuf_data(m)), mbuf_maxlen(m));
+    if (!n) {
+        mbuf_freem(m);
+        return kIOReturnBadArgument;
+    }
+    mbuf_setlen(m, n);
+    return iwx_awdl_data_enqueue(sc, m, n);
+}
+
+bool ItlIwx::awdlAmsduReady(const uint8_t *eth)
+{
+    return iwx_awdl_amsdu_ready(&com.sc_awdl_probe, eth);
+}
+
+IOReturn ItlIwx::sendAwdlAmsdu(const uint8_t *const *eths, const size_t *lengths, unsigned count)
+{
+    if (!getMainWorkLoop()->inGate()) return kIOReturnNotPermitted;
+    auto sc = &com;
+    auto p = &sc->sc_awdl_probe;
+    if (!count || !iwx_awdl_amsdu_ready(p, eths[0]))
+        return kIOReturnUnsupported;
+    const IOReturn gate = iwx_awdl_data_gate(sc, eths[0]);
+    if (gate != kIOReturnSuccess)
+        return gate;
+    const size_t n = iwx_awdl_amsdu_build(p, eths, lengths, count, p->tx.amsdu_buf, sizeof(p->tx.amsdu_buf));
+    if (!n)
+        return kIOReturnUnsupported;
+    unsigned int chunks = 16;
+    mbuf_t m = NULL;
+    if (mbuf_allocpacket(MBUF_DONTWAIT, n, &chunks, &m) || !m) {
+        ++p->tx.alloc_fail;
+        return kIOReturnNoMemory;
+    }
+    if (mbuf_copyback(m, 0, n, p->tx.amsdu_buf, MBUF_DONTWAIT) || mbuf_len(m) < 26) {
+        mbuf_freem(m);
+        ++p->tx.alloc_fail;
+        return kIOReturnNoMemory;
+    }
+    const IOReturn queued = iwx_awdl_data_enqueue(sc, m, n);
+    if (queued == kIOReturnSuccess) {
+        ++p->tx.amsdu_sent;
+        p->tx.amsdu_frames += count;
+    }
+    return queued;
+}
+
+/* Test switches, from the AW timer under the gate. */
+void ItlIwx::setAwdlRadioTest(bool hold, uint32_t phy2, uint32_t te, bool amsdu)
+{
+    auto sc = &com;
+    auto p = &sc->sc_awdl_probe;
+    auto c = &p->ctx;
+    if (!getMainWorkLoop()->inGate())
+        return;
+    p->tx.hold = hold;
+    p->tx.amsdu = amsdu;
+    const bool ready = c->phy2_chan && c->stage == IWX_AWDL_CTX_ASSOC && !p->tx.tripped;
+    /* A window left running when windows go off is what the firmware asserted on in the 06:29 test. */
+    if (c->te_want && !te && ready) {
+        struct iwx_session_prot_cmd cmd;
+        iwx_awdl_fill_te(&cmd, IWX_FW_CTXT_ACTION_REMOVE, 0);
+        if (!iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_SESSION_PROTECTION_CMD, IWX_MAC_CONF_GROUP, 0), IWX_CMD_ASYNC, sizeof(cmd), &cmd))
+            ++c->te_removed;
+    }
+    c->te_want = uint8_t(te);
+    if (c->phy2_want != phy2) {
+        c->phy2_want = phy2;
+        iwx_add_task(sc, systq, &sc->awdl_phy2_task);
+    }
+    if (!te || !ready || c->phy2_want != c->phy2_chan)
+        return;
+    uint64_t now = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+    const uint32_t duration = iwx_awdl_te_due(p, te, c->phy2_chan, now / 1000, c->last_te_us);
+    if (!duration)
+        return;
+    c->last_te_us = now / 1000;
+    struct iwx_session_prot_cmd cmd;
+    iwx_awdl_fill_te(&cmd, IWX_FW_CTXT_ACTION_ADD, duration);
+    if (!iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_SESSION_PROTECTION_CMD, IWX_MAC_CONF_GROUP, 0), IWX_CMD_ASYNC, sizeof(cmd), &cmd))
+        ++c->te_requests;
+}
+
+/* Linux moves a link between PHY contexts the same way: inactive, new context, active. */
+void ItlIwx::iwx_awdl_phy2_task(void *arg)
+{
+    auto sc = static_cast<iwx_softc *>(arg);
+    auto that = container_of(sc, ItlIwx, com);
+    if (!that->getMainWorkLoop()->inGate()) {
+        that->getMainCommandGate()->runAction(
+            [](OSObject *, void *arg0, void *, void *, void *) -> IOReturn {
+                iwx_awdl_phy2_task(arg0); return kIOReturnSuccess;
+            }, arg);
+        return;
+    }
+    auto ic = &sc->sc_ic;
+    auto p = &sc->sc_awdl_probe;
+    auto c = &p->ctx;
+    auto in = reinterpret_cast<iwx_node *>(ic->ic_bss);
+    const uint32_t want = c->phy2_want;
+    if (want == c->phy2_chan || c->stage != IWX_AWDL_CTX_ASSOC || p->tx.tripped || !in || !in->in_phyctxt ||
+        ic->ic_state != IEEE80211_S_RUN || (sc->sc_flags & (IWX_FLAG_SHUTDOWN | IWX_FLAG_HW_ERR)))
+        return;
+    struct ieee80211_channel *channel = NULL;
+    if (want) {
+        /* 5 GHz only: the link's ack rates come from the AP's band. Not the AP's own channel. */
+        if (want < 36 || want > IEEE80211_CHAN_MAX || !IEEE80211_IS_CHAN_5GHZ(&ic->ic_channels[want]) ||
+            uint32_t(ieee80211_chan2ieee(ic, in->in_phyctxt->channel)) == want) {
+            c->phy2_err = EINVAL;
+            return;
+        }
+        channel = &ic->ic_channels[want];
+    }
+    const int generation = sc->sc_generation;
+    const uint8_t chains = that->iwx_mimo_enabled(sc) ? 2 : 1;
+    int err = 0;
+    /*
+     * Leaving the second channel: end any window, whatever the switch says now, and release the peer's own
+     * queue, before the link moves. On 06:29 the firmware asserted (0x2000320F at LINK_CONFIG) with one window
+     * started and not ended and the own queue still allocated; which of the two it was is not known.
+     */
+    if (c->phy2_chan) {
+        struct iwx_session_prot_cmd cmd;
+        iwx_awdl_fill_te(&cmd, IWX_FW_CTXT_ACTION_REMOVE, 0);
+        err = that->iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_SESSION_PROTECTION_CMD, IWX_MAC_CONF_GROUP, 0), 0, sizeof(cmd), &cmd);
+        if (generation != sc->sc_generation)
+            return;
+        ++c->te_removed;
+        if (c->own_qid > 0) {
+            err = that->iwx_awdl_own_release(sc) ?: err;
+            if (generation != sc->sc_generation)
+                return;
+        }
+    }
+    err = that->iwx_awdl_ctx_link_cmd(sc, in, IWX_FW_CTXT_ACTION_MODIFY, IWX_LINK_CONTEXT_MODIFY_ACTIVE, 0) ?: err;
+    if (generation != sc->sc_generation)
+        return;
+    /* Off the old context first. 1.1.42 went straight to active on the new one and the firmware asserted. */
+    c->link_no_phy = 1;
+    err = that->iwx_awdl_ctx_link_cmd(sc, in, IWX_FW_CTXT_ACTION_MODIFY, 0, 0) ?: err;
+    c->link_no_phy = 0;
+    if (generation != sc->sc_generation)
+        return;
+    if (!err && channel) {
+        err = that->iwx_phy_ctxt_update(sc, &sc->sc_phyctxt[1], channel, chains, chains, 0);
+        if (generation != sc->sc_generation)
+            return;
+    }
+    if (!err)
+        c->phy2_chan = want;
+    /* Mask 0 with the context, then active: the order that first activates this link. */
+    err = that->iwx_awdl_ctx_link_cmd(sc, in, IWX_FW_CTXT_ACTION_MODIFY, 0, 0) ?: err;
+    if (generation != sc->sc_generation)
+        return;
+    /* Back to a working link even after an error. */
+    const int active = that->iwx_awdl_ctx_link_cmd(sc, in, IWX_FW_CTXT_ACTION_MODIFY,
+        IWX_LINK_CONTEXT_MODIFY_ACTIVE | IWX_LINK_CONTEXT_MODIFY_RATES_INFO, 1);
+    if (generation != sc->sc_generation)
+        return;
+    err = err ?: active;
+    if (err) {
+        c->phy2_err = uint32_t(err < 0 ? -err : err);
+        p->tx.tripped = 1;
+        sc->sc_pcitag->setProperty("ItlwmAwdlTxTripped", p->tx.tripped, 32);
+    } else
+        ++c->phy2_switches;
+}
+
+/* The AW timer's fallback and the test switch both arrive here, under the gate. */
+void ItlIwx::setAwdlOwnQueue(bool on, bool agg, uint32_t fix)
+{
+    auto sc = &com;
+    auto p = &sc->sc_awdl_probe;
+    auto c = &p->ctx;
+    if (!getMainWorkLoop()->inGate())
+        return;
+    /* Move when data now goes to another station, or the aggregation switch changed. */
+    const bool moved = on && c->own_active && p->tx.last_dest_valid && memcmp(p->tx.last_dest, c->own_peer, 6) &&
+        iwx_awdl_peer_index(p, p->tx.last_dest) >= 0;
+    const bool aggChanged = on && !!c->own_agg_want != agg;
+    const bool fixChanged = on && c->own_fix_want != uint8_t(fix & 3);
+    c->own_agg_want = agg;
+    c->own_fix_want = uint8_t(fix & 3);
+    /* A changed setting gets a fresh queue and a fresh look: a queue already marked held stays held otherwise. */
+    if (aggChanged || fixChanged) {
+        c->own_held = 0;
+        c->own_redo = 1;
+    }
+    if (!!c->own_want == on && !moved && !aggChanged && !fixChanged)
+        return;
+    c->own_want = on;
+    if (on) {
+        c->own_active = 0;
+        iwx_add_task(sc, systq, &sc->awdl_ownq_task);
+    } else
+        c->own_active = 0;
+}
+
+/* Frees the own queue: flush, disable, reset the ring. The caller checks the generation afterwards. */
+int ItlIwx::iwx_awdl_own_release(struct iwx_softc *sc)
+{
+    auto c = &sc->sc_awdl_probe.ctx;
+    if (c->own_qid <= 0)
+        return 0;
+    const int generation = sc->sc_generation;
+    const int own = c->own_qid;
+    c->own_qid = -1;
+    c->own_active = 0;
+    c->own_agg = 0;
+    sc->sc_flags |= IWX_FLAG_TXFLUSH;
+    int err = iwx_flush_sta_tids(sc, c->own_sta, 0xffff);
+    if (generation != sc->sc_generation)
+        return err;
+    sc->sc_flags &= ~IWX_FLAG_TXFLUSH;
+    err = iwx_mld_disable_txq(sc, c->own_sta, c->own_tid) ?: err;
+    if (generation != sc->sc_generation)
+        return err;
+    iwx_reset_tx_ring(sc, &sc->txq[own]);
+    ++c->own_released;
+    return err;
+}
+
+void ItlIwx::iwx_awdl_ownq_task(void *arg)
+{
+    auto sc = static_cast<iwx_softc *>(arg);
+    auto that = container_of(sc, ItlIwx, com);
+    if (!that->getMainWorkLoop()->inGate()) {
+        that->getMainCommandGate()->runAction(
+            [](OSObject *, void *arg0, void *, void *, void *) -> IOReturn {
+                iwx_awdl_ownq_task(arg0); return kIOReturnSuccess;
+            }, arg);
+        return;
+    }
+    auto p = &sc->sc_awdl_probe;
+    auto c = &p->ctx;
+    if (!c->own_want || c->own_active || c->own_held || c->stage != IWX_AWDL_CTX_ASSOC || !p->peer_added ||
+        p->tx.tripped || (sc->sc_flags & (IWX_FLAG_SHUTDOWN | IWX_FLAG_HW_ERR)))
+        return;
+    /* The station data goes to; before any data, the peer that set up block ack, as in 1.1.41. */
+    int index = p->tx.last_dest_valid ? iwx_awdl_peer_index(p, p->tx.last_dest) : -1;
+    if (index < 0) {
+        index = 0;
+        for (uint32_t i = 0; i < IWX_AWDL_BA_MAX; ++i)
+            if (p->ba[i].active)
+                index = int(p->ba[i].sta_id - IWX_AWDL_PEER_STA_FIRST);
+    }
+    const uint8_t sta = uint8_t(IWX_AWDL_PEER_STA_FIRST + index);
+    uint8_t tid = c->own_agg_want ? 0 : IWX_MGMT_TID;
+    const int generation = sc->sc_generation;
+    auto in = reinterpret_cast<iwx_node *>(sc->sc_ic.ic_bss);
+    /* MAC 1 was never given a power table: a client MAC in power save may hold frames for a wake that never comes. */
+    if ((c->own_fix_want & 1) && !(c->own_fix_done & 1)) {
+        struct iwx_mac_power_cmd pm;
+        memset(&pm, 0, sizeof(pm));
+        pm.id_and_color = htole32(IWX_AWDL_MAC_ID);
+        pm.keep_alive_seconds = htole16(25);
+        const int err = that->iwx_send_cmd_pdu(sc, IWX_MAC_PM_POWER_TABLE, 0, sizeof(pm), &pm);
+        if (generation != sc->sc_generation)
+            return;
+        if (err)
+            c->own_fix_err = uint32_t(err < 0 ? -err : err);
+        else
+            c->own_fix_done |= 1;
+    }
+    /* Link 1 only ever got ACTIVE and RATES_INFO: no EDCA (which TX FIFO serves each AC) and no beacon timing. */
+    if ((c->own_fix_want & 2) && !(c->own_fix_done & 2) && in) {
+        const int err = that->iwx_awdl_ctx_link_cmd(sc, in, IWX_FW_CTXT_ACTION_MODIFY,
+            IWX_LINK_CONTEXT_MODIFY_QOS_PARAMS | IWX_LINK_CONTEXT_MODIFY_BEACON_TIMING, 1);
+        if (generation != sc->sc_generation)
+            return;
+        if (err)
+            c->own_fix_err = 0x10000 | uint32_t(err < 0 ? -err : err);
+        else
+            c->own_fix_done |= 2;
+    }
+    if (c->own_qid > 0 && (c->own_sta != sta || c->own_tid != tid || c->own_redo)) {
+        that->iwx_awdl_own_release(sc);
+        if (generation != sc->sc_generation)
+            return;
+        ++c->own_retargets;
+    }
+    c->own_redo = 0;
+    if (c->own_qid <= 0) {
+        bool agg = false;
+        if (tid == 0) {
+            /* Station A-MPDU parameters and rate control, so the firmware can aggregate for this peer. */
+            const int err = that->iwx_awdl_peer_agg(sc, uint32_t(index));
+            if (generation != sc->sc_generation)
+                return;
+            agg = !err;
+            if (err)
+                tid = IWX_MGMT_TID;
+        }
+        if (!that->iwx_nic_lock(sc))
+            return;
+        const int q = that->iwx_tvqm_enable_txq(sc, tid, 0, IWX_DEFAULT_QUEUE_SIZE, sta);
+        that->iwx_nic_unlock(sc);
+        if (generation != sc->sc_generation)
+            return;
+        if (q <= 0) {
+            c->own_err = uint32_t(q < 0 ? -q : 1);
+            return;
+        }
+        c->own_qid = q;
+        c->own_sta = sta;
+        c->own_tid = tid;
+        c->own_agg = agg;
+        memcpy(c->own_peer, p->peer_addr[index], 6);
+        /* Explicitly allow transmit to this station, in case the firmware holds a peer's queue until told. */
+        if (that->iwx_lookup_cmd_ver(sc, IWX_MAC_CONF_GROUP, IWX_STA_DISABLE_TX_CMD) != IWX_FW_CMD_VER_UNKNOWN) {
+            struct iwx_awdl_sta_disable_tx_cmd en = { .sta_id = htole32(sta), .disable = 0 };
+            const int err = that->iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_STA_DISABLE_TX_CMD, IWX_MAC_CONF_GROUP, 0), 0, sizeof(en), &en);
+            if (generation != sc->sc_generation)
+                return;
+            if (err)
+                c->own_txen_err = uint32_t(err < 0 ? -err : err);
+        } else
+            c->own_txen_err = 0xffff;
+    }
+    c->own_idle = 0;
+    c->own_seen_done = c->own_ok + c->own_fail;
+    c->own_active = 1;
+}
+
+void ItlIwx::iwx_awdl_ba_send_resp(struct iwx_softc *sc, const struct iwx_awdl_ba_req *req, uint16_t status)
+{
+    auto p = &sc->sc_awdl_probe;
+    struct ieee80211com *ic = &sc->sc_ic;
+    struct _ifnet *ifp = &ic->ic_if;
+    struct ieee80211_node *ni = ic->ic_bss;
+    mbuf_t m = NULL;
+    if (!ni || mbuf_gethdr(MBUF_DONTWAIT, MT_DATA, &m) || !m) {
+        ++p->ba_errors;
+        return;
+    }
+    const size_t n = iwx_awdl_ba_build_resp(p->tx.self, req, status, static_cast<uint8_t *>(mbuf_data(m)), mbuf_get_mhlen());
+    if (!n) {
+        mbuf_freem(m);
+        ++p->ba_errors;
+        return;
+    }
+    mbuf_pkthdr_setlen(m, n);
+    mbuf_setlen(m, n);
+    mbuf_pkthdr_setrcvif(m, (ifnet_t)ni);
+    ieee80211_ref_node(ni);
+    if (mq_enqueue(&ic->ic_mgtq, m) != 0) {
+        ieee80211_release_node(ic, ni);
+        ++p->ba_errors;
+        return;
+    }
+    ifp->if_start(ifp);
+}
+
+/* The firmware allocates the reorder ID and answers with it in place of a status. */
+int ItlIwx::iwx_awdl_ba_cmd(struct iwx_softc *sc, const struct iwx_awdl_ba *ba, const struct iwx_awdl_ba_req *req, uint32_t *baid)
+{
+    struct iwx_rx_baid_cfg_cmd cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    if (req) {
+        cmd.action = htole32(IWX_RX_BAID_ACTION_ADD);
+        cmd.u.alloc.sta_id_mask = htole32(1 << ba->sta_id);
+        cmd.u.alloc.tid = ba->tid;
+        cmd.u.alloc.ssn = htole16(req->ssn);
+        cmd.u.alloc.win_size = htole16(req->win);
+    } else {
+        cmd.action = htole32(IWX_RX_BAID_ACTION_REMOVE);
+        cmd.u.remove.sta_id_mask = htole32(1 << ba->sta_id);
+        cmd.u.remove.tid = htole32(ba->tid);
+    }
+    uint32_t status = 0;
+    const int err = iwx_send_cmd_pdu_status(sc, iwx_cmd_id(IWX_RX_BAID_ALLOCATION_CONFIG_CMD, IWX_DATA_PATH_GROUP, 0),
+        sizeof(cmd), &cmd, &status);
+    if (baid)
+        *baid = status;
+    return err;
+}
+
+void ItlIwx::iwx_awdl_ba_task(void *arg)
+{
+    auto sc = static_cast<iwx_softc *>(arg);
+    auto that = container_of(sc, ItlIwx, com);
+    if (!that->getMainWorkLoop()->inGate()) {
+        that->getMainCommandGate()->runAction(
+            [](OSObject *, void *arg0, void *, void *, void *) -> IOReturn {
+                iwx_awdl_ba_task(arg0); return kIOReturnSuccess;
+            }, arg);
+        return;
+    }
+    auto p = &sc->sc_awdl_probe;
+    while (p->ba_pending_valid) {
+        const struct iwx_awdl_ba_req req = p->ba_pending;
+        p->ba_pending_valid = 0;
+        if (p->ctx.stage != IWX_AWDL_CTX_ASSOC || p->tx.tripped || (sc->sc_flags & (IWX_FLAG_SHUTDOWN | IWX_FLAG_HW_ERR)))
+            return;
+        const int generation = sc->sc_generation;
+        struct iwx_awdl_ba *ba = iwx_awdl_ba_find(p, req.peer, req.tid);
+        if (ba && !req.del && ba->dialog == req.dialog) {
+            /* The answer was lost: the session already stands. */
+            ++p->ba_repeated;
+            that->iwx_awdl_ba_send_resp(sc, &req, IWX_AWDL_BA_STATUS_OK);
+            continue;
+        }
+        if (ba) {
+            const int err = that->iwx_awdl_ba_cmd(sc, ba, NULL, NULL);
+            if (generation != sc->sc_generation)
+                return;
+            if (err) {
+                ++p->ba_errors;
+                p->ba_last_err = uint32_t(err < 0 ? -err : err);
+            }
+            ba->active = 0;
+            ++p->ba_removed;
+        }
+        if (req.del)
+            continue;
+        const int peer = iwx_awdl_peer_index(p, req.peer);
+        if (peer < 0) {
+            /* It gets a station once heard close by. Its next request is answered then. */
+            ++p->ba_no_peer;
+            continue;
+        }
+        ba = iwx_awdl_ba_free(p);
+        uint32_t baid = 0;
+        int err = EBUSY;
+        if (ba) {
+            ba->sta_id = uint8_t(IWX_AWDL_PEER_STA_FIRST + peer);
+            ba->tid = req.tid;
+            err = that->iwx_awdl_ba_cmd(sc, ba, &req, &baid);
+            if (generation != sc->sc_generation)
+                return;
+        }
+        if (err || baid >= nitems(sc->sc_rxba_data)) {
+            ++p->ba_refused;
+            p->ba_last_err = uint32_t(err < 0 ? -err : (err ?: 0x100 + baid));
+            that->iwx_awdl_ba_send_resp(sc, &req, IWX_AWDL_BA_STATUS_REFUSED);
+            continue;
+        }
+        ba->dialog = req.dialog;
+        memcpy(ba->peer, req.peer, 6);
+        ba->active = 1;
+        ++p->ba_started;
+        that->iwx_awdl_ba_send_resp(sc, &req, IWX_AWDL_BA_STATUS_OK);
+    }
+}
+
+IOReturn ItlIwx::requestAwdlMonitor(const uint8_t *address)
+{
+    if (!getMainWorkLoop()->inGate()) {
+        return getMainCommandGate()->runAction(
+            [](OSObject *, void *arg0, void *arg1, void *, void *) -> IOReturn {
+                return static_cast<ItlIwx *>(arg0)->requestAwdlMonitor(static_cast<const uint8_t *>(arg1));
+            }, this, const_cast<uint8_t *>(address));
+    }
+    auto sc = &com;
+    const int result = iwx_awdl_native_request(&sc->sc_awdl_probe, &sc->sc_awdl_native_requested, address);
+    if (result < 0) return result == -1 ? kIOReturnBadArgument : kIOReturnBusy;
+    sc->sc_pcitag->setProperty("ItlwmAwdlNativeMonitorRequested", true);
+    sc->sc_pcitag->setProperty("ItlwmAwdlNativeMonitorAddress", sc->sc_awdl_probe.tx.self, 6);
+    sc->sc_pcitag->setProperty("ItlwmAwdlCtxMode", sc->sc_awdl_probe.ctx.mode, 32);
+    sc->sc_pcitag->setProperty("ItlwmAwdlProbeMode", sc->sc_awdl_probe.mode, 32);
+    sc->sc_pcitag->setProperty("ItlwmAwdlTxMode", sc->sc_awdl_probe.tx.mode, 32);
+    iwx_add_task(sc, systq, &sc->awdl_native_task);
+    return kIOReturnSuccess; // Only queued. Read NativeMonitorReady for the firmware result.
+}
+
+IOReturn ItlIwx::setAwdlNativeTemplate(bool mif, const uint8_t *data, size_t length)
+{
+    if (!getMainWorkLoop()->inGate()) return kIOReturnNotPermitted;
+    auto p = &com.sc_awdl_probe;
+    if (!iwx_awdl_native_template(p, mif, data, length)) return kIOReturnBadArgument;
+    return kIOReturnSuccess;
+}
+
+IOReturn ItlIwx::enableAwdlNativeTx()
+{
+    if (!getMainWorkLoop()->inGate()) return kIOReturnNotPermitted;
+    auto sc = &com;
+    if (!sc->sc_awdl_native_requested) return kIOReturnNotReady;
+    sc->sc_awdl_probe.tx.native = 1;
+    sc->sc_awdl_probe.tx.mode = 1;
+    sc->sc_pcitag->setProperty("ItlwmAwdlTxMode", sc->sc_awdl_probe.tx.mode, 32);
+    return kIOReturnSuccess;
+}
+
+void ItlIwx::iwx_awdl_native_task(void *arg)
+{
+    auto sc = static_cast<iwx_softc *>(arg);
+    auto that = container_of(sc, ItlIwx, com);
+    if (!that->getMainWorkLoop()->inGate()) {
+        that->getMainCommandGate()->runAction(
+            [](OSObject *, void *arg0, void *, void *, void *) -> IOReturn {
+                iwx_awdl_native_task(arg0); return kIOReturnSuccess;
+            }, arg);
+        return;
+    }
+    auto ic = &sc->sc_ic;
+    auto in = reinterpret_cast<iwx_node *>(ic->ic_bss);
+    if (!sc->sc_awdl_native_requested || !in || !in->in_ni.ni_port_valid ||
+        ic->ic_wcl_teardown_pending || ic->ic_state != IEEE80211_S_RUN ||
+        sc->ns_nstate != IEEE80211_S_RUN || !(sc->sc_flags & IWX_FLAG_STA_ACTIVE) ||
+        (sc->sc_flags & (IWX_FLAG_SHUTDOWN | IWX_FLAG_HW_ERR))) {
+        if (sc->sc_awdl_native_requested)
+            sc->sc_pcitag->setProperty("ItlwmAwdlNativeMonitorReady", false);
+        return; // A later authorized transition retries through the existing ctx_add hook.
+    }
+    that->iwx_awdl_ctx_add(sc, in);
+}
+#endif
+
+#ifdef AIRPORT_WCL
+void ItlIwx::
+iwx_awdl_probe_publish(struct iwx_softc *sc)
+{
+    uint64_t now = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+    auto p = &sc->sc_awdl_probe;
+    if (p->published_ns && now - p->published_ns < 1000000000ULL)
+        return;
+    p->published_ns = now;
+    auto nub = sc->sc_pcitag;
+    nub->setProperty("ItlwmAwdlProbeForeignMgmt", p->foreign_mgmt, 32);
+    nub->setProperty("ItlwmAwdlProbeForeignAction", p->foreign_action, 32);
+    nub->setProperty("ItlwmAwdlProbeAppleAction", p->apple_action, 32);
+    nub->setProperty("ItlwmAwdlProbeAction", p->awdl_action, 32);
+    nub->setProperty("ItlwmAwdlProbePSF", p->awdl_psf, 32);
+    nub->setProperty("ItlwmAwdlProbeMIF", p->awdl_mif, 32);
+    nub->setProperty("ItlwmAwdlProbeBSSID", p->awdl_bssid, 32);
+    nub->setProperty("ItlwmAwdlProbeData", p->awdl_data, 32);
+    nub->setProperty("ItlwmAwdlProbeDataSelf", p->awdl_data_self, 32);
+    nub->setProperty("ItlwmAwdlProbeForeignData", p->foreign_data, 32);
+    nub->setProperty("ItlwmAwdlTxCsumFixed", p->tx.csum_fixed, 32);
+    nub->setProperty("ItlwmAwdlProbeDropped", p->dropped, 32);
+    nub->setProperty("ItlwmAwdlProbeSenders", p->sender_count, 32);
+    nub->setProperty("ItlwmAwdlParseBad", p->parse_bad, 32);
+    nub->setProperty("ItlwmAwdlSyncFrames", p->sync_frames, 32);
+    nub->setProperty("ItlwmAwdlSyncUpdates", p->sync_updates, 32);
+    nub->setProperty("ItlwmAwdlSyncAwPeriod", p->sync.aw_period, 32);
+    nub->setProperty("ItlwmAwdlSyncPresence", p->sync.presence, 32);
+    nub->setProperty("ItlwmAwdlSyncHeight", p->sync.height, 32);
+    nub->setProperty("ItlwmAwdlSyncEncoding", p->sync.encoding, 32);
+    nub->setProperty("ItlwmAwdlJitter256us", p->jitter[0], 32);
+    nub->setProperty("ItlwmAwdlJitter1TU", p->jitter[1], 32);
+    nub->setProperty("ItlwmAwdlJitter3TU", p->jitter[2], 32);
+    nub->setProperty("ItlwmAwdlJitterOver", p->jitter[3], 32);
+    nub->setProperty("ItlwmAwdlHost256us", p->host_jitter[0], 32);
+    nub->setProperty("ItlwmAwdlHost1TU", p->host_jitter[1], 32);
+    nub->setProperty("ItlwmAwdlHost4TU", p->host_jitter[2], 32);
+    nub->setProperty("ItlwmAwdlHost16TU", p->host_jitter[3], 32);
+    nub->setProperty("ItlwmAwdlHostOver", p->host_jitter[4], 32);
+    nub->setProperty("ItlwmAwdlSlots6", p->slots_6, 32);
+    nub->setProperty("ItlwmAwdlSlots44", p->slots_44, 32);
+    nub->setProperty("ItlwmAwdlSlots149", p->slots_149, 32);
+    nub->setProperty("ItlwmAwdlSlotsOther", p->slots_other, 32);
+    nub->setProperty("ItlwmAwdlSlotsIdle", p->slots_idle, 32);
+    nub->setProperty("ItlwmAwdlSlotsCurrent", p->slots_current, 32);
+    nub->setProperty("ItlwmAwdlTxMcastSent", p->tx.mcast_sent, 32);
+    nub->setProperty("ItlwmAwdlTxPsfSent", p->tx.psf_sent, 32);
+    nub->setProperty("ItlwmAwdlDataRateMcsStep", static_cast<unsigned long long>(p->tx.rate_step - IWX_AWDL_RATE_TOP_STEP), 32);
+    nub->setProperty("ItlwmAwdlDataRxRateNFlags", p->rx_data_rate, 32);
+    nub->setProperty("ItlwmAwdlDataRxRatePeak", p->rx_data_rate_peak, 32);
+    nub->setProperty("ItlwmAwdlDataRxAmpdu", p->rx_data_ampdu, 32);
+    nub->setProperty("ItlwmAwdlDataRateUps", p->tx.rate_ups, 32);
+    nub->setProperty("ItlwmAwdlDataRateDowns", p->tx.rate_downs, 32);
+    nub->setProperty("ItlwmAwdlPeerStations", p->peer_added, 32);
+    nub->setProperty("ItlwmAwdlPeerStationErrors", p->peer_errors, 32);
+    if (p->peer_added)
+        nub->setProperty("ItlwmAwdlPeerStationAddrs", p->peer_addr, p->peer_added * 6);
+    nub->setProperty("ItlwmAwdlTxMcastOk", p->tx.mcast_ok, 32);
+    nub->setProperty("ItlwmAwdlTxMcastFail", p->tx.mcast_fail, 32);
+    nub->setProperty("ItlwmAwdlTxUnicastSent", p->tx.unicast_sent, 32);
+    nub->setProperty("ItlwmAwdlTxUnicastAck", p->tx.unicast_ack, 32);
+    nub->setProperty("ItlwmAwdlTxUnicastNoAck", p->tx.unicast_noack, 32);
+    nub->setProperty("ItlwmAwdlTxUnicastRetries", p->tx.unicast_retries, 32);
+    nub->setProperty("ItlwmAwdlTxLastFailStatus", p->tx.last_fail_status, 32);
+    nub->setProperty("ItlwmAwdlTxBusy", p->tx.busy, 32);
+    nub->setProperty("ItlwmAwdlTxAllocFail", p->tx.alloc_fail, 32);
+    nub->setProperty("ItlwmAwdlTxQueueLimited", p->tx.queue_limited, 32);
+    nub->setProperty("ItlwmAwdlTxStalls", p->tx.stalls, 32);
+    nub->setProperty("ItlwmAwdlDataTxStalls", p->tx.data_stalls, 32);
+    nub->setProperty("ItlwmAwdlDataTxKicks", p->tx.data_kicks, 32);
+    nub->setProperty("ItlwmAwdlBaHeard", p->ba_heard, 32);
+    nub->setProperty("ItlwmAwdlBaStarted", p->ba_started, 32);
+    nub->setProperty("ItlwmAwdlBaRepeated", p->ba_repeated, 32);
+    nub->setProperty("ItlwmAwdlBaRefused", p->ba_refused, 32);
+    nub->setProperty("ItlwmAwdlBaNoPeer", p->ba_no_peer, 32);
+    nub->setProperty("ItlwmAwdlBaRemoved", p->ba_removed, 32);
+    nub->setProperty("ItlwmAwdlBaErrors", p->ba_errors, 32);
+    nub->setProperty("ItlwmAwdlBaLastErr", p->ba_last_err, 32);
+    nub->setProperty("ItlwmAwdlBaSample", p->ba_sample, sizeof(p->ba_sample));
+    nub->setProperty("ItlwmAwdlRxOldSn", p->rx_old_sn, 32);
+    nub->setProperty("ItlwmAwdlCacheAdds", p->cache_adds, 32);
+    nub->setProperty("ItlwmAwdlUmiSent", p->umi_sent, 32);
+    nub->setProperty("ItlwmAwdlUmiOk", p->umi_ok, 32);
+    nub->setProperty("ItlwmAwdlUmiFail", p->umi_fail, 32);
+    nub->setProperty("ItlwmAwdlUmiRejected", p->umi_rejected, 32);
+    nub->setProperty("ItlwmAwdlCacheDeletes", p->cache_dels, 32);
+    nub->setProperty("ItlwmAwdlCacheFull", p->cache_full, 32);
+    nub->setProperty("ItlwmAwdlHold", p->tx.hold, 32);
+    nub->setProperty("ItlwmAwdlAmsduOn", p->tx.amsdu, 32);
+    nub->setProperty("ItlwmAwdlAmsduSent", p->tx.amsdu_sent, 32);
+    nub->setProperty("ItlwmAwdlAmsduFrames", p->tx.amsdu_frames, 32);
+    nub->setProperty("ItlwmAwdlAmsduOk", p->tx.amsdu_ok, 32);
+    nub->setProperty("ItlwmAwdlAmsduFail", p->tx.amsdu_fail, 32);
+    nub->setProperty("ItlwmAwdlAmsduGaveUp", p->tx.amsdu_gave_up, 32);
+    nub->setProperty("ItlwmAwdlAwayHolds", p->tx.away_holds, 32);
+    nub->setProperty("ItlwmAwdlTxOkHere", p->tx.ok_here, 32);
+    nub->setProperty("ItlwmAwdlTxFailHere", p->tx.fail_here, 32);
+    nub->setProperty("ItlwmAwdlTxOkAway", p->tx.ok_away, 32);
+    nub->setProperty("ItlwmAwdlTxFailAway", p->tx.fail_away, 32);
+    nub->setProperty("ItlwmAwdlPhy2Chan", p->ctx.phy2_chan, 32);
+    nub->setProperty("ItlwmAwdlPhy2Err", p->ctx.phy2_err, 32);
+    nub->setProperty("ItlwmAwdlPhy2Switches", p->ctx.phy2_switches, 32);
+    nub->setProperty("ItlwmAwdlRxPhy2", p->ctx.rx_phy2, 32);
+    nub->setProperty("ItlwmAwdlRxHome", p->ctx.rx_home, 32);
+    {
+        /* Held frames: nothing finished across two looks at a queue with frames on it. */
+        auto c = &p->ctx;
+        const uint32_t done = c->own_ok + c->own_fail;
+        if (c->own_active && c->own_qid > 0 && sc->txq[c->own_qid].queued && done == c->own_seen_done) {
+            if (++c->own_idle >= 2) {
+                c->own_active = 0;
+                c->own_held = 1;
+            }
+        } else
+            c->own_idle = 0;
+        c->own_seen_done = done;
+        nub->setProperty("ItlwmAwdlOwnQueue", static_cast<uint32_t>(c->own_qid), 32);
+        nub->setProperty("ItlwmAwdlOwnActive", c->own_active, 32);
+        nub->setProperty("ItlwmAwdlOwnHeld", c->own_held, 32);
+        nub->setProperty("ItlwmAwdlOwnSta", c->own_sta, 32);
+        nub->setProperty("ItlwmAwdlOwnTid", c->own_tid, 32);
+        nub->setProperty("ItlwmAwdlOwnAgg", c->own_agg, 32);
+        nub->setProperty("ItlwmAwdlOwnRetargets", c->own_retargets, 32);
+        nub->setProperty("ItlwmAwdlOwnAggErr", c->own_agg_err, 32);
+        nub->setProperty("ItlwmAwdlOwnTlcErr", c->own_tlc_err, 32);
+        nub->setProperty("ItlwmAwdlOwnTxEnErr", c->own_txen_err, 32);
+        nub->setProperty("ItlwmAwdlOwnAggOk", c->own_agg_ok, 32);
+        nub->setProperty("ItlwmAwdlOwnAggFail", c->own_agg_fail, 32);
+        nub->setProperty("ItlwmAwdlOwnBaNotifs", c->own_ba_notifs, 32);
+        nub->setProperty("ItlwmAwdlOwnFixDone", c->own_fix_done, 32);
+        nub->setProperty("ItlwmAwdlOwnFixErr", c->own_fix_err, 32);
+        nub->setProperty("ItlwmAwdlOwnSent", c->own_sent, 32);
+        nub->setProperty("ItlwmAwdlOwnOk", c->own_ok, 32);
+        nub->setProperty("ItlwmAwdlOwnFail", c->own_fail, 32);
+        nub->setProperty("ItlwmAwdlOwnErr", c->own_err, 32);
+    }
+    nub->setProperty("ItlwmAwdlCtxTeRequests", p->ctx.te_requests, 32);
+    nub->setProperty("ItlwmAwdlCtxTeStarted", p->ctx.te_started, 32);
+    nub->setProperty("ItlwmAwdlCtxTeEnded", p->ctx.te_ended, 32);
+    nub->setProperty("ItlwmAwdlCtxTeFailed", p->ctx.te_failed, 32);
+    nub->setProperty("ItlwmAwdlCtxTeRemoved", p->ctx.te_removed, 32);
+    nub->setProperty("ItlwmAwdlOwnReleased", p->ctx.own_released, 32);
+    auto ic = &sc->sc_ic;
+    if (ic->ic_bss && ic->ic_bss->ni_chan)
+        nub->setProperty("ItlwmAwdlProbeChannel",
+            uint32_t(ieee80211_chan2ieee(ic, ic->ic_bss->ni_chan)), 32);
+}
+
+static uint8_t iwx_mvm_mac80211_ac_to_ucode_ac(enum ieee80211_edca_ac ac);
+
+void ItlIwx::
+iwx_awdl_ctx_publish(struct iwx_softc *sc)
+{
+    const struct iwx_awdl_ctx *c = &sc->sc_awdl_probe.ctx;
+    auto nub = sc->sc_pcitag;
+    if (sc->sc_awdl_native_requested)
+        nub->setProperty("ItlwmAwdlNativeMonitorReady", c->mode == 6 && c->stage >= IWX_AWDL_CTX_ACTIVE && !sc->sc_awdl_probe.tx.tripped);
+    nub->setProperty("ItlwmAwdlCtxStage", c->stage, 32);
+    nub->setProperty("ItlwmAwdlCtxFailedStage", c->failed_stage, 32);
+    nub->setProperty("ItlwmAwdlCtxError", c->last_err, 32);
+    nub->setProperty("ItlwmAwdlCtxAdds", c->adds, 32);
+    nub->setProperty("ItlwmAwdlCtxRemoves", c->removes, 32);
+    nub->setProperty("ItlwmAwdlCtxQueue", uint32_t(c->qid > 0 ? c->qid : 0), 32);
+}
+
+int ItlIwx::
+iwx_awdl_ctx_link_cmd(struct iwx_softc *sc, struct iwx_node *in, uint32_t action,
+                      uint32_t modify_mask, uint32_t active)
+{
+    struct ieee80211com *ic = &sc->sc_ic;
+    struct iwx_link_config_cmd cmd;
+    const bool has_phy = !sc->sc_awdl_probe.ctx.link_no_phy && action != IWX_FW_CTXT_ACTION_ADD && action != IWX_FW_CTXT_ACTION_REMOVE && in && in->in_phyctxt;
+    iwx_awdl_fill_link(&cmd, action, has_phy ? (sc->sc_awdl_probe.ctx.phy2_chan ? sc->sc_phyctxt[1].id : in->in_phyctxt->id) : IWX_FW_CTXT_INVALID,
+                       sc->sc_awdl_probe.tx.self, modify_mask, active);
+    /* Every field every time, as Linux iwl_mvm_link_changed() does; the mask only selects. */
+    if (has_phy) {
+        int cck, ofdm;
+        iwx_ack_rates(sc, in, &cck, &ofdm);
+        cmd.cck_rates = htole32(cck);
+        cmd.ofdm_rates = htole32(ofdm);
+        cmd.short_slot = htole32((ic->ic_flags & IEEE80211_F_SHSLOT) ? 1 : 0);
+        cmd.bi = htole32(in->in_ni.ni_intval);
+        cmd.dtim_interval = htole32(in->in_ni.ni_intval * in->in_ni.ni_dtimperiod);
+        for (int i = 0; i < EDCA_NUM_AC; i++) {
+            struct ieee80211_edca_ac_params *ac = &ic->ic_edca_ac[i];
+            uint8_t ucode_ac = iwx_mvm_mac80211_ac_to_ucode_ac((enum ieee80211_edca_ac)i);
+            cmd.ac[ucode_ac].cw_min = htole16((1 << ac->ac_ecwmin) - 1);
+            cmd.ac[ucode_ac].cw_max = htole16((1 << ac->ac_ecwmax) - 1);
+            cmd.ac[ucode_ac].aifsn = ac->ac_aifsn;
+            cmd.ac[ucode_ac].fifos_mask = (1 << iwx_ac_to_tx_fifo[i]);
+            cmd.ac[ucode_ac].edca_txop = htole16(ac->ac_txoplimit * 32);
+        }
+    }
+    return iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_LINK_CONFIG_CMD, IWX_MAC_CONF_GROUP, 0), 0, sizeof(cmd), &cmd);
+}
+
+/*
+ * Each command wait releases the gate, and teardown may run meanwhile. The stage is
+ * set before a command is sent; host commands run in order, so a remove that sees
+ * the stage also follows the command in flight. Any failure ends it for this boot.
+ */
+void ItlIwx::
+iwx_awdl_ctx_add(struct iwx_softc *sc, struct iwx_node *in)
+{
+    auto p = &sc->sc_awdl_probe;
+    auto c = &p->ctx;
+    struct ieee80211com *ic = &sc->sc_ic;
+    if (c->mode && p->tx.tripped)
+        iwx_awdl_ctx_publish(sc); /* After a fault nothing else reports that it is gone. */
+    if (!c->mode || p->tx.tripped || c->stage || !in->in_phyctxt)
+        return;
+    const uint32_t epoch = sc->sc_mld_assoc_epoch;
+    const int generation = sc->sc_generation;
+    uint32_t stage = IWX_AWDL_CTX_MAC;
+    int err;
+    ++c->adds;
+    {
+        struct iwx_mac_config_cmd cmd;
+        iwx_awdl_fill_mac(&cmd, IWX_FW_CTXT_ACTION_ADD, p->tx.self, c->mode >= 3, false);
+        c->stage = stage;
+        err = iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_MAC_CONFIG_CMD, IWX_MAC_CONF_GROUP, 0), 0, sizeof(cmd), &cmd);
+    }
+#define IWX_AWDL_CTX_STEP_DONE() do {                                                        \
+        if (generation != sc->sc_generation || epoch != sc->sc_mld_assoc_epoch ||            \
+            c->stage != stage || ic->ic_state != IEEE80211_S_RUN ||                          \
+            sc->ns_nstate != IEEE80211_S_RUN || ic->ic_wcl_teardown_pending ||               \
+            (sc->sc_flags & IWX_FLAG_SHUTDOWN))                                              \
+            return;                                                                          \
+        if (err) goto fail;                                                                  \
+    } while (0)
+    IWX_AWDL_CTX_STEP_DONE();
+    stage = c->stage = IWX_AWDL_CTX_LINK;
+    err = iwx_awdl_ctx_link_cmd(sc, in, IWX_FW_CTXT_ACTION_ADD, 0, 0);
+    IWX_AWDL_CTX_STEP_DONE();
+    /* Linux: first the PHY context with an empty mask, then activate with rates. */
+    err = iwx_awdl_ctx_link_cmd(sc, in, IWX_FW_CTXT_ACTION_MODIFY, 0, 0);
+    IWX_AWDL_CTX_STEP_DONE();
+    stage = c->stage = IWX_AWDL_CTX_ACTIVE;
+    err = iwx_awdl_ctx_link_cmd(sc, in, IWX_FW_CTXT_ACTION_MODIFY,
+        IWX_LINK_CONTEXT_MODIFY_ACTIVE | IWX_LINK_CONTEXT_MODIFY_RATES_INFO, 1);
+    IWX_AWDL_CTX_STEP_DONE();
+    if (c->mode == 6 && !p->assoc_rx) {
+        iwx_awdl_ctx_publish(sc);
+        return;
+    }
+    {
+        struct iwx_sta_cfg_cmd cmd;
+        iwx_awdl_fill_sta(&cmd, c->mode == 4 || c->mode == 6);
+        stage = c->stage = IWX_AWDL_CTX_STA;
+        err = iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_STA_CONFIG_CMD, IWX_MAC_CONF_GROUP, 0), 0, sizeof(cmd), &cmd);
+    }
+    IWX_AWDL_CTX_STEP_DONE();
+    /* Mode 6 sends on the AP queue. */
+    if (c->mode != 6) {
+        stage = c->stage = IWX_AWDL_CTX_QUEUE;
+        const int queue = iwx_tvqm_enable_txq(sc, IWX_MGMT_TID, 0, IWX_DEFAULT_QUEUE_SIZE, IWX_AWDL_STA_ID);
+        err = queue < 0 ? queue : 0;
+        IWX_AWDL_CTX_STEP_DONE();
+        c->qid = queue;
+    }
+    if (c->mode == 4 || c->mode == 6) {
+        struct iwx_mac_config_cmd cmd;
+        iwx_awdl_fill_mac(&cmd, IWX_FW_CTXT_ACTION_MODIFY, p->tx.self, true, true);
+        stage = c->stage = IWX_AWDL_CTX_ASSOC;
+        err = iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_MAC_CONFIG_CMD, IWX_MAC_CONF_GROUP, 0), 0, sizeof(cmd), &cmd);
+        IWX_AWDL_CTX_STEP_DONE();
+    }
+#undef IWX_AWDL_CTX_STEP_DONE
+    iwx_awdl_ctx_publish(sc);
+    if (p->peer_added < p->peer_count || p->cache_add_wait || p->cache_del_wait)
+        iwx_add_task(sc, systq, &sc->awdl_peer_task);
+    return;
+fail:
+    /* The failed command created nothing. */
+    c->failed_stage = stage;
+    c->last_err = uint32_t(err < 0 ? -err : err);
+    c->stage = stage - 1;
+    p->tx.tripped = 1;
+    sc->sc_pcitag->setProperty("ItlwmAwdlTxTripped", p->tx.tripped, 32);
+    iwx_awdl_ctx_remove(sc);
+    iwx_awdl_ctx_publish(sc);
+}
+
+/* Before anything the AP link depends on goes away: this link shares its PHY context. */
+void ItlIwx::
+iwx_awdl_ctx_remove(struct iwx_softc *sc)
+{
+    auto c = &sc->sc_awdl_probe.ctx;
+    struct iwx_node *in = (struct iwx_node *)sc->sc_ic.ic_bss;
+    const uint32_t stage = c->stage;
+    const int generation = sc->sc_generation;
+    int err = 0;
+    if (stage == IWX_AWDL_CTX_NONE)
+        return;
+    c->stage = IWX_AWDL_CTX_NONE;
+    c->qid = -1;
+    c->phy2_chan = 0;
+    if (sc->sc_awdl_native_requested)
+        sc->sc_pcitag->setProperty("ItlwmAwdlNativeMonitorReady", false);
+    ++c->removes;
+    {
+        auto p = &sc->sc_awdl_probe;
+        /* Linux order: block ack and queues before the station that owns them. */
+        p->ba_pending_valid = 0;
+        for (uint32_t i = 0; i < IWX_AWDL_BA_MAX; ++i) {
+            if (!p->ba[i].active)
+                continue;
+            p->ba[i].active = 0;
+            err = iwx_awdl_ba_cmd(sc, &p->ba[i], NULL, NULL) ?: err;
+            if (generation != sc->sc_generation)
+                return;
+        }
+        c->own_active = 0;
+        c->own_held = 0;
+        if (c->own_qid > 0) {
+            const int own = c->own_qid;
+            c->own_qid = -1;
+            sc->sc_flags |= IWX_FLAG_TXFLUSH;
+            err = iwx_flush_sta_tids(sc, c->own_sta, 0xffff) ?: err;
+            if (generation != sc->sc_generation)
+                return;
+            sc->sc_flags &= ~IWX_FLAG_TXFLUSH;
+            err = iwx_mld_disable_txq(sc, c->own_sta, IWX_MGMT_TID) ?: err;
+            if (generation != sc->sc_generation)
+                return;
+            iwx_reset_tx_ring(sc, &sc->txq[own]);
+        }
+        const uint32_t peers = p->peer_added;
+        p->peer_added = p->peer_count = 0;
+        p->cache_add_wait = p->cache_del_wait = 0;
+        for (uint32_t i = peers; i-- > 0;) {
+            struct iwx_sta_remove_cmd cmd = { .sta_id = htole32(IWX_AWDL_PEER_STA_FIRST + i) };
+            err = iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_STA_REMOVE_CMD, IWX_MAC_CONF_GROUP, 0), 0, sizeof(cmd), &cmd) ?: err;
+            if (generation != sc->sc_generation)
+                return;
+        }
+    }
+    if (c->mode == 5 && stage >= IWX_AWDL_CTX_QUEUE) {
+        struct iwx_session_prot_cmd te;
+        iwx_awdl_fill_te(&te, IWX_FW_CTXT_ACTION_REMOVE, 0);
+        err = iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_SESSION_PROTECTION_CMD, IWX_MAC_CONF_GROUP, 0), 0, sizeof(te), &te);
+        if (generation != sc->sc_generation)
+            return;
+    }
+    if (stage >= IWX_AWDL_CTX_ASSOC) {
+        struct iwx_mac_config_cmd cmd;
+        iwx_awdl_fill_mac(&cmd, IWX_FW_CTXT_ACTION_MODIFY, sc->sc_awdl_probe.tx.self, true, false);
+        err = iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_MAC_CONFIG_CMD, IWX_MAC_CONF_GROUP, 0), 0, sizeof(cmd), &cmd);
+        if (generation != sc->sc_generation)
+            return;
+    }
+    if (stage >= IWX_AWDL_CTX_QUEUE && c->mode != 6) {
+        sc->sc_flags |= IWX_FLAG_TXFLUSH;
+        err = iwx_flush_sta_tids(sc, IWX_AWDL_STA_ID, 0xffff) ?: err;
+        if (generation != sc->sc_generation)
+            return;
+        sc->sc_flags &= ~IWX_FLAG_TXFLUSH;
+        err = iwx_mld_disable_txq(sc, IWX_AWDL_STA_ID, IWX_MGMT_TID) ?: err;
+        if (generation != sc->sc_generation)
+            return;
+    }
+    if (stage >= IWX_AWDL_CTX_STA) {
+        struct iwx_sta_remove_cmd cmd = { .sta_id = htole32(IWX_AWDL_STA_ID) };
+        err = iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_STA_REMOVE_CMD, IWX_MAC_CONF_GROUP, 0), 0, sizeof(cmd), &cmd) ?: err;
+        if (generation != sc->sc_generation)
+            return;
+    }
+    if (stage >= IWX_AWDL_CTX_ACTIVE) {
+        err = iwx_awdl_ctx_link_cmd(sc, in, IWX_FW_CTXT_ACTION_MODIFY, IWX_LINK_CONTEXT_MODIFY_ACTIVE, 0) ?: err;
+        if (generation != sc->sc_generation)
+            return;
+    }
+    if (stage >= IWX_AWDL_CTX_LINK) {
+        err = iwx_awdl_ctx_link_cmd(sc, in, IWX_FW_CTXT_ACTION_REMOVE, 0, 0) ?: err;
+        if (generation != sc->sc_generation)
+            return;
+    }
+    {
+        struct iwx_mac_config_cmd cmd;
+        iwx_awdl_fill_mac(&cmd, IWX_FW_CTXT_ACTION_REMOVE, nullptr, false, false);
+        err = iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_MAC_CONFIG_CMD, IWX_MAC_CONF_GROUP, 0), 0, sizeof(cmd), &cmd) ?: err;
+        if (generation != sc->sc_generation)
+            return;
+    }
+    if (err) {
+        c->last_err = uint32_t(err < 0 ? -err : err);
+        sc->sc_awdl_probe.tx.tripped = 1;
+    }
+    iwx_awdl_ctx_publish(sc);
+}
+
+/* The added count rises before each command, as the stage does: a remove also covers one in flight. */
+bool ItlIwx::awdlSyncNext(uint16_t *seq, uint32_t *wait_us)
+{
+    if (!getMainWorkLoop()->inGate()) return false;
+    uint64_t now = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+    return iwx_awdl_sync_next(&com.sc_awdl_probe, now / 1000, seq, wait_us);
+}
+
+void ItlIwx::iwx_awdl_peer_task(void *arg)
+{
+    auto sc = static_cast<iwx_softc *>(arg);
+    auto that = container_of(sc, ItlIwx, com);
+    if (!that->getMainWorkLoop()->inGate()) {
+        that->getMainCommandGate()->runAction(
+            [](OSObject *, void *arg0, void *, void *, void *) -> IOReturn {
+                iwx_awdl_peer_task(arg0); return kIOReturnSuccess;
+            }, arg);
+        return;
+    }
+    auto ic = &sc->sc_ic;
+    auto p = &sc->sc_awdl_probe;
+    while (p->peer_added < p->peer_count) {
+        if (p->ctx.stage != IWX_AWDL_CTX_ASSOC || p->tx.tripped || p->peer_failed ||
+            ic->ic_state != IEEE80211_S_RUN || sc->ns_nstate != IEEE80211_S_RUN || ic->ic_wcl_teardown_pending ||
+            (sc->sc_flags & (IWX_FLAG_SHUTDOWN | IWX_FLAG_HW_ERR)))
+            return;
+        const int generation = sc->sc_generation;
+        const uint32_t index = p->peer_added++;
+        struct iwx_sta_cfg_cmd cmd;
+        iwx_awdl_fill_peer_sta(&cmd, index, p->peer_addr[index]);
+        const int err = that->iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_STA_CONFIG_CMD, IWX_MAC_CONF_GROUP, 0), 0, sizeof(cmd), &cmd);
+        if (generation != sc->sc_generation)
+            return;
+        if (err && p->peer_added == index + 1) {
+            /* The failed command created nothing. Stay with what exists. */
+            p->peer_added = p->peer_count = index;
+            p->peer_failed = 1;
+            ++p->peer_errors;
+        }
+    }
+    if (p->ctx.stage != IWX_AWDL_CTX_ASSOC || p->tx.tripped)
+        return;
+    /* Only now is the station really in the firmware. A request that failed gets no answer. */
+    auto *controller = OSDynamicCast(AirportItlwm, that->getController());
+    for (uint32_t i = 0; i < IWX_AWDL_PEER_STA_MAX; ++i) {
+        const uint8_t bit = uint8_t(1u << i);
+        const bool added = i < p->peer_added;
+        if (p->cache_add_wait & bit) {
+            p->cache_add_wait = uint8_t(p->cache_add_wait & ~bit);
+            if (added && controller) {
+                ++p->cache_adds;
+                controller->awdlPeerCacheDone(p->peer_addr[i], true);
+            }
+        }
+        if (p->cache_del_wait & bit) {
+            p->cache_del_wait = uint8_t(p->cache_del_wait & ~bit);
+            if (added && controller) {
+                ++p->cache_dels;
+                controller->awdlPeerCacheDone(p->peer_addr[i], false);
+            }
+        }
+    }
+}
+
+/* The family's status path can send again, so results leave from a task and not from a completion. */
+void ItlIwx::iwx_awdl_umi_task(void *arg)
+{
+    auto sc = static_cast<iwx_softc *>(arg);
+    auto that = container_of(sc, ItlIwx, com);
+    if (!that->getMainWorkLoop()->inGate()) {
+        that->getMainCommandGate()->runAction(
+            [](OSObject *, void *arg0, void *, void *, void *) -> IOReturn {
+                iwx_awdl_umi_task(arg0); return kIOReturnSuccess;
+            }, arg);
+        return;
+    }
+    auto p = &sc->sc_awdl_probe;
+    auto *controller = OSDynamicCast(AirportItlwm, that->getController());
+    while (p->umi_done_count) {
+        uint8_t mac[6];
+        memcpy(mac, p->umi_done[0].mac, 6);
+        const uint8_t status = p->umi_done[0].status;
+        --p->umi_done_count;
+        memmove(&p->umi_done[0], &p->umi_done[1], sizeof(p->umi_done[0]) * p->umi_done_count);
+        if (controller)
+            controller->awdlUmiDone(mac, status == 0);
+    }
+}
+
+/* Failures report back too, so the family retries instead of waiting out its timeout. */
+void ItlIwx::sendAwdlUmi(const uint8_t *peer, const uint8_t *tlvs, size_t length)
+{
+    if (!getMainWorkLoop()->inGate() || !peer) return;
+    auto sc = &com;
+    auto p = &sc->sc_awdl_probe;
+    IOReturn result = iwx_awdl_data_gate(sc, peer);
+    mbuf_t m = NULL;
+    if (result == kIOReturnSuccess) {
+        result = kIOReturnNoMemory;
+        mbuf_gethdr(MBUF_DONTWAIT, MT_DATA, &m);
+        if (m) {
+            mbuf_mclget(MBUF_DONTWAIT, MT_DATA, &m);
+            if (m && !(mbuf_flags(m) & MBUF_EXT)) {
+                mbuf_freem(m);
+                m = NULL;
+            }
+        }
+    }
+    if (m) {
+        uint64_t now = 0;
+        absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+        const uint16_t seq = p->tx.seq;
+        const size_t n = mbuf_maxlen(m) >= IWX_AWDL_NATIVE_FRAME_MAX
+            ? iwx_awdl_build_umi(p, peer, tlvs, length, now / 1000, static_cast<uint8_t *>(mbuf_data(m)), mbuf_maxlen(m)) : 0;
+        if (!n) {
+            ++p->umi_rejected;
+            mbuf_freem(m);
+            result = kIOReturnBadArgument;
+        } else {
+            mbuf_setlen(m, n);
+            p->umi_seq = uint16_t(seq << 4);
+            p->umi_seq_valid = 1;
+            memcpy(p->umi_seq_peer, peer, 6);
+            result = iwx_awdl_data_enqueue(sc, m, n);
+            if (result == kIOReturnSuccess)
+                ++p->umi_sent;
+            else
+                p->umi_seq_valid = 0;
+        }
+    }
+    if (result != kIOReturnSuccess) {
+        iwx_awdl_umi_note(p, peer, false);
+        iwx_add_task(sc, systq, &sc->awdl_umi_task);
+    }
+}
+
+void ItlIwx::awdlPeerCache(const uint8_t *mac, uint32_t op)
+{
+    auto sc = &com;
+    if (getMainWorkLoop()->inGate() && iwx_awdl_cache_request(&sc->sc_awdl_probe, mac, op))
+        iwx_add_task(sc, systq, &sc->awdl_peer_task);
+}
+
+void ItlIwx::
+iwx_awdl_tx_maybe(struct iwx_softc *sc)
+{
+    static const uint8_t broadcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    auto p = &sc->sc_awdl_probe;
+    struct ieee80211com *ic = &sc->sc_ic;
+    struct _ifnet *ifp = &ic->ic_if;
+    struct ieee80211_node *ni = ic->ic_bss;
+    const enum iwx_awdl_tx_kind kind = iwx_awdl_tx_decide(p, p->rx_host_us);
+    if (kind == IWX_AWDL_TX_NONE)
+        return;
+    /* Mode 6 and no context use the AP station's queue; other modes only their own. */
+    const bool apQueue = !p->ctx.mode || p->ctx.mode == 6;
+    if (p->ctx.mode == 6 ? p->ctx.stage < IWX_AWDL_CTX_ACTIVE : (p->ctx.mode && p->ctx.qid <= 0)) {
+        ++p->tx.busy;
+        return;
+    }
+    if (p->ctx.mode == 5 && p->rx_host_us - p->ctx.last_te_us >= IWX_AWDL_TE_INTERVAL_US) {
+        /* Asynchronous: this runs on the receive path. Held frames go out once it starts. */
+        struct iwx_session_prot_cmd te;
+        iwx_awdl_fill_te(&te, IWX_FW_CTXT_ACTION_ADD, IWX_AWDL_TE_DURATION_TU);
+        if (!iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_SESSION_PROTECTION_CMD, IWX_MAC_CONF_GROUP, 0),
+                              IWX_CMD_ASYNC, sizeof(te), &te))
+            ++p->ctx.te_requests;
+        p->ctx.last_te_us = p->rx_host_us;
+    }
+    if (p->ctx.mode && sc->txq[apQueue ? sc->first_data_qid : p->ctx.qid].queued >= IWX_AWDL_TX_MAX_QUEUED) {
+        ++p->tx.queue_limited;
+        return;
+    }
+    if (!ni->ni_port_valid || !(sc->sc_flags & IWX_FLAG_MLD_TXQ_ACTIVE) ||
+        (sc->sc_flags & (IWX_FLAG_SHUTDOWN | IWX_FLAG_TXFLUSH | IWX_FLAG_HW_ERR)) ||
+        !sc->qfullmsk.empty()) {
+        ++p->tx.busy;
+        return;
+    }
+    uint8_t *frame = p->tx.frame;
+    const size_t len = p->tx.native ?
+        iwx_awdl_build_native(p, kind == IWX_AWDL_TX_MIF, p->rx_host_us, frame, sizeof(p->tx.frame)) :
+        iwx_awdl_build(p, kind == IWX_AWDL_TX_UNICAST ? p->tx.peer : broadcast,
+                       kind == IWX_AWDL_TX_PSF ? 0 : 3, p->rx_host_us, frame, sizeof(p->tx.frame));
+    if (!len)
+        return;
+    mbuf_t m = NULL;
+    mbuf_gethdr(MBUF_DONTWAIT, MT_DATA, &m);
+    if (m && len > mbuf_get_mhlen()) {
+        mbuf_mclget(MBUF_DONTWAIT, MT_DATA, &m);
+        if (m && !(mbuf_flags(m) & MBUF_EXT)) {
+            mbuf_freem(m);
+            m = NULL;
+        }
+    }
+    if (!m) {
+        ++p->tx.alloc_fail;
+        return;
+    }
+    memcpy(mbuf_data(m), frame, len);
+    mbuf_pkthdr_setlen(m, len);
+    mbuf_setlen(m, len);
+    mbuf_pkthdr_setrcvif(m, (ifnet_t)ni);
+    ieee80211_ref_node(ni);
+    if (mq_enqueue(&ic->ic_mgtq, m) == 0) {
+        iwx_awdl_tx_note_queued(p, kind, p->rx_host_us);
+        ifp->if_start(ifp);
+    } else {
+        ieee80211_release_node(ic, ni);
+        ++p->tx.busy;
     }
 }
 #endif
@@ -6297,7 +7497,8 @@ iwx_ccmp_decap(struct iwx_softc *sc, mbuf_t m, struct ieee80211_node *ni,
 
    hasqos = ieee80211_has_qos(wh);
    tid = hasqos ? ieee80211_get_qos(wh) & IEEE80211_QOS_TID : 0;
-   prsc = &k->k_rsc[tid];
+   prsc = (wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_MGT ?
+       &k->k_mgmt_rsc : &k->k_rsc[tid];
 
    /* Extract the 48-bit PN from the CCMP header. */
    pn = (uint64_t)ivp[0]       |
@@ -6967,6 +8168,63 @@ iwx_rx_mpdu_mq(struct iwx_softc *sc, mbuf_t m, void *pktdata,
         mbuf_adj(m, 2);
     }
     
+#ifdef AIRPORT_WCL
+    // Firmware FCS and header padding have now been stripped. The native AWDL parser
+    // expects the action body, not DMA padding, trailing FCS or an 802.11 MAC header.
+    if (sc->sc_awdl_probe.mode && ic->ic_state == IEEE80211_S_RUN && ic->ic_bss) {
+        uint64_t awdlNow = 0;
+        absolutetime_to_nanoseconds(mach_absolute_time(), &awdlNow);
+        auto *probe = &sc->sc_awdl_probe;
+        probe->rx_host_us = awdlNow / 1000;
+        probe->rx_gp2 = le32toh(sc->sc_device_family >= IWX_DEVICE_FAMILY_AX210 ?
+            desc->v3.gp2_on_air_rise : desc->v1.gp2_on_air_rise);
+        probe->rx_chan = sc->sc_device_family >= IWX_DEVICE_FAMILY_AX210 ?
+            desc->v3.channel : desc->v1.channel;
+        const auto *frame = static_cast<const uint8_t *>(mbuf_data(m));
+        const size_t frameLength = mbuf_len(m);
+        if (iwx_awdl_probe_rx(probe, frame, frameLength, ic->ic_bss->ni_bssid) == IWX_AWDL_PROBE_DROP) {
+            if (probe->ctx.phy2_chan && frameLength >= 24 && !memcmp(frame + 16, iwx_awdl_bssid, 6))
+                ++*(probe->rx_chan == probe->ctx.phy2_chan ? &probe->ctx.rx_phy2 : &probe->ctx.rx_home);
+            if (frameLength >= 24 && (frame[0] & 0x0c) == 0x08 && !memcmp(frame + 4, probe->tx.self, 6)) {
+                const uint32_t rxRate = le32toh(sc->sc_device_family >= IWX_DEVICE_FAMILY_AX210 ?
+                    desc->v3.rate_n_flags : desc->v1.rate_n_flags);
+                probe->rx_data_rate = rxRate;
+                /* Modulation, width, streams and MCS compare in that order. */
+                if ((rxRate & 0x3fff) > (probe->rx_data_rate_peak & 0x3fff))
+                    probe->rx_data_rate_peak = rxRate;
+                if (le16toh(desc->phy_info) & IWX_RX_MPDU_PHY_AMPDU)
+                    ++probe->rx_data_ampdu;
+            }
+            if (sc->sc_awdl_native_requested && probe->ctx.stage >= IWX_AWDL_CTX_ACTIVE &&
+                !probe->tx.tripped && !(sc->sc_flags & (IWX_FLAG_SHUTDOWN | IWX_FLAG_HW_ERR)) &&
+                !ic->ic_wcl_teardown_pending && iwx_awdl_rx_wanted(probe, frame, frameLength) &&
+                getMainWorkLoop()->inGate()) {
+                auto *controller = OSDynamicCast(AirportItlwm, getController());
+                const int awdlRssi = iwx_rxmq_get_signal_strength(sc, desc);
+                /* A retry of what the block ack window already passed: the first copy went up. */
+                const uint32_t awdlReorder = le32toh(desc->reorder_data);
+                const bool awdlOld = (frame[0] & 0x0c) == 0x08 && (awdlReorder & IWX_RX_MPDU_REORDER_BA_OLD_SN) &&
+                    ((awdlReorder & IWX_RX_MPDU_REORDER_BAID_MASK) >> IWX_RX_MPDU_REORDER_BAID_SHIFT) !=
+                        IWX_RX_REORDER_DATA_INVALID_BAID;
+                if (awdlOld)
+                    ++probe->rx_old_sn;
+                else if (controller) controller->inputAWDLActionFrame(frame, frameLength, probe->rx_chan,
+                    awdlRssi, uint32_t(probe->rx_host_us));
+                if ((frame[0] & 0x0c) == 0x00 && iwx_awdl_ba_note(probe, frame, frameLength))
+                    iwx_add_task(sc, systq, &sc->awdl_ba_task);
+                if (iwx_awdl_peer_note(probe, frame, frameLength, awdlRssi))
+                    iwx_add_task(sc, systq, &sc->awdl_peer_task);
+            }
+            iwx_awdl_tx_maybe(sc);
+            /* One frame per heard frame sent only MIFs where a lone phone sends only MIFs (1.1.35). */
+            if (probe->tx.native) iwx_awdl_tx_maybe(sc);
+            iwx_awdl_probe_publish(sc);
+            mbuf_freem(m);
+            return;
+        }
+    }
+#endif
+    
     memset(&rxi, 0, sizeof(rxi));
     
     /*
@@ -7052,6 +8310,19 @@ iwx_rx_mpdu_mq(struct iwx_softc *sc, mbuf_t m, void *pktdata,
                  rate_n_flags, device_timestamp, &rxi, ml);
 }
 
+#ifdef AIRPORT_WCL
+/* Before a result is counted: was the peer the schedule follows on this channel? */
+static void iwx_awdl_tx_note_presence(struct iwx_softc *sc)
+{
+    auto p = &sc->sc_awdl_probe;
+    struct ieee80211com *ic = &sc->sc_ic;
+    uint64_t now = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+    p->tx.peer_away = ic->ic_bss && iwx_awdl_peer_away(p, p->sync.reference, now / 1000,
+        uint8_t(ieee80211_chan2ieee(ic, ic->ic_bss->ni_chan)));
+}
+#endif
+
 void ItlIwx::
 iwx_rx_tx_cmd_single(struct iwx_softc *sc, struct iwx_rx_packet *pkt,
                      struct iwx_tx_data *txd)
@@ -7066,6 +8337,24 @@ iwx_rx_tx_cmd_single(struct iwx_softc *sc, struct iwx_rx_packet *pkt,
 #ifdef AIRPORT_WCL
     wcl_rsn_tx_completed(&ic->ic_wcl_rsn_trace, txd->wcl_rsn_cookie,
         ic->ic_wcl_rsn_cookie, txd->wcl_rsn_kind, status);
+    /* Its losses say nothing about the AP link: keep them out of its antenna and error state. */
+    if (txd->awdl_kind) {
+        iwx_awdl_tx_note_presence(sc);
+        iwx_awdl_tx_note_done(&sc->sc_awdl_probe, txd->awdl_kind != 1, status == IWX_TX_STATUS_SUCCESS,
+                              static_cast<uint32_t>(status), tx_resp->failure_frame);
+        if (txd->awdl_kind == 3) {
+            if (status == IWX_TX_STATUS_SUCCESS) ++sc->sc_awdl_probe.ctx.own_ok;
+            else ++sc->sc_awdl_probe.ctx.own_fail;
+        }
+        if (txd->awdl_kind == 4)
+            iwx_awdl_amsdu_note_done(&sc->sc_awdl_probe, status == IWX_TX_STATUS_SUCCESS);
+        if (txd->awdl_umi) {
+            txd->awdl_umi = 0;
+            iwx_awdl_umi_note(&sc->sc_awdl_probe, txd->awdl_umi_peer, status == IWX_TX_STATUS_SUCCESS);
+            iwx_add_task(sc, systq, &sc->awdl_umi_task);
+        }
+        return;
+    }
 #endif
     
     txfail = (status != IWX_TX_STATUS_SUCCESS);
@@ -7109,6 +8398,8 @@ iwx_txd_done(struct iwx_softc *sc, struct iwx_tx_data *txd)
     txd->m = NULL;
 #ifdef AIRPORT_WCL
     txd->wcl_rsn_kind = txd->wcl_rsn_cookie = 0;
+    txd->awdl_kind = 0;
+    txd->awdl_umi = 0;
 #endif
     
     KASSERT(txd->in, "txd->in");
@@ -7122,6 +8413,18 @@ iwx_clear_oactive(struct iwx_softc *sc, struct iwx_tx_ring *ring)
     struct ieee80211com *ic = &sc->sc_ic;
     struct _ifnet *ifp = &ic->ic_if;
 
+#ifdef AIRPORT_WCL
+    {
+        auto p = &sc->sc_awdl_probe;
+        const int dataQid = p->ctx.own_active ? p->ctx.own_qid : sc->first_data_qid;
+        if (p->tx.data_stalled && ring->qid == dataQid && ring->queued <= IWX_AWDL_DATA_MAX_QUEUED / 2) {
+            p->tx.data_stalled = 0;
+            ++p->tx.data_kicks;
+            if (auto *controller = OSDynamicCast(AirportItlwm, getController()))
+                controller->awdlTxRoom();
+        }
+    }
+#endif
     if (ring->queued < ring->low_mark) {
         sc->qfullmsk.clear(ring->qid);
         if (sc->qfullmsk.empty() && ifq_is_oactive(&ifp->if_snd)) {
@@ -7147,8 +8450,23 @@ iwx_rx_tx_ba_notif(struct iwx_softc *sc, struct iwx_rx_packet *pkt, struct iwx_r
     if (length < sizeof(*ba_res) ||
         le16toh(ba_res->tfd_cnt) > (length - sizeof(*ba_res)) / sizeof(ba_res->tfd[0]))
         return;
+#ifdef AIRPORT_WCL
+    auto awdlCtx = &sc->sc_awdl_probe.ctx;
+    const bool ownAgg = awdlCtx->own_agg && awdlCtx->own_qid > 0 && ba_res->sta_id == awdlCtx->own_sta;
+    if (ownAgg) {
+        const uint16_t txed = le16toh(ba_res->txed), done = le16toh(ba_res->done);
+        ++awdlCtx->own_ba_notifs;
+        awdlCtx->own_agg_ok += done;
+        awdlCtx->own_agg_fail += txed > done ? uint32_t(txed - done) : 0;
+        /* Progress for the held-queue check, which counts completions. */
+        awdlCtx->own_ok += done;
+    }
+    if (ba_res->sta_id != IWX_STATION_ID && !ownAgg)
+        return;
+#else
     if (ba_res->sta_id != IWX_STATION_ID)
         return;
+#endif
     sc->sc_tx_timer = 0;
 
     if (le32toh(ba_res->flags) != IWX_BA_RESP_TX_BAR && le32toh(ba_res->flags) != IWX_BA_RESP_TX_AGG){
@@ -7328,6 +8646,11 @@ iwx_rx_bmiss(struct iwx_softc *sc, struct iwx_rx_packet *pkt,
     if ((ic->ic_opmode != IEEE80211_M_STA) ||
         (ic->ic_state != IEEE80211_S_RUN))
         return;
+#ifdef AIRPORT_WCL
+    /* The AWDL context has no AP: its beacons say nothing about the real one. */
+    if (sc->sc_awdl_probe.ctx.mode && le32toh(mbn->mac_id) == IWX_AWDL_MAC_ID)
+        return;
+#endif
     
     //    bus_dmamap_sync(sc->sc_dmat, data->map, sizeof(*pkt),
     //        sizeof(*mbn), BUS_DMASYNC_POSTREAD);
@@ -8097,9 +9420,31 @@ iwx_tx_fill_cmd(struct iwx_softc *sc, struct iwx_node *in,
         *rate_n_flags = 0;
         return &iwx_rates[min_ridx];
     }
+#ifdef AIRPORT_WCL
+    /* Peers advertise HT rates in their AWDL frames, and the phone's are read as this Mac's are. */
+    if (type == IEEE80211_FC0_TYPE_DATA && !IEEE80211_IS_MULTICAST(wh->i_addr1) &&
+        !memcmp(wh->i_addr3, iwx_awdl_bssid, 6)) {
+        const uint8_t version = iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_TX_CMD);
+        const uint8_t valid = iwx_fw_valid_tx_ant(sc);
+        int32_t rate = iwx_awdl_data_rate(sc->sc_awdl_probe.tx.rate_step);
+        /* This link shares the AP's PHY context, so no wider than that. */
+        if (rate >= 0 && (rate & IWX_AWDL_RATE_80MHZ) &&
+            ni->ni_chw != IEEE80211_CHAN_WIDTH_80 && ni->ni_chw != IEEE80211_CHAN_WIDTH_160)
+            rate = iwx_awdl_data_rate(-1);
+        if (rate >= 0 && (rate & IWX_RATE_MCS_NSS_MSK) && (valid & 3) != 3)
+            rate &= ~IWX_RATE_MCS_NSS_MSK;
+        if (rate >= 0 && version > 8 && version != IWX_FW_CMD_VER_UNKNOWN) {
+            const uint32_t antennas = (rate & IWX_RATE_MCS_NSS_MSK) ? uint32_t(3) << IWX_RATE_MCS_ANT_POS :
+                uint32_t(iwx_get_tx_ant(sc, ni, &iwx_rates[min_ridx], type, wh));
+            *flags |= IWX_TX_FLAGS_CMD_RATE;
+            *rate_n_flags = htole32(antennas | uint32_t(rate));
+            return &iwx_rates[min_ridx];
+        }
+    }
+#endif
     if (IEEE80211_IS_MULTICAST(wh->i_addr1) ||
-        type != IEEE80211_FC0_TYPE_DATA) {
-        /* for non-data, use the lowest supported rate */
+        type != IEEE80211_FC0_TYPE_DATA || !memcmp(wh->i_addr3, iwx_awdl_bssid, 6)) {
+        /* for non-data, use the lowest supported rate. AWDL peers are not the AP: its rate table does not apply. */
         ridx = min_ridx;
         *flags |= IWX_TX_FLAGS_CMD_RATE;
     } else if (ic->ic_fixed_mcs != -1) {
@@ -8265,9 +9610,39 @@ iwx_tx(struct iwx_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)
 #endif
     tid = IWX_MGMT_TID;
     qid = sc->first_data_qid;
+#ifdef AIRPORT_WCL
+    uint8_t awdlKind = ((type == IEEE80211_FC0_TYPE_MGT && subtype == IEEE80211_FC0_SUBTYPE_ACTION) ||
+                              type == IEEE80211_FC0_TYPE_DATA) &&
+        !memcmp(wh->i_addr3, iwx_awdl_bssid, 6) ? (IEEE80211_IS_MULTICAST(wh->i_addr1) ? 1 : 2) : 0;
+    if (awdlKind && sc->sc_awdl_probe.ctx.mode && sc->sc_awdl_probe.ctx.mode != 6) {
+        /* Never fall back to the AP station's queue once the context owns these frames. */
+        if (sc->sc_awdl_probe.ctx.qid <= 0) {
+            mbuf_freem(m);
+            return ENXIO;
+        }
+        qid = sc->sc_awdl_probe.ctx.qid;
+    }
+    /* Only the A-MSDU path builds QoS AWDL data. It stays on this queue, away from the AP's block ack. */
+    if (awdlKind == 2 && type == IEEE80211_FC0_TYPE_DATA && ieee80211_has_qos(wh) &&
+        (ieee80211_get_qos(wh) & IEEE80211_QOS_AMSDU))
+        awdlKind = 4;
+    if (awdlKind == 2 && type == IEEE80211_FC0_TYPE_DATA && sc->sc_awdl_probe.ctx.own_active &&
+        !memcmp(wh->i_addr1, sc->sc_awdl_probe.ctx.own_peer, 6)) {
+        qid = sc->sc_awdl_probe.ctx.own_qid;
+        awdlKind = 3;
+        ++sc->sc_awdl_probe.ctx.own_sent;
+        /* Aggregation queues take sequence numbers from their ring position, as the AP's do (IWX_AGG_SSN_TO_TXQ_IDX). */
+        if (sc->sc_awdl_probe.ctx.own_agg && ieee80211_has_qos(wh))
+            *reinterpret_cast<uint16_t *>(wh->i_seq) = htole16(uint16_t((sc->txq[qid].cur & 0xfff) << IEEE80211_SEQ_SEQ_SHIFT));
+    }
+#endif
 
     /* Put QoS frames on the data queue which maps to their TID. */
+#ifdef AIRPORT_WCL
+    if (ieee80211_has_qos(wh) && awdlKind != 4 && awdlKind != 3) {
+#else
     if (ieee80211_has_qos(wh)) {
+#endif
         struct ieee80211_tx_ba *ba;
         uint16_t qos = ieee80211_get_qos(wh);
         uint8_t tid = qos & IEEE80211_QOS_TID;
@@ -8342,6 +9717,13 @@ iwx_tx(struct iwx_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)
     cmd->hdr.idx = idx;
     
     rinfo = iwx_tx_fill_cmd(sc, in, wh, &flags, &rate_n_flags);
+#ifdef AIRPORT_WCL
+    /* The peer has firmware rate control when its queue aggregates: no fixed rate. */
+    if (awdlKind == 3 && sc->sc_awdl_probe.ctx.own_agg) {
+        flags &= ~IWX_TX_FLAGS_CMD_RATE;
+        rate_n_flags = 0;
+    }
+#endif
     
 #if NBPFILTER > 0
     if (sc->sc_drvbpf != NULL) {
@@ -8388,6 +9770,10 @@ iwx_tx(struct iwx_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)
     totlen = mbuf_pkthdr_len(m);
     
     offload_assist = itlTxOffloadHeader(hdrlen);
+#ifdef AIRPORT_WCL
+    if (awdlKind == 4)
+        offload_assist |= IWX_TX_CMD_OFFLD_AMSDU;
+#endif
     
     if (sc->sc_device_family >= IWX_DEVICE_FAMILY_AX210) {
         static_assert(sizeof(struct iwx_tx_cmd_gen3) == 28,
@@ -8432,6 +9818,15 @@ iwx_tx(struct iwx_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)
 #ifdef AIRPORT_WCL
     data->wcl_rsn_kind = rsnKind;
     data->wcl_rsn_cookie = rsnKind ? ic->ic_wcl_rsn_cookie : 0;
+    data->awdl_kind = awdlKind;
+    data->awdl_umi = 0;
+    if (awdlKind == 2 && type == IEEE80211_FC0_TYPE_MGT && sc->sc_awdl_probe.umi_seq_valid &&
+        !memcmp(wh->i_addr1, sc->sc_awdl_probe.umi_seq_peer, 6) &&
+        le16toh(*reinterpret_cast<const uint16_t *>(wh->i_seq)) == sc->sc_awdl_probe.umi_seq) {
+        data->awdl_umi = 1;
+        memcpy(data->awdl_umi_peer, wh->i_addr1, 6);
+        sc->sc_awdl_probe.umi_seq_valid = 0;
+    }
 #endif
 
     DPRINTFN(3, ("sending data: pkt tid=%d qid=%d idx=%d queued=%d len=%d nsegs=%d flags=0x%08x rate_n_flags=0x%08x offload_assist=%u\n",
@@ -10967,6 +12362,75 @@ iwx_rs_init(struct iwx_softc *sc, struct iwx_node *in, bool update)
     }
 }
 
+#ifdef AIRPORT_WCL
+/*
+ * A-MPDU parameters and firmware rate control for an AWDL peer station, as the AP station gets them
+ * (iwx_mld_sta_config_cmd, iwx_rs_init). The phone's caps are not parsed: VHT 2SS MCS 0-9, A-MPDU
+ * exponent 7 capped at 4M, 4 us spacing to be safe. Width follows the link's channel.
+ */
+int ItlIwx::
+iwx_awdl_peer_agg(struct iwx_softc *sc, uint32_t index)
+{
+    auto p = &sc->sc_awdl_probe;
+    auto c = &p->ctx;
+    struct ieee80211com *ic = &sc->sc_ic;
+    struct ieee80211_node *ni = ic->ic_bss;
+    if (!ni || index >= p->peer_added) {
+        c->own_agg_err = EINVAL;
+        return EINVAL;
+    }
+    const int generation = sc->sc_generation;
+    const bool mimo = iwx_mimo_enabled(sc);
+    struct iwx_sta_cfg_cmd sta;
+    iwx_awdl_fill_peer_sta(&sta, index, p->peer_addr[index]);
+    if (mimo)
+        sta.mimo = htole32(1);
+    uint32_t agg = 7;
+    if (agg > (IWX_STA_FLG_MAX_AGG_SIZE_4M >> IWX_STA_FLG_MAX_AGG_SIZE_SHIFT))
+        agg = IWX_STA_FLG_MAX_AGG_SIZE_4M >> IWX_STA_FLG_MAX_AGG_SIZE_SHIFT;
+    sta.tx_ampdu_max_size = htole32(agg);
+    sta.tx_ampdu_spacing = htole32(5);
+    int err = iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_STA_CONFIG_CMD, IWX_MAC_CONF_GROUP, 0), 0, sizeof(sta), &sta);
+    if (generation != sc->sc_generation)
+        return ECANCELED;
+    if (err) {
+        c->own_agg_err = uint32_t(err < 0 ? -err : err);
+        return err;
+    }
+    if (iwx_lookup_cmd_ver(sc, IWX_DATA_PATH_GROUP, IWX_TLC_MNG_CONFIG_CMD) != 4) {
+        c->own_tlc_err = 0xffff;
+        return ENOTSUP;
+    }
+    struct iwx_tlc_config_cmd_v4 tlc;
+    memset(&tlc, 0, sizeof(tlc));
+    static const uint8_t ofdm[] = {12, 18, 24, 36, 48, 72, 96, 108};
+    for (uint8_t rval : ofdm) {
+        const int idx = iwx_rs_rval2idx(rval);
+        if (idx >= 0)
+            tlc.non_ht_rates |= uint16_t(1 << idx);
+    }
+    const uint8_t width = c->phy2_chan ? IEEE80211_CHAN_WIDTH_20 : ni->ni_chw;
+    uint16_t mcs = (1 << (IWX_TLC_MNG_HT_RATE_MCS9 + 1)) - 1;
+    if (width == IEEE80211_CHAN_WIDTH_20)
+        mcs &= ~(1 << IWX_TLC_MNG_HT_RATE_MCS9);
+    tlc.mode = IWX_TLC_MNG_MODE_VHT;
+    tlc.ht_rates[IWX_TLC_NSS_1][IWX_TLC_MCS_PER_BW_80] = htole16(mcs);
+    if (mimo)
+        tlc.ht_rates[IWX_TLC_NSS_2][IWX_TLC_MCS_PER_BW_80] = htole16(mcs);
+    tlc.sta_id = uint8_t(IWX_AWDL_PEER_STA_FIRST + index);
+    tlc.max_ch_width = iwx_rs_fw_bw_from_sta_bw(width);
+    tlc.chains = iwx_rs_fw_set_active_chains(iwx_fw_valid_tx_ant(sc));
+    tlc.flags = iwx_rs_fw_get_config_flags(sc);
+    tlc.sgi_ch_width_supp = (1 << IWX_TLC_MNG_CH_WIDTH_20MHZ) | (1 << IWX_TLC_MNG_CH_WIDTH_40MHZ) | (1 << IWX_TLC_MNG_CH_WIDTH_80MHZ);
+    err = iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_TLC_MNG_CONFIG_CMD, IWX_DATA_PATH_GROUP, 0), 0, sizeof(tlc), &tlc);
+    if (generation != sc->sc_generation)
+        return ECANCELED;
+    if (err)
+        c->own_tlc_err = uint32_t(err < 0 ? -err : err);
+    return err;
+}
+#endif
+
 static uint32_t iwx_new_rate_from_v1(uint32_t rate_v1)
 {
     uint32_t rate_v2 = 0;
@@ -11420,6 +12884,14 @@ iwx_mld_mac_config_cmd(struct iwx_softc *sc, struct iwx_node *in,
         if (!assoc)
             cmd.filter_flags |= htole32(IWX_MAC_CFG_FILTER_ACCEPT_BEACON);
 #endif
+#ifdef AIRPORT_WCL
+        /* Boot-arg only, and only after association: join frames are untouched. */
+        if (assoc && (sc->sc_awdl_probe.mode == 1 || sc->sc_awdl_probe.mode == 2)) {
+            cmd.filter_flags |= htole32(IWX_MAC_CFG_FILTER_ACCEPT_CONTROL_AND_MGMT);
+            if (sc->sc_awdl_probe.mode == 2)
+                cmd.filter_flags |= htole32(IWX_MAC_CFG_FILTER_PROMISC);
+        }
+#endif
         if (in->in_ni.ni_flags & IEEE80211_NODE_HE)
             cmd.he_support = htole16(1);
         if (in->in_ni.ni_flags & IEEE80211_NODE_HE)
@@ -11857,6 +13329,11 @@ iwx_mld_deauth(struct iwx_softc *sc, struct iwx_node *in)
     int err, generation = sc->sc_generation;
 
     iwx_mld_probe(sc, IWX_MLD_STEP_DEAUTH, 0);
+#ifdef AIRPORT_WCL
+    iwx_awdl_ctx_remove(sc);
+    if (generation != sc->sc_generation)
+        return ENXIO;
+#endif
 
     if (sc->sc_flags & IWX_FLAG_MAC_ACTIVE) {
         err = iwx_cancel_session_protection(sc, in);
@@ -12088,6 +13565,11 @@ iwx_mld_run_stop(struct iwx_softc *sc, struct iwx_node *in)
     sc->sc_pcitag->setProperty("BE201HENegotiated", false);
 
     iwx_mld_probe(sc, IWX_MLD_STEP_RUN_STOP, 0);
+#ifdef AIRPORT_WCL
+    iwx_awdl_ctx_remove(sc);
+    if (generation != sc->sc_generation)
+        return ENXIO;
+#endif
 
     sc->sc_flags |= IWX_FLAG_TXFLUSH;
     err = iwx_flush_sta_tids(sc, IWX_STATION_ID, 0xffff);
@@ -13435,6 +14917,9 @@ iwx_stop(struct _ifnet *ifp)
     iwx_del_task(sc, systq, &sc->ba_task);
 #ifdef AIRPORT_WCL
     iwx_del_task(sc, systq, &sc->mld_authorized_task);
+    iwx_del_task(sc, systq, &sc->awdl_native_task);
+    iwx_del_task(sc, systq, &sc->awdl_peer_task);
+    iwx_del_task(sc, systq, &sc->awdl_umi_task);
     sc->sc_mld_authorized_epoch = sc->sc_mld_authorized_done_epoch = 0;
 #endif
     iwx_del_task(sc, systq, &sc->mac_ctxt_task);
@@ -13478,6 +14963,19 @@ iwx_stop(struct _ifnet *ifp)
     bzero(sc->sc_mld_context_addr, sizeof(sc->sc_mld_context_addr));
 #ifdef AIRPORT_WCL
     ic->ic_wcl_teardown_pending = false;
+    /* The firmware holding the AWDL context is gone; its ring is freed with the others. */
+    sc->sc_awdl_probe.ctx.stage = IWX_AWDL_CTX_NONE;
+    sc->sc_awdl_probe.ctx.qid = -1;
+    sc->sc_awdl_probe.peer_added = sc->sc_awdl_probe.peer_count = 0;
+    sc->sc_awdl_probe.cache_add_wait = sc->sc_awdl_probe.cache_del_wait = 0;
+    sc->sc_awdl_probe.ctx.own_qid = -1;
+    sc->sc_awdl_probe.ctx.own_active = sc->sc_awdl_probe.ctx.own_held = 0;
+    sc->sc_awdl_probe.ctx.phy2_chan = sc->sc_awdl_probe.ctx.phy2_want = 0;
+    sc->sc_awdl_probe.ba_pending_valid = 0;
+    memset(sc->sc_awdl_probe.ba, 0, sizeof(sc->sc_awdl_probe.ba));
+    sc->sc_awdl_probe.tx.data_stalled = 0;
+    if (sc->sc_awdl_native_requested)
+        sc->sc_pcitag->setProperty("ItlwmAwdlNativeMonitorReady", false);
 #endif
 
     sc->sc_rx_ba_sessions = 0;
@@ -13514,7 +15012,33 @@ iwx_watchdog(struct _ifnet *ifp)
     
     ifp->if_timer = 0;
     if (sc->sc_tx_timer > 0) {
-        if (--sc->sc_tx_timer == 0) {
+#ifdef AIRPORT_WCL
+        /* AWDL frames the firmware holds must not restart the AP connection. */
+        if (sc->sc_tx_timer == 1 && sc->sc_awdl_probe.ctx.own_qid > 0 &&
+            sc->txq[sc->sc_awdl_probe.ctx.own_qid].queued) {
+            bool others = false;
+            for (int i = 0; i < IWX_MAX_QUEUES; i++)
+                others |= i != sc->sc_awdl_probe.ctx.own_qid && sc->txq[i].queued;
+            sc->sc_awdl_probe.ctx.own_active = 0;
+            sc->sc_awdl_probe.ctx.own_held = 1;
+            if (!others)
+                sc->sc_tx_timer = 0;
+        }
+        if (sc->sc_tx_timer == 1 && sc->sc_awdl_probe.ctx.qid > 0 &&
+            sc->txq[sc->sc_awdl_probe.ctx.qid].queued) {
+            bool others = false;
+            for (int i = 0; i < IWX_MAX_QUEUES; i++)
+                others |= i != sc->sc_awdl_probe.ctx.qid && sc->txq[i].queued;
+            if (!others) {
+                ++sc->sc_awdl_probe.tx.stalls;
+                sc->sc_awdl_probe.tx.tripped = 1;
+                sc->sc_pcitag->setProperty("ItlwmAwdlTxStalls", sc->sc_awdl_probe.tx.stalls, 32);
+                sc->sc_pcitag->setProperty("ItlwmAwdlTxTripped", sc->sc_awdl_probe.tx.tripped, 32);
+                sc->sc_tx_timer = 0;
+            }
+        }
+#endif
+        if (sc->sc_tx_timer > 0 && --sc->sc_tx_timer == 0) {
             XYLog("%s: device timeout\n", DEVNAME(sc));
 #ifdef IWX_DEBUG
             int i;
@@ -13908,6 +15432,15 @@ iwx_nic_lmac_error(struct iwx_softc *sc)
 void ItlIwx::
 iwx_nic_error(struct iwx_softc *sc)
 {
+#ifdef AIRPORT_WCL
+    /* One firmware fault ends this boot's AWDL test; recovery must not re-enter it. */
+    if ((sc->sc_awdl_probe.tx.mode || sc->sc_awdl_probe.ctx.mode) && !sc->sc_awdl_probe.tx.tripped &&
+        (sc->sc_awdl_probe.tx.mcast_sent || sc->sc_awdl_probe.tx.unicast_sent || sc->sc_awdl_probe.ctx.adds)) {
+        sc->sc_awdl_probe.tx.tripped = 1;
+        ++sc->sc_awdl_probe.tx.firmware_faults;
+        sc->sc_pcitag->setProperty("ItlwmAwdlTxTripped", sc->sc_awdl_probe.tx.tripped, 32);
+    }
+#endif
     ++sc->sc_fw_errors;
     sc->sc_pcitag->setProperty("ItlwmFwErrors", sc->sc_fw_errors, 32);
     iwx_nic_lmac_error(sc);
@@ -14357,6 +15890,18 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data,
             case IWX_WIDE_ID(IWX_MAC_CONF_GROUP, IWX_SESSION_PROTECTION_NOTIF): {
                 struct iwx_session_prot_notif *notif;
                 SYNC_RESP_STRUCT(notif, pkt, struct iwx_session_prot_notif *);
+#ifdef AIRPORT_WCL
+                /* Its window says nothing about the AP link's association state. */
+                if (sc->sc_awdl_probe.ctx.mode >= 5 && le32toh(notif->mac_id) == IWX_AWDL_LINK_ID) {
+                    if (!notif->status)
+                        ++sc->sc_awdl_probe.ctx.te_failed;
+                    else if (notif->start)
+                        ++sc->sc_awdl_probe.ctx.te_started;
+                    else
+                        ++sc->sc_awdl_probe.ctx.te_ended;
+                    break;
+                }
+#endif
                 ++sc->sc_sess_prot_notif;
                 sc->sc_pcitag->setProperty("ItlwmSessProtNotifs",
                     sc->sc_sess_prot_notif, 32);
@@ -16207,6 +17752,38 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
     sc->sc_pcitag = pa->pa_tag;
     sc->sc_dmat = pa->pa_dmat;
     sc->sc_tlc_trace_enabled = ItlDiagnosticFlag("be201_tlc_diag");
+#ifdef AIRPORT_WCL
+    {
+        uint32_t awdlProbe = 0;
+        PE_parse_boot_argn("be201_awdl_probe", &awdlProbe, sizeof(awdlProbe));
+        memset(&sc->sc_awdl_probe, 0, sizeof(sc->sc_awdl_probe));
+        sc->sc_awdl_native_requested = false;
+        sc->sc_awdl_probe.mode = awdlProbe <= 2 ? awdlProbe : 0;
+        sc->sc_pcitag->setProperty("ItlwmAwdlProbeMode", sc->sc_awdl_probe.mode, 32);
+        /* Its own context replaces the wider station filter, never adds to it. */
+        uint32_t awdlCtx = 0;
+        PE_parse_boot_argn("be201_awdl_ctx", &awdlCtx, sizeof(awdlCtx));
+        sc->sc_awdl_probe.ctx.qid = -1;
+        sc->sc_awdl_probe.ctx.own_qid = -1;
+        if (awdlCtx >= 2 && awdlCtx <= 6) {
+            sc->sc_awdl_probe.ctx.mode = awdlCtx;
+            sc->sc_awdl_probe.mode = 3;
+            sc->sc_pcitag->setProperty("ItlwmAwdlProbeMode", sc->sc_awdl_probe.mode, 32);
+        }
+        sc->sc_pcitag->setProperty("ItlwmAwdlCtxMode", sc->sc_awdl_probe.ctx.mode, 32);
+        /* Transmit follows what the probe hears, so it needs the probe. */
+        uint32_t awdlTx = 0;
+        PE_parse_boot_argn("be201_awdl_tx", &awdlTx, sizeof(awdlTx));
+        sc->sc_awdl_probe.tx.mode = awdlTx == 1 && sc->sc_awdl_probe.mode ? 1 : 0;
+        sc->sc_pcitag->setProperty("ItlwmAwdlTxMode", sc->sc_awdl_probe.tx.mode, 32);
+        if (sc->sc_awdl_probe.tx.mode || sc->sc_awdl_probe.ctx.mode) {
+            read_random(sc->sc_awdl_probe.tx.self, sizeof(sc->sc_awdl_probe.tx.self));
+            sc->sc_awdl_probe.tx.self[0] = (sc->sc_awdl_probe.tx.self[0] & 0xfe) | 0x02;
+            sc->sc_pcitag->setProperty("ItlwmAwdlTxAddr", sc->sc_awdl_probe.tx.self,
+                sizeof(sc->sc_awdl_probe.tx.self));
+        }
+    }
+#endif
     memset(&sc->sc_tlc_trace, 0, sizeof(sc->sc_tlc_trace));
 #ifdef AIRPORT_WCL
     ic->ic_wcl_teardown_pending = false;
@@ -16634,6 +18211,12 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
     sc->sc_mld_authorized_epoch = sc->sc_mld_authorized_done_epoch = 0;
     sc->sc_mld_authorized_updates = 0;
     task_set(&sc->mld_authorized_task, iwx_mld_authorized_task, sc, "iwx_mld_authorized_task");
+    task_set(&sc->awdl_native_task, iwx_awdl_native_task, sc, "iwx_awdl_native_task");
+    task_set(&sc->awdl_peer_task, iwx_awdl_peer_task, sc, "iwx_awdl_peer_task");
+    task_set(&sc->awdl_umi_task, iwx_awdl_umi_task, sc, "iwx_awdl_umi_task");
+    task_set(&sc->awdl_ba_task, iwx_awdl_ba_task, sc, "iwx_awdl_ba_task");
+    task_set(&sc->awdl_ownq_task, iwx_awdl_ownq_task, sc, "iwx_awdl_ownq_task");
+    task_set(&sc->awdl_phy2_task, iwx_awdl_phy2_task, sc, "iwx_awdl_phy2_task");
     ic->ic_wcl_port_authorized = iwx_wcl_port_authorized;
 #endif
     task_set(&sc->mac_ctxt_task, iwx_mac_ctxt_task, sc, "iwx_mac_ctxt_task");

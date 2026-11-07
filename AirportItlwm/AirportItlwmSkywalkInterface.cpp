@@ -42,6 +42,29 @@ IOReturn AirportItlwmSkywalkInterface::unsupportedContinuityRequest(unsigned id)
     return kIOReturnUnsupported;
 }
 
+/*
+ * be201_awdl_if=1 lets wifip2pd reach this request; no interface exists yet, so it still
+ * fails. Records what the system asks for: only the random address and small numbers.
+ */
+IOReturn AirportItlwmSkywalkInterface::setVIRTUAL_IF_CREATE(apple80211_virt_if_create_data *data)
+{
+#ifdef AIRPORT_WCL
+    static uint32_t requests;
+    if (data && instance && (ItlDiagnosticFlag("be201_awdl_if") || ItlDiagnosticFlag("be201_awdl_vif"))) {
+        char name[IFNAMSIZ + 1] = {};
+        memcpy(name, data->bsd_name, IFNAMSIZ);
+        instance->setProperty("ItlwmAwdlIfCreateRequests", ++requests, 32);
+        instance->setProperty("ItlwmAwdlIfCreateVersion", data->version, 32);
+        instance->setProperty("ItlwmAwdlIfCreateRole", data->role, 32);
+        instance->setProperty("ItlwmAwdlIfCreateAddr", data->mac, APPLE80211_ADDR_LEN);
+        instance->setProperty("ItlwmAwdlIfCreateName", name);
+        if (ItlDiagnosticFlag("be201_awdl_vif"))
+            return instance->createAWDLInterface(data);
+    }
+#endif
+    return kIOReturnUnsupported;
+}
+
 const char* hexdump(uint8_t *buf, size_t len) {
     ssize_t str_len = len * 3 + 1;
     char *str = (char*)IOMalloc(str_len);
@@ -565,6 +588,31 @@ getMCS_VHT(struct apple80211_mcs_vht_data *data)
             data->bw = 20;
             break;
     }
+    return kIOReturnSuccess;
+}
+
+// The AWDL manager asks the infrastructure interface for these elements and advertises them to peers:
+// "Invalid _htCapabilityLength, skipping buildEnhDataRateTlv" otherwise, and a phone then sends this Mac
+// no unicast. Two streams, no A-MPDU promise. Only once armed: normal boots answer as they always did.
+IOReturn AirportItlwmSkywalkInterface::
+getHT_CAPABILITY(apple80211_ht_capability *data)
+{
+    static const uint8_t element[28] = {45, 26, 0x6f, 0x01, 0x00, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01};
+    if (!data || !AirportItlwm::awdlVifCapabilityArmed())
+        return kIOReturnUnsupported;
+    data->version = APPLE80211_VERSION;
+    memcpy(reinterpret_cast<uint8_t *>(data) + 4, element, sizeof(element));
+    return kIOReturnSuccess;
+}
+
+IOReturn AirportItlwmSkywalkInterface::
+getVHT_CAPABILITY(apple80211_vht_capability *data)
+{
+    static const uint8_t element[14] = {191, 12, 0x30, 0x01, 0, 0, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0};
+    if (!data || !AirportItlwm::awdlVifCapabilityArmed())
+        return kIOReturnUnsupported;
+    data->version = APPLE80211_VERSION;
+    memcpy(reinterpret_cast<uint8_t *>(data) + 4, element, sizeof(element));
     return kIOReturnSuccess;
 }
 
