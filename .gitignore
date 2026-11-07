@@ -1,0 +1,31 @@
+.DS_Store
+
+# Deployable kits: kexts, EFI backups, configs with machine identity, runtime logs
+/outputs/
+
+# Third-party trees and build output (rebuildable)
+/work/airportbz-deps/
+/work/*-reference/
+/work/*-build/
+/work/*.log
+
+# Other work folders: keep source, scripts and notes only.
+# Logs, captures, plists, json dumps and object files stay local (device data).
+/work/*/**
+!/work/*/**/
+!/work/*/**/*.c
+!/work/*/**/*.cpp
+!/work/*/**/*.h
+!/work/*/**/*.hpp
+!/work/*/**/*.m
+!/work/*/**/*.py
+!/work/*/**/*.sh
+!/work/*/**/*.command
+!/work/*/**/*.md
+!/work/*/**/*.yml
+
+# The driver keeps its own rules in work/airportbz/.gitignore
+!/work/airportbz/**
+
+# Vendored third-party Python packages
+/work/awdl/python-deps/
