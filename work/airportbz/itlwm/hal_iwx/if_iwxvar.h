@@ -350,6 +350,7 @@ struct iwx_tx_data {
     uint32_t wcl_rsn_kind, wcl_rsn_cookie;
     uint8_t awdl_kind; /* 0 other, 1 multicast, 2 unicast AWDL frame, 3 unicast on the peer's own queue, 4 A-MSDU. */
     uint8_t awdl_umi; /* The family waits for this frame's ACK result. */
+    uint8_t awdl_phy2q; /* Sent on the AWDL station's queue on link 1 while it sits on the second channel. */
     uint8_t awdl_umi_peer[6];
 #endif
 };
@@ -712,6 +713,7 @@ struct iwx_softc {
     struct task        awdl_ba_task;
     struct task        awdl_ownq_task;
     struct task        awdl_phy2_task;
+    struct task        awdl_solo_task;
     struct task        awdl_umi_task;
     bool sc_awdl_native_requested;
     struct iwx_awdl_probe sc_awdl_probe;

@@ -5092,8 +5092,10 @@ IOReturn ItlIwx::iwx_awdl_data_gate(struct iwx_softc *sc, const uint8_t *eth)
     auto p = &sc->sc_awdl_probe;
     struct ieee80211com *ic = &sc->sc_ic;
     struct ieee80211_node *ni = ic->ic_bss;
+    /* On its own (1.1.66) there is no AP port or AP queue to wait for: the AWDL station's queue is the one. */
+    const bool solo = p->ctx.solo && p->ctx.phy2_qid > 0;
     if (!sc->sc_awdl_native_requested || p->ctx.stage < IWX_AWDL_CTX_ACTIVE || p->tx.tripped || !ni ||
-        !ni->ni_port_valid || !(sc->sc_flags & IWX_FLAG_MLD_TXQ_ACTIVE) ||
+        (!solo && (!ni->ni_port_valid || !(sc->sc_flags & IWX_FLAG_MLD_TXQ_ACTIVE))) ||
         (sc->sc_flags & (IWX_FLAG_SHUTDOWN | IWX_FLAG_HW_ERR)))
         return kIOReturnNotReady;
     if (p->tx.hold) {
@@ -5107,7 +5109,7 @@ IOReturn ItlIwx::iwx_awdl_data_gate(struct iwx_softc *sc, const uint8_t *eth)
         }
     }
     /* Room comes back with a completion: the caller keeps the packet and waits, TCP sees no loss. */
-    const int dataQid = p->ctx.own_active ? p->ctx.own_qid : sc->first_data_qid;
+    const int dataQid = p->ctx.own_active ? p->ctx.own_qid : (solo ? p->ctx.phy2_qid : sc->first_data_qid);
     if ((sc->sc_flags & IWX_FLAG_TXFLUSH) || !sc->qfullmsk.empty() ||
         sc->txq[dataQid].queued >= IWX_AWDL_DATA_MAX_QUEUED) {
         ++p->tx.busy;
@@ -5208,7 +5210,45 @@ IOReturn ItlIwx::sendAwdlAmsdu(const uint8_t *const *eths, const size_t *lengths
     return queued;
 }
 
-/* Test switches, from the AW timer under the gate. */
+/* No association, none starting: the AWDL context may run on its own. */
+static bool iwx_awdl_solo_idle(struct iwx_softc *sc)
+{
+    struct ieee80211com *ic = &sc->sc_ic;
+    return (ic->ic_state == IEEE80211_S_INIT || ic->ic_state == IEEE80211_S_SCAN) && sc->ns_nstate == ic->ic_state &&
+        !ic->ic_wcl_teardown_pending && !(sc->sc_flags & (IWX_FLAG_SHUTDOWN | IWX_FLAG_HW_ERR | IWX_FLAG_STA_ACTIVE));
+}
+
+/* This Mac's own schedule at each slot start, from the AW timer under the gate, just before the radio switches. */
+void ItlIwx::setAwdlSlot(uint32_t chan, uint32_t run, uint32_t seq5)
+{
+    auto c = &com.sc_awdl_probe.ctx;
+    if (!getMainWorkLoop()->inGate())
+        return;
+    uint64_t now = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+    c->slot_chan = uint8_t(chan <= 255 ? chan : 0);
+    /* run: the run length in the low byte, the next 5 GHz channel above it. */
+    c->slot_run = uint8_t((run & 0xff) <= 16 ? (run & 0xff) : 16);
+    c->slot_next5 = uint8_t((run >> 8) & 0xff);
+    c->seq_chan5 = uint16_t(seq5 & 0xffff);
+    c->slot_us = now / 1000;
+    /* Idle long enough with no infrastructure network: start the context on its own (1.1.66). */
+    {
+        auto sc = &com;
+        const uint64_t now_us = now / 1000;
+        if (!iwx_awdl_solo_idle(sc) || c->stage != IWX_AWDL_CTX_NONE)
+            c->solo_try_us = now_us;
+        else if (iwx_use_mld_api(sc) && sc->sc_awdl_native_requested && c->mode == 6 && !c->solo_failed &&
+                 !sc->sc_awdl_probe.tx.tripped && now_us - c->solo_try_us >= IWX_AWDL_SOLO_IDLE_US) {
+            c->solo_try_us = now_us;
+            iwx_add_task(sc, systq, &sc->awdl_solo_task);
+        }
+    }
+    /* Counters from the tick too: without peers nothing is received, and they went stale for whole test phases. */
+    iwx_awdl_probe_publish(&com);
+}
+
+/* Test switches, from the AW timer under the gate. phy2 1 is automatic: the own sequence's 5 GHz channel. */
 void ItlIwx::setAwdlRadioTest(bool hold, uint32_t phy2, uint32_t te, bool amsdu)
 {
     auto sc = &com;
@@ -5216,13 +5256,58 @@ void ItlIwx::setAwdlRadioTest(bool hold, uint32_t phy2, uint32_t te, bool amsdu)
     auto c = &p->ctx;
     if (!getMainWorkLoop()->inGate())
         return;
+    uint64_t now = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+    const uint64_t now_us = now / 1000;
+    /* te carries the protection kind above the mode (1.1.62); the kind changes only between windows. */
+    const uint32_t conf = (te >> 8) & 0xff;
+    te &= 0xff;
+    /* On its own the link already sits on the AWDL channel: no second channel tests, no moves. */
+    if (c->solo) {
+        p->tx.hold = hold;
+        p->tx.amsdu = amsdu;
+        return;
+    }
+    if (now_us >= c->te_end_us && conf < IWX_SESSION_PROTECT_CONF_MAX_ID)
+        c->te_conf = uint8_t(conf);
+    /*
+     * Second channel switched off: a fresh own queue on the AP's channel. A held queue and a spent rebuild budget from
+     * a second channel test cost the rest of the boot its speed (1.1.61, OwnRecoverFails 4 after mode 5).
+     */
+    if (!phy2 && !te && (c->phy2_want || c->te_want) && (c->own_held || c->own_recover_fails)) {
+        c->own_recover_fails = 0;
+        c->own_held = 0;
+        c->own_redo = 1;
+        c->own_active = 0;
+    }
+    if (phy2 == 1) {
+        auto ic = &sc->sc_ic;
+        const uint8_t home = ic->ic_state == IEEE80211_S_RUN && ic->ic_bss && ic->ic_bss->ni_chan ?
+            uint8_t(ieee80211_chan2ieee(ic, ic->ic_bss->ni_chan)) : 0;
+        const uint8_t cand = home ? iwx_awdl_phy2_auto(c->seq_chan5, home) : 0;
+        if (cand != c->auto_cand) {
+            c->auto_cand = cand;
+            c->auto_since_us = now_us;
+        }
+        if (iwx_awdl_te_follows(te)) {
+            /* Modes 4 to 6: the link follows this Mac's own sequence, a slot ahead; twice a cycle on a router. */
+            phy2 = iwx_awdl_phy2_follow(cand, c->slot_next5);
+            if (phy2 != c->phy2_want)
+                ++c->phy2_slot_moves;
+        } else {
+            /* A choice that flips with every new sequence would move the link, and flush its queues, each time. */
+            phy2 = now_us - c->auto_since_us >= IWX_AWDL_PHY2_AUTO_STABLE_US ? c->auto_cand : c->phy2_want;
+            if (phy2 != c->phy2_want)
+                ++c->phy2_auto_changes;
+        }
+    }
     p->tx.hold = hold;
     p->tx.amsdu = amsdu;
     const bool ready = c->phy2_chan && c->stage == IWX_AWDL_CTX_ASSOC && !p->tx.tripped;
     /* A window left running when windows go off is what the firmware asserted on in the 06:29 test. */
     if (c->te_want && !te && ready) {
         struct iwx_session_prot_cmd cmd;
-        iwx_awdl_fill_te(&cmd, IWX_FW_CTXT_ACTION_REMOVE, 0);
+        iwx_awdl_fill_te(&cmd, IWX_FW_CTXT_ACTION_REMOVE, 0, c->te_conf);
         if (!iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_SESSION_PROTECTION_CMD, IWX_MAC_CONF_GROUP, 0), IWX_CMD_ASYNC, sizeof(cmd), &cmd))
             ++c->te_removed;
     }
@@ -5231,18 +5316,24 @@ void ItlIwx::setAwdlRadioTest(bool hold, uint32_t phy2, uint32_t te, bool amsdu)
         c->phy2_want = phy2;
         iwx_add_task(sc, systq, &sc->awdl_phy2_task);
     }
-    if (!te || !ready || c->phy2_want != c->phy2_chan)
+    if (!iwx_awdl_te_windows(te) || !ready || c->phy2_want != c->phy2_chan)
         return;
-    uint64_t now = 0;
-    absolutetime_to_nanoseconds(mach_absolute_time(), &now);
-    const uint32_t duration = iwx_awdl_te_due(p, te, c->phy2_chan, now / 1000, c->last_te_us);
+    const uint32_t duration = te == 3 || iwx_awdl_te_follows(te) ?
+        iwx_awdl_te_own_due(c->slot_chan, c->slot_run, c->phy2_chan, c->slot_us, now_us, c->te_end_us) :
+        iwx_awdl_te_due(p, te, c->phy2_chan, now_us, c->last_te_us);
     if (!duration)
         return;
-    c->last_te_us = now / 1000;
+    c->last_te_us = now_us;
+    c->te_end_us = now_us + uint64_t(duration) * IWX_AWDL_TU_US;
+    /* One window per reported slot start. */
+    c->slot_run = 0;
     struct iwx_session_prot_cmd cmd;
-    iwx_awdl_fill_te(&cmd, IWX_FW_CTXT_ACTION_ADD, duration);
-    if (!iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_SESSION_PROTECTION_CMD, IWX_MAC_CONF_GROUP, 0), IWX_CMD_ASYNC, sizeof(cmd), &cmd))
+    iwx_awdl_fill_te(&cmd, IWX_FW_CTXT_ACTION_ADD, duration, c->te_conf);
+    if (!iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_SESSION_PROTECTION_CMD, IWX_MAC_CONF_GROUP, 0), IWX_CMD_ASYNC, sizeof(cmd), &cmd)) {
         ++c->te_requests;
+        if (te == 3 || iwx_awdl_te_follows(te))
+            ++c->te_own;
+    }
 }
 
 /* Linux moves a link between PHY contexts the same way: inactive, new context, active. */
@@ -5285,12 +5376,25 @@ void ItlIwx::iwx_awdl_phy2_task(void *arg)
      */
     if (c->phy2_chan) {
         struct iwx_session_prot_cmd cmd;
-        iwx_awdl_fill_te(&cmd, IWX_FW_CTXT_ACTION_REMOVE, 0);
+        iwx_awdl_fill_te(&cmd, IWX_FW_CTXT_ACTION_REMOVE, 0, c->te_conf);
         err = that->iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_SESSION_PROTECTION_CMD, IWX_MAC_CONF_GROUP, 0), 0, sizeof(cmd), &cmd);
         if (generation != sc->sc_generation)
             return;
         ++c->te_removed;
-        if (c->own_qid > 0) {
+        if (c->own_qid > 0 && iwx_awdl_te_keeps_own(c->te_want) && c->own_active) {
+            /*
+             * Mode 5: keep the queue across the move and drop only what waits in it. Mode 4 released it at every
+             * move, twice a second, and the 1 s retry never caught up: 55 sent, 8 done, data fell back to the AP's
+             * queue on the AP's channel (2026-11-08 18:2x). Whether a live queue is what asserted at LINK_CONFIG
+             * in the 06:29 test (a window was running too) is what this mode finds out.
+             */
+            sc->sc_flags |= IWX_FLAG_TXFLUSH;
+            err = that->iwx_flush_sta_tids(sc, c->own_sta, 0xffff) ?: err;
+            if (generation != sc->sc_generation)
+                return;
+            sc->sc_flags &= ~IWX_FLAG_TXFLUSH;
+            ++c->own_kept_moves;
+        } else if (c->own_qid > 0) {
             err = that->iwx_awdl_own_release(sc) ?: err;
             if (generation != sc->sc_generation)
                 return;
@@ -5326,8 +5430,40 @@ void ItlIwx::iwx_awdl_phy2_task(void *arg)
         c->phy2_err = uint32_t(err < 0 ? -err : err);
         p->tx.tripped = 1;
         sc->sc_pcitag->setProperty("ItlwmAwdlTxTripped", p->tx.tripped, 32);
-    } else
+    } else {
         ++c->phy2_switches;
+        /*
+         * Mode 5: the kept queue's station gets its A-MPDU fields and rate control again for the link's new PHY, as
+         * Linux re-inits rate control after a channel context change. On the second channel no own-queue frame ever
+         * completed (1.1.60 mode 3, 1.1.61 mode 5), while the same queue on the AP's PHY did.
+         */
+        if (iwx_awdl_te_keeps_own(c->te_want) && c->own_qid > 0 && c->own_agg) {
+            const int index = iwx_awdl_peer_index(p, c->own_peer);
+            if (index >= 0) {
+                const int e = that->iwx_awdl_peer_agg(sc, uint32_t(index));
+                if (generation != sc->sc_generation)
+                    return;
+                if (e)
+                    c->own_refresh_err = uint32_t(e < 0 ? -e : e);
+                else
+                    ++c->own_refreshes;
+            }
+        }
+        /* Mode 6: once on the second channel, a queue on the AWDL station of link 1, kept until the context goes. */
+        if (iwx_awdl_te_phy2q(c->te_want) && c->phy2_chan && c->phy2_qid <= 0 && !c->phy2_q_err && c->mode == 6 &&
+            c->stage == IWX_AWDL_CTX_ASSOC) {
+            if (that->iwx_nic_lock(sc)) {
+                const int q = that->iwx_tvqm_enable_txq(sc, IWX_MGMT_TID, 0, IWX_DEFAULT_QUEUE_SIZE, IWX_AWDL_STA_ID);
+                that->iwx_nic_unlock(sc);
+                if (generation != sc->sc_generation)
+                    return;
+                if (q > 0)
+                    c->phy2_qid = q;
+                else
+                    c->phy2_q_err = uint32_t(q < 0 ? -q : 1);
+            }
+        }
+    }
 }
 
 /* The AW timer's fallback and the test switch both arrive here, under the gate. */
@@ -5338,9 +5474,23 @@ void ItlIwx::setAwdlOwnQueue(bool on, bool agg, uint32_t fix)
     auto c = &p->ctx;
     if (!getMainWorkLoop()->inGate())
         return;
-    /* Move when data now goes to another station, or the aggregation switch changed. */
-    const bool moved = on && c->own_active && p->tx.last_dest_valid && memcmp(p->tx.last_dest, c->own_peer, 6) &&
+    uint64_t now = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+    const uint64_t now_us = now / 1000;
+    if (c->own_sent != c->own_sent_mark) {
+        c->own_sent_mark = c->own_sent;
+        c->own_busy_us = now_us;
+    }
+    /*
+     * Move when data now goes to another station, or the aggregation switch changed. Only once the current peer has
+     * gone quiet: a move flushes that peer's frames, and with an iPad and an iPhone both active the last destination
+     * alternates from one 64 ms tick to the next.
+     */
+    const bool elsewhere = on && c->own_active && p->tx.last_dest_valid && memcmp(p->tx.last_dest, c->own_peer, 6) &&
         iwx_awdl_peer_index(p, p->tx.last_dest) >= 0;
+    const bool moved = elsewhere && now_us - c->own_busy_us >= IWX_AWDL_OWN_QUIET_US;
+    if (elsewhere && !moved)
+        ++c->own_quiet_skips;
     const bool aggChanged = on && !!c->own_agg_want != agg;
     const bool fixChanged = on && c->own_fix_want != uint8_t(fix & 3);
     c->own_agg_want = agg;
@@ -5349,6 +5499,48 @@ void ItlIwx::setAwdlOwnQueue(bool on, bool agg, uint32_t fix)
     if (aggChanged || fixChanged) {
         c->own_held = 0;
         c->own_redo = 1;
+        c->own_recover_fails = 0;
+    }
+    /*
+     * Held, now that the queue is on by default: on 2026-11-07 the aggregated queue finished 463693 of 463726 frames and
+     * then counted as held for the rest of the boot, so a second AirDrop would have gone back to 4.6 MB/s. Free the
+     * stuck frames and rebuild after a pause, for as long as rebuilds still get frames through.
+     */
+    if (!c->own_held)
+        c->own_held_us = 0;
+    else if (on && c->own_recover_fails < IWX_AWDL_OWN_RECOVER_MAX) {
+        if (!c->own_held_us)
+            c->own_held_us = now_us;
+        else if (now_us - c->own_held_us >= IWX_AWDL_OWN_RECOVER_US) {
+            if (c->own_recovers && c->own_ok == c->own_recover_ok_mark)
+                ++c->own_recover_fails;
+            else
+                c->own_recover_fails = 0;
+            c->own_held_us = now_us;
+            if (c->own_recover_fails < IWX_AWDL_OWN_RECOVER_MAX) {
+                c->own_recover_ok_mark = c->own_ok;
+                ++c->own_recovers;
+                c->own_held = 0;
+                c->own_held_us = 0;
+                c->own_redo = 1;
+                c->own_want = on;
+                c->own_active = 0;
+                iwx_add_task(sc, systq, &sc->awdl_ownq_task);
+                return;
+            }
+        }
+    }
+    /*
+     * A queue wanted but never made. On by default (1.1.55) the switch is set at load, the first task finds no peer
+     * and returns, and nothing changed afterwards to queue it again: OwnSent and OwnFixDone stayed 0 all boot and
+     * AirDrop ran at the old speed. Try again once a second while the context and a peer are there. A failed queue
+     * allocation (OwnErr) is not retried.
+     */
+    if (on && c->own_want && !c->own_active && !c->own_held && !c->own_err && c->stage == IWX_AWDL_CTX_ASSOC &&
+        p->peer_added && !p->tx.tripped && now_us - c->own_try_us >= IWX_AWDL_OWN_RETRY_US) {
+        c->own_try_us = now_us;
+        ++c->own_retries;
+        iwx_add_task(sc, systq, &sc->awdl_ownq_task);
     }
     if (!!c->own_want == on && !moved && !aggChanged && !fixChanged)
         return;
@@ -5795,6 +5987,37 @@ iwx_awdl_probe_publish(struct iwx_softc *sc)
         nub->setProperty("ItlwmAwdlOwnTid", c->own_tid, 32);
         nub->setProperty("ItlwmAwdlOwnAgg", c->own_agg, 32);
         nub->setProperty("ItlwmAwdlOwnRetargets", c->own_retargets, 32);
+        nub->setProperty("ItlwmAwdlOwnRecovers", c->own_recovers, 32);
+        nub->setProperty("ItlwmAwdlOwnRetries", c->own_retries, 32);
+        nub->setProperty("ItlwmAwdlOwnRecoverFails", c->own_recover_fails, 32);
+        nub->setProperty("ItlwmAwdlOwnQuietSkips", c->own_quiet_skips, 32);
+        nub->setProperty("ItlwmAwdlCtxTeOwn", c->te_own, 32);
+        nub->setProperty("ItlwmAwdlSeqChan5", c->seq_chan5, 32);
+        nub->setProperty("ItlwmAwdlPhy2Auto", c->auto_cand, 32);
+        nub->setProperty("ItlwmAwdlPhy2AutoChanges", c->phy2_auto_changes, 32);
+        nub->setProperty("ItlwmAwdlPhy2SlotMoves", c->phy2_slot_moves, 32);
+        nub->setProperty("ItlwmAwdlOwnKeptMoves", c->own_kept_moves, 32);
+        nub->setProperty("ItlwmAwdlOwnRefreshes", c->own_refreshes, 32);
+        nub->setProperty("ItlwmAwdlOwnRefreshErr", c->own_refresh_err, 32);
+        nub->setProperty("ItlwmAwdlTeConf", c->te_conf, 32);
+        nub->setProperty("ItlwmAwdlOwnSentPhy2", c->own_sent_phy2, 32);
+        nub->setProperty("ItlwmAwdlOwnDonePhy2", c->own_done_phy2, 32);
+        nub->setProperty("ItlwmAwdlOwnFailPhy2", c->own_fail_phy2, 32);
+        nub->setProperty("ItlwmAwdlOwnLastStatusPhy2", c->own_last_status_phy2, 32);
+        nub->setProperty("ItlwmAwdlOwnBaPhy2", c->own_ba_phy2, 32);
+        nub->setProperty("ItlwmAwdlPhy2Qid", static_cast<uint32_t>(c->phy2_qid > 0 ? c->phy2_qid : 0), 32);
+        nub->setProperty("ItlwmAwdlPhy2QSent", c->phy2_q_sent, 32);
+        nub->setProperty("ItlwmAwdlPhy2QDone", c->phy2_q_done, 32);
+        nub->setProperty("ItlwmAwdlPhy2QFail", c->phy2_q_fail, 32);
+        nub->setProperty("ItlwmAwdlPhy2QDrop", c->phy2_q_drop, 32);
+        nub->setProperty("ItlwmAwdlPhy2QErr", c->phy2_q_err, 32);
+        nub->setProperty("ItlwmAwdlSolo", c->solo, 32);
+        nub->setProperty("ItlwmAwdlSoloAdds", c->solo_adds, 32);
+        nub->setProperty("ItlwmAwdlSoloRemoves", c->solo_removes, 32);
+        nub->setProperty("ItlwmAwdlSoloFailed", c->solo_failed, 32);
+        nub->setProperty("ItlwmAwdlSoloErr", c->solo_err, 32);
+        nub->setProperty("ItlwmAwdlSoloErrStage", c->solo_err_stage, 32);
+        nub->setProperty("ItlwmAwdlSlotNext5", c->slot_next5, 32);
         nub->setProperty("ItlwmAwdlOwnAggErr", c->own_agg_err, 32);
         nub->setProperty("ItlwmAwdlOwnTlcErr", c->own_tlc_err, 32);
         nub->setProperty("ItlwmAwdlOwnTxEnErr", c->own_txen_err, 32);
@@ -5843,9 +6066,32 @@ iwx_awdl_ctx_link_cmd(struct iwx_softc *sc, struct iwx_node *in, uint32_t action
 {
     struct ieee80211com *ic = &sc->sc_ic;
     struct iwx_link_config_cmd cmd;
-    const bool has_phy = !sc->sc_awdl_probe.ctx.link_no_phy && action != IWX_FW_CTXT_ACTION_ADD && action != IWX_FW_CTXT_ACTION_REMOVE && in && in->in_phyctxt;
+    const bool has_phy = !sc->sc_awdl_probe.ctx.link_no_phy && action != IWX_FW_CTXT_ACTION_ADD && action != IWX_FW_CTXT_ACTION_REMOVE &&
+        (sc->sc_awdl_probe.ctx.solo ? sc->sc_awdl_probe.ctx.phy2_chan != 0 : in && in->in_phyctxt);
     iwx_awdl_fill_link(&cmd, action, has_phy ? (sc->sc_awdl_probe.ctx.phy2_chan ? sc->sc_phyctxt[1].id : in->in_phyctxt->id) : IWX_FW_CTXT_INVALID,
                        sc->sc_awdl_probe.tx.self, modify_mask, active);
+    /*
+     * On its own there is no AP to take rates, beacon timing or EDCA from: the 5 GHz mandatory rates, 100 TU and the
+     * standard EDCA set.
+     */
+    if (has_phy && sc->sc_awdl_probe.ctx.solo) {
+        static const struct { uint16_t cw_min, cw_max; uint8_t aifsn; } edca[EDCA_NUM_AC] = {
+            {15, 1023, 3}, {15, 1023, 7}, {7, 15, 2}, {3, 7, 2}};
+        cmd.cck_rates = 0;
+        cmd.ofdm_rates = htole32((IWX_RATE_BIT_MSK(6) | IWX_RATE_BIT_MSK(12) | IWX_RATE_BIT_MSK(24)) >> IWX_FIRST_OFDM_RATE);
+        cmd.short_slot = htole32(1);
+        cmd.bi = htole32(100);
+        cmd.dtim_interval = htole32(100);
+        for (int i = 0; i < EDCA_NUM_AC; i++) {
+            uint8_t ucode_ac = iwx_mvm_mac80211_ac_to_ucode_ac((enum ieee80211_edca_ac)i);
+            cmd.ac[ucode_ac].cw_min = htole16(edca[i].cw_min);
+            cmd.ac[ucode_ac].cw_max = htole16(edca[i].cw_max);
+            cmd.ac[ucode_ac].aifsn = edca[i].aifsn;
+            cmd.ac[ucode_ac].fifos_mask = (1 << iwx_ac_to_tx_fifo[i]);
+            cmd.ac[ucode_ac].edca_txop = 0;
+        }
+        return iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_LINK_CONFIG_CMD, IWX_MAC_CONF_GROUP, 0), 0, sizeof(cmd), &cmd);
+    }
     /* Every field every time, as Linux iwl_mvm_link_changed() does; the mask only selects. */
     if (has_phy) {
         int cck, ofdm;
@@ -5866,6 +6112,121 @@ iwx_awdl_ctx_link_cmd(struct iwx_softc *sc, struct iwx_node *in, uint32_t action
         }
     }
     return iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_LINK_CONFIG_CMD, IWX_MAC_CONF_GROUP, 0), 0, sizeof(cmd), &cmd);
+}
+
+void ItlIwx::iwx_awdl_solo_task(void *arg)
+{
+    auto sc = static_cast<iwx_softc *>(arg);
+    auto that = container_of(sc, ItlIwx, com);
+    if (!that->getMainWorkLoop()->inGate()) {
+        that->getMainCommandGate()->runAction(
+            [](OSObject *, void *arg0, void *, void *, void *) -> IOReturn {
+                iwx_awdl_solo_task(arg0); return kIOReturnSuccess;
+            }, arg);
+        return;
+    }
+    that->iwx_awdl_solo_add(sc);
+}
+
+/*
+ * No infrastructure network (1.1.66). Until now the context only came up after an association, on the AP's PHY
+ * context, so with Wi-Fi on but not joined, or when macOS drops the network to give AWDL the radio, AWDL had no
+ * firmware context at all. Here link 1 gets the second PHY context on the AWDL channel, nothing shares it, and every
+ * AWDL frame uses the AWDL station's own queue. Same steps as iwx_awdl_ctx_add; a join removes it first
+ * (iwx_mld_auth). A failure removes what was made and stops it for this boot, without tripping AWDL.
+ */
+void ItlIwx::
+iwx_awdl_solo_add(struct iwx_softc *sc)
+{
+    auto p = &sc->sc_awdl_probe;
+    auto c = &p->ctx;
+    struct ieee80211com *ic = &sc->sc_ic;
+    auto in = reinterpret_cast<iwx_node *>(ic->ic_bss);
+    if (!iwx_use_mld_api(sc) || !sc->sc_awdl_native_requested || c->mode != 6 || c->stage || c->solo_failed ||
+        p->tx.tripped || !in || !iwx_awdl_solo_idle(sc))
+        return;
+    uint8_t chan = iwx_awdl_phy2_auto(c->seq_chan5, 0);
+    if (!chan || chan > IEEE80211_CHAN_MAX || !IEEE80211_IS_CHAN_5GHZ(&ic->ic_channels[chan]))
+        chan = IWX_AWDL_SOLO_CHAN;
+    if (!IEEE80211_IS_CHAN_5GHZ(&ic->ic_channels[chan]))
+        return;
+    const int generation = sc->sc_generation;
+    const uint8_t chains = iwx_mimo_enabled(sc) ? 2 : 1;
+    uint32_t stage = IWX_AWDL_CTX_NONE;
+    int err = iwx_phy_ctxt_update(sc, &sc->sc_phyctxt[1], &ic->ic_channels[chan], chains, chains, 0);
+    if (generation != sc->sc_generation)
+        return;
+    if (err)
+        goto fail;
+    ++c->solo_adds;
+    ++c->adds;
+    c->solo = 1;
+    c->phy2_chan = chan;
+#define IWX_AWDL_SOLO_STEP() do {                                                             \
+        if (generation != sc->sc_generation || c->stage != stage)                             \
+            return;                                                                           \
+        if (err) goto fail;                                                                   \
+        if (!iwx_awdl_solo_idle(sc)) { iwx_awdl_ctx_remove(sc); iwx_awdl_ctx_publish(sc); return; } \
+    } while (0)
+    {
+        struct iwx_mac_config_cmd cmd;
+        iwx_awdl_fill_mac(&cmd, IWX_FW_CTXT_ACTION_ADD, p->tx.self, true, false);
+        stage = c->stage = IWX_AWDL_CTX_MAC;
+        err = iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_MAC_CONFIG_CMD, IWX_MAC_CONF_GROUP, 0), 0, sizeof(cmd), &cmd);
+    }
+    IWX_AWDL_SOLO_STEP();
+    stage = c->stage = IWX_AWDL_CTX_LINK;
+    err = iwx_awdl_ctx_link_cmd(sc, in, IWX_FW_CTXT_ACTION_ADD, 0, 0);
+    IWX_AWDL_SOLO_STEP();
+    err = iwx_awdl_ctx_link_cmd(sc, in, IWX_FW_CTXT_ACTION_MODIFY, 0, 0);
+    IWX_AWDL_SOLO_STEP();
+    stage = c->stage = IWX_AWDL_CTX_ACTIVE;
+    err = iwx_awdl_ctx_link_cmd(sc, in, IWX_FW_CTXT_ACTION_MODIFY,
+        IWX_LINK_CONTEXT_MODIFY_ACTIVE | IWX_LINK_CONTEXT_MODIFY_RATES_INFO, 1);
+    IWX_AWDL_SOLO_STEP();
+    if (!p->assoc_rx) {
+        iwx_awdl_ctx_publish(sc);
+        return;
+    }
+    {
+        struct iwx_sta_cfg_cmd cmd;
+        iwx_awdl_fill_sta(&cmd, true);
+        stage = c->stage = IWX_AWDL_CTX_STA;
+        err = iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_STA_CONFIG_CMD, IWX_MAC_CONF_GROUP, 0), 0, sizeof(cmd), &cmd);
+    }
+    IWX_AWDL_SOLO_STEP();
+    {
+        /* The AWDL station's queue carries every AWDL frame here: there is no AP station queue to borrow. */
+        int q = -EIO;
+        if (iwx_nic_lock(sc)) {
+            q = iwx_tvqm_enable_txq(sc, IWX_MGMT_TID, 0, IWX_DEFAULT_QUEUE_SIZE, IWX_AWDL_STA_ID);
+            iwx_nic_unlock(sc);
+        }
+        err = q > 0 ? 0 : (q < 0 ? q : EIO);
+        if (q > 0 && generation == sc->sc_generation && c->stage == stage)
+            c->phy2_qid = q;
+    }
+    IWX_AWDL_SOLO_STEP();
+    {
+        struct iwx_mac_config_cmd cmd;
+        iwx_awdl_fill_mac(&cmd, IWX_FW_CTXT_ACTION_MODIFY, p->tx.self, true, true);
+        stage = c->stage = IWX_AWDL_CTX_ASSOC;
+        err = iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_MAC_CONFIG_CMD, IWX_MAC_CONF_GROUP, 0), 0, sizeof(cmd), &cmd);
+    }
+    IWX_AWDL_SOLO_STEP();
+#undef IWX_AWDL_SOLO_STEP
+    iwx_awdl_ctx_publish(sc);
+    if (p->peer_added < p->peer_count || p->cache_add_wait || p->cache_del_wait)
+        iwx_add_task(sc, systq, &sc->awdl_peer_task);
+    return;
+fail:
+    c->solo_err = uint32_t(err < 0 ? -err : err);
+    c->solo_err_stage = stage;
+    c->solo_failed = 1;
+    iwx_awdl_ctx_remove(sc);
+    c->solo = 0;
+    c->phy2_chan = 0;
+    iwx_awdl_ctx_publish(sc);
 }
 
 /*
@@ -5968,7 +6329,12 @@ iwx_awdl_ctx_remove(struct iwx_softc *sc)
         return;
     c->stage = IWX_AWDL_CTX_NONE;
     c->qid = -1;
-    c->phy2_chan = 0;
+    /*
+     * Where link 1 sits (the second PHY context, alone or beside the AP) stays known until the link is gone, so
+     * the deactivating LINK_CONFIG names the context the link is really on; cleared at the end (1.1.66).
+     */
+    if (c->solo)
+        ++c->solo_removes;
     if (sc->sc_awdl_native_requested)
         sc->sc_pcitag->setProperty("ItlwmAwdlNativeMonitorReady", false);
     ++c->removes;
@@ -5994,7 +6360,12 @@ iwx_awdl_ctx_remove(struct iwx_softc *sc)
             if (generation != sc->sc_generation)
                 return;
             sc->sc_flags &= ~IWX_FLAG_TXFLUSH;
-            err = iwx_mld_disable_txq(sc, c->own_sta, IWX_MGMT_TID) ?: err;
+            /*
+             * The TID the queue was made on: 0 with aggregation. A fixed management TID here disabled a queue that
+             * did not exist, and the firmware asserted (0x20101F49, last command SCD_QUEUE_CONFIG) when 1.1.56 left
+             * a hotspot for a router after an AirDrop; AWDL stayed off for that boot.
+             */
+            err = iwx_mld_disable_txq(sc, c->own_sta, c->own_tid) ?: err;
             if (generation != sc->sc_generation)
                 return;
             iwx_reset_tx_ring(sc, &sc->txq[own]);
@@ -6022,6 +6393,20 @@ iwx_awdl_ctx_remove(struct iwx_softc *sc)
         err = iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_MAC_CONFIG_CMD, IWX_MAC_CONF_GROUP, 0), 0, sizeof(cmd), &cmd);
         if (generation != sc->sc_generation)
             return;
+    }
+    if (c->mode == 6 && c->phy2_qid > 0) {
+        /* Mode 6's queue on the AWDL station goes before the station, like the other modes' queue below. */
+        const int q = c->phy2_qid;
+        c->phy2_qid = -1;
+        sc->sc_flags |= IWX_FLAG_TXFLUSH;
+        err = iwx_flush_sta_tids(sc, IWX_AWDL_STA_ID, 0xffff) ?: err;
+        if (generation != sc->sc_generation)
+            return;
+        sc->sc_flags &= ~IWX_FLAG_TXFLUSH;
+        err = iwx_mld_disable_txq(sc, IWX_AWDL_STA_ID, IWX_MGMT_TID) ?: err;
+        if (generation != sc->sc_generation)
+            return;
+        iwx_reset_tx_ring(sc, &sc->txq[q]);
     }
     if (stage >= IWX_AWDL_CTX_QUEUE && c->mode != 6) {
         sc->sc_flags |= IWX_FLAG_TXFLUSH;
@@ -6056,6 +6441,8 @@ iwx_awdl_ctx_remove(struct iwx_softc *sc)
         if (generation != sc->sc_generation)
             return;
     }
+    c->phy2_chan = 0;
+    c->solo = 0;
     if (err) {
         c->last_err = uint32_t(err < 0 ? -err : err);
         sc->sc_awdl_probe.tx.tripped = 1;
@@ -6086,9 +6473,10 @@ void ItlIwx::iwx_awdl_peer_task(void *arg)
     auto ic = &sc->sc_ic;
     auto p = &sc->sc_awdl_probe;
     while (p->peer_added < p->peer_count) {
+        /* Associated, or on its own and still idle (1.1.66). */
         if (p->ctx.stage != IWX_AWDL_CTX_ASSOC || p->tx.tripped || p->peer_failed ||
-            ic->ic_state != IEEE80211_S_RUN || sc->ns_nstate != IEEE80211_S_RUN || ic->ic_wcl_teardown_pending ||
-            (sc->sc_flags & (IWX_FLAG_SHUTDOWN | IWX_FLAG_HW_ERR)))
+            (p->ctx.solo ? !iwx_awdl_solo_idle(sc) : (ic->ic_state != IEEE80211_S_RUN || sc->ns_nstate != IEEE80211_S_RUN)) ||
+            ic->ic_wcl_teardown_pending || (sc->sc_flags & (IWX_FLAG_SHUTDOWN | IWX_FLAG_HW_ERR)))
             return;
         const int generation = sc->sc_generation;
         const uint32_t index = p->peer_added++;
@@ -6233,11 +6621,14 @@ iwx_awdl_tx_maybe(struct iwx_softc *sc)
             ++p->ctx.te_requests;
         p->ctx.last_te_us = p->rx_host_us;
     }
-    if (p->ctx.mode && sc->txq[apQueue ? sc->first_data_qid : p->ctx.qid].queued >= IWX_AWDL_TX_MAX_QUEUED) {
+    const int txQid = p->ctx.solo && p->ctx.phy2_qid > 0 ? p->ctx.phy2_qid : (apQueue ? sc->first_data_qid : p->ctx.qid);
+    if (p->ctx.mode && sc->txq[txQid].queued >= IWX_AWDL_TX_MAX_QUEUED) {
         ++p->tx.queue_limited;
         return;
     }
-    if (!ni->ni_port_valid || !(sc->sc_flags & IWX_FLAG_MLD_TXQ_ACTIVE) ||
+    /* On its own (1.1.66) the sync frames do not wait for an AP port or AP queues. */
+    const bool solo = p->ctx.solo && p->ctx.phy2_qid > 0;
+    if ((!solo && (!ni->ni_port_valid || !(sc->sc_flags & IWX_FLAG_MLD_TXQ_ACTIVE))) ||
         (sc->sc_flags & (IWX_FLAG_SHUTDOWN | IWX_FLAG_TXFLUSH | IWX_FLAG_HW_ERR)) ||
         !sc->qfullmsk.empty()) {
         ++p->tx.busy;
@@ -8171,7 +8562,8 @@ iwx_rx_mpdu_mq(struct iwx_softc *sc, mbuf_t m, void *pktdata,
 #ifdef AIRPORT_WCL
     // Firmware FCS and header padding have now been stripped. The native AWDL parser
     // expects the action body, not DMA padding, trailing FCS or an 802.11 MAC header.
-    if (sc->sc_awdl_probe.mode && ic->ic_state == IEEE80211_S_RUN && ic->ic_bss) {
+    /* AWDL on its own (1.1.66) receives with no association too. */
+    if (sc->sc_awdl_probe.mode && (ic->ic_state == IEEE80211_S_RUN || sc->sc_awdl_probe.ctx.solo) && ic->ic_bss) {
         uint64_t awdlNow = 0;
         absolutetime_to_nanoseconds(mach_absolute_time(), &awdlNow);
         auto *probe = &sc->sc_awdl_probe;
@@ -8338,6 +8730,11 @@ iwx_rx_tx_cmd_single(struct iwx_softc *sc, struct iwx_rx_packet *pkt,
     wcl_rsn_tx_completed(&ic->ic_wcl_rsn_trace, txd->wcl_rsn_cookie,
         ic->ic_wcl_rsn_cookie, txd->wcl_rsn_kind, status);
     /* Its losses say nothing about the AP link: keep them out of its antenna and error state. */
+    if (txd->awdl_phy2q) {
+        ++sc->sc_awdl_probe.ctx.phy2_q_done;
+        if (status != IWX_TX_STATUS_SUCCESS)
+            ++sc->sc_awdl_probe.ctx.phy2_q_fail;
+    }
     if (txd->awdl_kind) {
         iwx_awdl_tx_note_presence(sc);
         iwx_awdl_tx_note_done(&sc->sc_awdl_probe, txd->awdl_kind != 1, status == IWX_TX_STATUS_SUCCESS,
@@ -8345,6 +8742,13 @@ iwx_rx_tx_cmd_single(struct iwx_softc *sc, struct iwx_rx_packet *pkt,
         if (txd->awdl_kind == 3) {
             if (status == IWX_TX_STATUS_SUCCESS) ++sc->sc_awdl_probe.ctx.own_ok;
             else ++sc->sc_awdl_probe.ctx.own_fail;
+            if (sc->sc_awdl_probe.ctx.phy2_chan) {
+                ++sc->sc_awdl_probe.ctx.own_done_phy2;
+                if (status != IWX_TX_STATUS_SUCCESS) {
+                    ++sc->sc_awdl_probe.ctx.own_fail_phy2;
+                    sc->sc_awdl_probe.ctx.own_last_status_phy2 = static_cast<uint32_t>(status);
+                }
+            }
         }
         if (txd->awdl_kind == 4)
             iwx_awdl_amsdu_note_done(&sc->sc_awdl_probe, status == IWX_TX_STATUS_SUCCESS);
@@ -8399,6 +8803,7 @@ iwx_txd_done(struct iwx_softc *sc, struct iwx_tx_data *txd)
 #ifdef AIRPORT_WCL
     txd->wcl_rsn_kind = txd->wcl_rsn_cookie = 0;
     txd->awdl_kind = 0;
+    txd->awdl_phy2q = 0;
     txd->awdl_umi = 0;
 #endif
     
@@ -8416,7 +8821,8 @@ iwx_clear_oactive(struct iwx_softc *sc, struct iwx_tx_ring *ring)
 #ifdef AIRPORT_WCL
     {
         auto p = &sc->sc_awdl_probe;
-        const int dataQid = p->ctx.own_active ? p->ctx.own_qid : sc->first_data_qid;
+        const int dataQid = p->ctx.own_active ? p->ctx.own_qid :
+            (p->ctx.solo && p->ctx.phy2_qid > 0 ? p->ctx.phy2_qid : sc->first_data_qid);
         if (p->tx.data_stalled && ring->qid == dataQid && ring->queued <= IWX_AWDL_DATA_MAX_QUEUED / 2) {
             p->tx.data_stalled = 0;
             ++p->tx.data_kicks;
@@ -8460,6 +8866,10 @@ iwx_rx_tx_ba_notif(struct iwx_softc *sc, struct iwx_rx_packet *pkt, struct iwx_r
         awdlCtx->own_agg_fail += txed > done ? uint32_t(txed - done) : 0;
         /* Progress for the held-queue check, which counts completions. */
         awdlCtx->own_ok += done;
+        if (awdlCtx->phy2_chan) {
+            awdlCtx->own_done_phy2 += txed;
+            ++awdlCtx->own_ba_phy2;
+        }
     }
     if (ba_res->sta_id != IWX_STATION_ID && !ownAgg)
         return;
@@ -9406,6 +9816,12 @@ iwx_tx_fill_cmd(struct iwx_softc *sc, struct iwx_node *in,
     uint8_t hwrate;
 
     *flags = 0;
+#ifdef AIRPORT_WCL
+    /* AWDL on its own sits on 5 GHz whatever the last AP's band was: never a CCK rate there (1.1.66). */
+    const bool awdlSolo = sc->sc_awdl_probe.ctx.solo && !memcmp(wh->i_addr3, iwx_awdl_bssid, 6);
+    if (awdlSolo && min_ridx < iwx_rval2ridx(12))
+        min_ridx = iwx_rval2ridx(12);
+#endif
     /*
      * MLD (BZ) firmware: follow Linux iwl_mvm_set_tx_params(). Frames to
      * the AP station use the firmware's rate selection (TLC is configured
@@ -9422,7 +9838,7 @@ iwx_tx_fill_cmd(struct iwx_softc *sc, struct iwx_node *in,
     }
 #ifdef AIRPORT_WCL
     /* Peers advertise HT rates in their AWDL frames, and the phone's are read as this Mac's are. */
-    if (type == IEEE80211_FC0_TYPE_DATA && !IEEE80211_IS_MULTICAST(wh->i_addr1) &&
+    if (type == IEEE80211_FC0_TYPE_DATA && !IEEE80211_IS_MULTICAST(wh->i_addr1) && !awdlSolo &&
         !memcmp(wh->i_addr3, iwx_awdl_bssid, 6)) {
         const uint8_t version = iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_TX_CMD);
         const uint8_t valid = iwx_fw_valid_tx_ant(sc);
@@ -9576,7 +9992,12 @@ iwx_tx(struct iwx_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)
      * or data, which iwx_start() still dequeues outside RUN under AIRPORT)
      * asserts the firmware, so drop it here.
      */
-    if (iwx_use_mld_api(sc) && !(sc->sc_flags & IWX_FLAG_MLD_TXQ_ACTIVE)) {
+    if (iwx_use_mld_api(sc) && !(sc->sc_flags & IWX_FLAG_MLD_TXQ_ACTIVE)
+#ifdef AIRPORT_WCL
+        /* AWDL on its own has its queue on the AWDL station, not the AP's (1.1.66). */
+        && !(sc->sc_awdl_probe.ctx.solo && sc->sc_awdl_probe.ctx.phy2_qid > 0 && !memcmp(wh->i_addr3, iwx_awdl_bssid, 6))
+#endif
+        ) {
         ++sc->sc_tx_noqueue_drops;
         sc->sc_pcitag->setProperty("ItlwmTxNoQueueDrop",
             sc->sc_tx_noqueue_drops, 32);
@@ -9622,6 +10043,22 @@ iwx_tx(struct iwx_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)
         }
         qid = sc->sc_awdl_probe.ctx.qid;
     }
+    bool awdlPhy2q = false;
+    {
+        /* Mode 6: while link 1 is on the second channel, its AWDL frames leave there, not on the AP's queue. */
+        auto c = &sc->sc_awdl_probe.ctx;
+        if (awdlKind && c->mode == 6 && c->phy2_qid > 0 && (c->solo || (iwx_awdl_te_phy2q(c->te_want) && c->phy2_chan))) {
+            /* Bounded: frames the firmware never sends must not fill the ring and stop the AP's traffic. */
+            if (sc->txq[c->phy2_qid].queued >= IWX_AWDL_TX_MAX_QUEUED) {
+                ++c->phy2_q_drop;
+                mbuf_freem(m);
+                return ENOBUFS;
+            }
+            qid = c->phy2_qid;
+            awdlPhy2q = true;
+            ++c->phy2_q_sent;
+        }
+    }
     /* Only the A-MSDU path builds QoS AWDL data. It stays on this queue, away from the AP's block ack. */
     if (awdlKind == 2 && type == IEEE80211_FC0_TYPE_DATA && ieee80211_has_qos(wh) &&
         (ieee80211_get_qos(wh) & IEEE80211_QOS_AMSDU))
@@ -9630,7 +10067,13 @@ iwx_tx(struct iwx_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)
         !memcmp(wh->i_addr1, sc->sc_awdl_probe.ctx.own_peer, 6)) {
         qid = sc->sc_awdl_probe.ctx.own_qid;
         awdlKind = 3;
+        if (awdlPhy2q) {
+            --sc->sc_awdl_probe.ctx.phy2_q_sent;
+            awdlPhy2q = false;
+        }
         ++sc->sc_awdl_probe.ctx.own_sent;
+        if (sc->sc_awdl_probe.ctx.phy2_chan)
+            ++sc->sc_awdl_probe.ctx.own_sent_phy2;
         /* Aggregation queues take sequence numbers from their ring position, as the AP's do (IWX_AGG_SSN_TO_TXQ_IDX). */
         if (sc->sc_awdl_probe.ctx.own_agg && ieee80211_has_qos(wh))
             *reinterpret_cast<uint16_t *>(wh->i_seq) = htole16(uint16_t((sc->txq[qid].cur & 0xfff) << IEEE80211_SEQ_SEQ_SHIFT));
@@ -9819,6 +10262,7 @@ iwx_tx(struct iwx_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)
     data->wcl_rsn_kind = rsnKind;
     data->wcl_rsn_cookie = rsnKind ? ic->ic_wcl_rsn_cookie : 0;
     data->awdl_kind = awdlKind;
+    data->awdl_phy2q = awdlPhy2q;
     data->awdl_umi = 0;
     if (awdlKind == 2 && type == IEEE80211_FC0_TYPE_MGT && sc->sc_awdl_probe.umi_seq_valid &&
         !memcmp(wh->i_addr1, sc->sc_awdl_probe.umi_seq_peer, 6) &&
@@ -13202,6 +13646,14 @@ iwx_mld_auth(struct iwx_softc *sc, struct iwx_node *in)
 #endif
     uint32_t step, duration;
     int generation = sc->sc_generation, err;
+#ifdef AIRPORT_WCL
+    /* AWDL running on its own goes before the station MAC: the join proceeds exactly as without it (1.1.66). */
+    if (sc->sc_awdl_probe.ctx.solo) {
+        iwx_awdl_ctx_remove(sc);
+        if (generation != sc->sc_generation)
+            return ENXIO;
+    }
+#endif
     sc->sc_pcitag->setProperty("BE201HENegotiated", false);
     sc->sc_pcitag->setProperty("BE201TxRateIsHE", false);
     sc->sc_pcitag->setProperty("BE201HETxRateKbps", 0ULL, 32);
@@ -14920,6 +15372,7 @@ iwx_stop(struct _ifnet *ifp)
     iwx_del_task(sc, systq, &sc->awdl_native_task);
     iwx_del_task(sc, systq, &sc->awdl_peer_task);
     iwx_del_task(sc, systq, &sc->awdl_umi_task);
+    iwx_del_task(sc, systq, &sc->awdl_solo_task);
     sc->sc_mld_authorized_epoch = sc->sc_mld_authorized_done_epoch = 0;
 #endif
     iwx_del_task(sc, systq, &sc->mac_ctxt_task);
@@ -14966,6 +15419,8 @@ iwx_stop(struct _ifnet *ifp)
     /* The firmware holding the AWDL context is gone; its ring is freed with the others. */
     sc->sc_awdl_probe.ctx.stage = IWX_AWDL_CTX_NONE;
     sc->sc_awdl_probe.ctx.qid = -1;
+    sc->sc_awdl_probe.ctx.phy2_qid = -1;
+    sc->sc_awdl_probe.ctx.solo = 0;
     sc->sc_awdl_probe.peer_added = sc->sc_awdl_probe.peer_count = 0;
     sc->sc_awdl_probe.cache_add_wait = sc->sc_awdl_probe.cache_del_wait = 0;
     sc->sc_awdl_probe.ctx.own_qid = -1;
@@ -15021,6 +15476,15 @@ iwx_watchdog(struct _ifnet *ifp)
                 others |= i != sc->sc_awdl_probe.ctx.own_qid && sc->txq[i].queued;
             sc->sc_awdl_probe.ctx.own_active = 0;
             sc->sc_awdl_probe.ctx.own_held = 1;
+            if (!others)
+                sc->sc_tx_timer = 0;
+        }
+        /* Mode 6's queue on link 1: frames held there must not restart the AP connection either. */
+        if (sc->sc_tx_timer == 1 && sc->sc_awdl_probe.ctx.phy2_qid > 0 &&
+            sc->txq[sc->sc_awdl_probe.ctx.phy2_qid].queued) {
+            bool others = false;
+            for (int i = 0; i < IWX_MAX_QUEUES; i++)
+                others |= i != sc->sc_awdl_probe.ctx.phy2_qid && i != sc->sc_awdl_probe.ctx.own_qid && sc->txq[i].queued;
             if (!others)
                 sc->sc_tx_timer = 0;
         }
@@ -17765,6 +18229,7 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
         PE_parse_boot_argn("be201_awdl_ctx", &awdlCtx, sizeof(awdlCtx));
         sc->sc_awdl_probe.ctx.qid = -1;
         sc->sc_awdl_probe.ctx.own_qid = -1;
+        sc->sc_awdl_probe.ctx.phy2_qid = -1;
         if (awdlCtx >= 2 && awdlCtx <= 6) {
             sc->sc_awdl_probe.ctx.mode = awdlCtx;
             sc->sc_awdl_probe.mode = 3;
@@ -18217,6 +18682,7 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
     task_set(&sc->awdl_ba_task, iwx_awdl_ba_task, sc, "iwx_awdl_ba_task");
     task_set(&sc->awdl_ownq_task, iwx_awdl_ownq_task, sc, "iwx_awdl_ownq_task");
     task_set(&sc->awdl_phy2_task, iwx_awdl_phy2_task, sc, "iwx_awdl_phy2_task");
+    task_set(&sc->awdl_solo_task, iwx_awdl_solo_task, sc, "iwx_awdl_solo_task");
     ic->ic_wcl_port_authorized = iwx_wcl_port_authorized;
 #endif
     task_set(&sc->mac_ctxt_task, iwx_mac_ctxt_task, sc, "iwx_mac_ctxt_task");

@@ -39,8 +39,8 @@ out:return false;
 #define IWX_TX_STATUS_SUCCESS 1
 struct iwx_tx_resp{unsigned frame_count;struct{uint16_t status;}status;uint8_t failure_frame=0;};
 struct iwx_rx_packet {iwx_tx_resp data[1];};
-struct iwx_tx_data{unsigned type=8,wcl_rsn_cookie=0,wcl_rsn_kind=0;uint8_t awdl_kind=0,awdl_umi=0,awdl_umi_peer[6]={};};
-struct iwx_awdl_probe{ struct { unsigned own_ok,own_fail; } ctx;};static inline void iwx_awdl_umi_note(iwx_awdl_probe*,const uint8_t*,bool){}static int systq;static inline void iwx_add_task(void*,int,void*){}static inline void iwx_awdl_tx_note_presence(struct iwx_softc*){}static inline void iwx_awdl_amsdu_note_done(iwx_awdl_probe*,bool){}static inline void iwx_awdl_tx_note_done(iwx_awdl_probe*,bool,bool,uint32_t,uint32_t){}
+struct iwx_tx_data{unsigned type=8,wcl_rsn_cookie=0,wcl_rsn_kind=0;uint8_t awdl_kind=0,awdl_umi=0,awdl_phy2q=0,awdl_umi_peer[6]={};};
+struct iwx_awdl_probe{ struct { unsigned own_ok,own_fail,phy2_chan,own_done_phy2,own_fail_phy2,own_last_status_phy2,phy2_q_done,phy2_q_fail; } ctx;};static inline void iwx_awdl_umi_note(iwx_awdl_probe*,const uint8_t*,bool){}static int systq;static inline void iwx_add_task(void*,int,void*){}static inline void iwx_awdl_tx_note_presence(struct iwx_softc*){}static inline void iwx_awdl_amsdu_note_done(iwx_awdl_probe*,bool){}static inline void iwx_awdl_tx_note_done(iwx_awdl_probe*,bool,bool,uint32_t,uint32_t){}
 struct iwx_softc{ieee80211com sc_ic;uint8_t sc_mgmt_last_antenna_idx=0;iwx_awdl_probe sc_awdl_probe;int awdl_umi_task=0;};
 struct ItlIwx{unsigned toggles=0;void iwx_toggle_tx_ant(iwx_softc *,uint8_t *){++toggles;}void iwx_rx_tx_cmd_single(iwx_softc *,iwx_rx_packet *,iwx_tx_data *);};
 ''' + single + r'''

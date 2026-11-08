@@ -124,6 +124,7 @@ public:
     static uint32_t awdlOwnFixWanted();
     void setAWDLOwnQueue(bool on, bool agg, uint32_t fix) { if (fHalService) fHalService->setAwdlOwnQueue(on, agg, fix); }
     static void awdlRadioTest(bool *hold, uint32_t *phy2, uint32_t *te, bool *amsdu);
+    void setAWDLSlot(uint32_t chan, uint32_t run, uint32_t seq5) { if (fHalService) fHalService->setAwdlSlot(chan, run, seq5); }
     void setAWDLRadioTest(bool hold, uint32_t phy2, uint32_t te, bool amsdu) { if (fHalService) fHalService->setAwdlRadioTest(hold, phy2, te, amsdu); }
     bool awdlAmsduReady(const uint8_t *eth) { return fHalService && fHalService->awdlAmsduReady(eth); }
     IOReturn sendAWDLAmsdu(const uint8_t *const *eths, const size_t *lengths, unsigned count) { return fHalService ? fHalService->sendAwdlAmsdu(eths, lengths, count) : kIOReturnNotReady; }
@@ -136,6 +137,7 @@ public:
     bool awdlFailed = false;
     uint32_t awdlUnarmedRefusals = 0;
     uint32_t awdlAttempts = 0;
+    uint32_t awdlLateAdopted = 0;
 #endif
     virtual void free() override;
     virtual IOService* probe(IOService* provider, SInt32* score) override;

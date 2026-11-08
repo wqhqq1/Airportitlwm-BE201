@@ -4,7 +4,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SDK=${MAC_KERNEL_SDK:?Set MAC_KERNEL_SDK to the MacKernelSDK directory}
 TOOLCHAIN=${DARWIN_TOOLCHAIN:-/Library/Developer/CommandLineTools/usr/bin}
 OUT=${BUILD_OUTPUT:-$ROOT/build}
-VERSION=${BE201_BUILD_VERSION:-1.1.53}
+VERSION=${BE201_BUILD_VERSION:-1.1.66}
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 2
 /bin/sh "$ROOT/scripts/prepare-mackernelsdk.sh" "$SDK"
 mkdir -p "$OUT/objects"
@@ -85,7 +85,19 @@ __private_extern__ int _kext_apple_cc = 1;
 EOF
 clang++ "${common[@]}" -std=gnu++14 -fno-exceptions -fno-rtti \
   -c "$OUT/module.cpp" -o "$OUT/objects/module.o"
-"$TOOLCHAIN/ld" -no_fixup_chains \
-  -arch x86_64 -kext -undefined dynamic_lookup -macos_version_min 15.2 \
-  -o "$OUT/AirportItlwm" "$OUT"/objects/*.o "$SDK/Library/x86_64/libkmod.a"
+link() {
+  "$TOOLCHAIN/ld" -no_fixup_chains \
+    -arch x86_64 -kext -undefined dynamic_lookup -macos_version_min 15.2 \
+    -o "$OUT/AirportItlwm" "$OUT"/objects/*.o "$@" "$SDK/Library/x86_64/libkmod.a"
+}
+link
+# OpenCore skips a kext whose segments do not sit at their VM addresses once expanded ("Failed to fit ... Invalid
+# Parameter"). When __DATA's file content ends exactly on a page, ld leaves a page gap before __LINKEDIT (1.1.54,
+# 2026-11-08, Wi-Fi absent for a boot). A small initialized pad moves that end off the page.
+if ! python3 "$ROOT/scripts/oc_layout_check.py" "$OUT/AirportItlwm"; then
+  printf '__attribute__((used, section("__DATA,__data"))) static char be201_layout_pad[64] = {1};\n' > "$OUT/layout_pad.c"
+  clang -target x86_64-apple-macos15.2 -mkernel -c "$OUT/layout_pad.c" -o "$OUT/layout_pad.o"
+  link "$OUT/layout_pad.o"
+  python3 "$ROOT/scripts/oc_layout_check.py" "$OUT/AirportItlwm"
+fi
 printf 'Compiled 58 Sequoia sources and linked %s\n' "$OUT/AirportItlwm"

@@ -58,6 +58,23 @@
 /* Windows that follow the peer: one 64 TU slot at most every 250 ms. Every other slot (1.1.49) took the AP RTT to 139 ms. */
 #define IWX_AWDL_TE_SLOT_TU 64u
 #define IWX_AWDL_TE_SLOT_GAP_US 250000u
+/* Mode 3: windows in this Mac's own advertised slots on the second channel, from the AW timer at each slot start.
+ * A run of that channel's slots gets one window, two slots (128 TU) at most so the AP never loses more in a row. */
+#define IWX_AWDL_OWN_SLOT_TU 64u
+#define IWX_AWDL_OWN_SLOT_RUN_MAX 2u
+/* Automatic second channel: a new choice must hold this long before the link moves. */
+#define IWX_AWDL_PHY2_AUTO_STABLE_US 2000000u
+/* The own queue moves to another peer only after its current peer had no frame for this long. */
+#define IWX_AWDL_OWN_QUIET_US 1000000u
+/* A held own queue (frames that never finish, often the tail left when a peer goes) is freed and rebuilt after this
+ * long, again and again while rebuilds still carry frames; after this many rebuilds in a row with nothing done, never. */
+#define IWX_AWDL_OWN_RECOVER_US 3000000u
+#define IWX_AWDL_OWN_RECOVER_MAX 4u
+/* A wanted queue that was never made (no peer yet when the switch came on) is tried again this often. */
+#define IWX_AWDL_OWN_RETRY_US 1000000u
+/* With no infrastructure network: how long the driver must sit idle before AWDL runs on its own, and its channel. */
+#define IWX_AWDL_SOLO_IDLE_US 5000000u
+#define IWX_AWDL_SOLO_CHAN 149u
 
 static const uint8_t iwx_awdl_bssid[6] = {0x00, 0x25, 0x00, 0xff, 0x94, 0x73};
 
@@ -147,6 +164,42 @@ struct iwx_awdl_ctx {
     uint8_t own_fix_want, own_fix_done, own_redo;
     uint32_t own_fix_err;
     uint32_t own_retargets, own_agg_err, own_tlc_err, own_txen_err, own_agg_ok, own_agg_fail, own_ba_notifs;
+    /* Default from 1.1.54: retarget only after the current peer went quiet; held queues rebuilt, a bounded number of times. */
+    uint32_t own_sent_mark, own_recovers, own_recover_fails, own_recover_ok_mark, own_quiet_skips;
+    uint64_t own_busy_us, own_held_us, own_try_us;
+    uint32_t own_retries;
+    /* This Mac's own schedule, from the AW timer: the slot starting now, how many slots of that channel follow, the
+     * 5 GHz channel the sequence uses. Second channel automatic choice and mode 3 windows. */
+    uint8_t slot_chan, slot_run, auto_cand;
+    /* Mode 4: the 5 GHz channel of the next slot that has one, from this slot on (the link moves a slot ahead). */
+    uint8_t slot_next5;
+    uint32_t phy2_slot_moves;
+    /* Mode 5: moves that kept the own queue (flushed only) instead of releasing it. */
+    uint32_t own_kept_moves;
+    /* Second channel windows: the session protection kind, latched only between windows; peer refreshes after moves. */
+    uint8_t te_conf;
+    uint32_t own_refreshes, own_refresh_err;
+    /* Own queue completions while link 1 sits on the second channel, and the frames sent there. */
+    uint32_t own_sent_phy2, own_done_phy2;
+    /* On the second channel: failed TX responses, the last failure status, block ack notifications. */
+    uint32_t own_fail_phy2, own_last_status_phy2, own_ba_phy2;
+    /*
+     * Mode 6: a queue on the AWDL station (link 1), so action, multicast and fallback unicast frames go where link 1
+     * is. In context mode 6 they all used the AP station's queue, on the AP's channel only. 0 or less: none.
+     */
+    int32_t phy2_qid;
+    uint32_t phy2_q_sent, phy2_q_done, phy2_q_fail, phy2_q_drop, phy2_q_err;
+    /*
+     * No infrastructure network (1.1.66): the context on its own, link 1 on the second PHY context at the AWDL
+     * channel, all AWDL frames on the AWDL station's queue. Removed before any join; a failure stops it for the boot.
+     */
+    uint8_t solo, solo_failed;
+    uint32_t solo_adds, solo_removes, solo_err, solo_err_stage;
+    uint64_t solo_try_us;
+    /* The sequence's first two different 5 GHz channels, low byte first. */
+    uint16_t seq_chan5;
+    uint64_t slot_us, auto_since_us, te_end_us;
+    uint32_t te_own, phy2_auto_changes;
 };
 
 struct iwx_awdl_probe {
@@ -997,6 +1050,50 @@ static inline uint32_t iwx_awdl_te_due(const struct iwx_awdl_probe *p, uint32_t 
         return host_us - last_us >= IWX_AWDL_TE_INTERVAL_US ? IWX_AWDL_TE_DURATION_TU : 0;
     if (mode != 2 || host_us - last_us < IWX_AWDL_TE_SLOT_GAP_US) return 0;
     return iwx_awdl_peer_slot_chan(p, host_us) == chan ? IWX_AWDL_TE_SLOT_TU : 0;
+}
+
+/*
+ * Mode 3: a window when this Mac's own slot starting now is on the second channel. Only at a run's first slot (run > 0),
+ * only for the slot tick just reported, and not while an earlier window still runs. Duration in TU, 0 for none.
+ */
+static inline uint32_t iwx_awdl_te_own_due(uint8_t slot_chan, uint8_t slot_run, uint32_t chan, uint64_t slot_us,
+                                           uint64_t host_us, uint64_t te_end_us) {
+    if (!chan || slot_chan != chan || !slot_run || host_us < te_end_us) return 0;
+    /* A tick handled late would put the window into the next slot: AP time lost for nothing. */
+    if (host_us - slot_us > IWX_AWDL_OWN_SLOT_TU * IWX_AWDL_TU_US / 4) return 0;
+    const uint32_t run = slot_run < IWX_AWDL_OWN_SLOT_RUN_MAX ? slot_run : IWX_AWDL_OWN_SLOT_RUN_MAX;
+    return run * IWX_AWDL_OWN_SLOT_TU;
+}
+
+/* Modes that make link 1 follow this Mac's own sequence, and those that keep the own queue across the moves. */
+static inline bool iwx_awdl_te_follows(uint32_t te) { return te >= 4 && te <= 7; }
+static inline bool iwx_awdl_te_keeps_own(uint32_t te) { return te >= 5 && te <= 7; }
+/* Modes whose AWDL frames use link 1's queue on the second channel (6 to 8). */
+static inline bool iwx_awdl_te_phy2q(uint32_t te) { return te >= 6 && te <= 8; }
+/*
+ * Modes with session protection windows (1 to 6). 7 and 8 open none and leave link 1's time to the firmware:
+ * in 1.1.64 nothing on link 1's queues was sent during windows (Phy2QDone 0 of 8 held, own queue 2 of 47).
+ */
+static inline bool iwx_awdl_te_windows(uint32_t te) { return te >= 1 && te <= 6; }
+
+/*
+ * Mode 4: where link 1 should be for the coming slots. The second channel when the next 5 GHz slot of this Mac's own
+ * sequence is on it, otherwise the AP's channel (0). On a router on 36 the sequence 36 0 149 0 ... 6 0 149 gives 149
+ * from slot 1 to slot 10 and 36 from slot 11 to slot 0: slot 0 on 36 is where the phone found this Mac (2026-11-08).
+ */
+static inline uint8_t iwx_awdl_phy2_follow(uint8_t cand, uint8_t next5) {
+    return cand && next5 == cand ? cand : 0;
+}
+
+/*
+ * Automatic second channel: a 5 GHz channel of this Mac's own sequence that the AP is not on. seq holds the first two
+ * different ones, low byte first. On a router on 36 the family's sequence was 36 0 149 0 0 0 0 0 6 0 149 ...: slot 0
+ * on the AP's channel, so taking only the first 5 GHz channel (1.1.54 to 1.1.57) never chose 149.
+ */
+static inline uint8_t iwx_awdl_phy2_auto(uint16_t seq, uint8_t home) {
+    const uint8_t a = uint8_t(seq & 0xff), b = uint8_t(seq >> 8);
+    if (a >= 36 && a != home) return a;
+    return b >= 36 && b != home ? b : 0;
 }
 
 /* True when an AWDL action frame names a new nearby sender. Far ones would use up the table in a crowd. */

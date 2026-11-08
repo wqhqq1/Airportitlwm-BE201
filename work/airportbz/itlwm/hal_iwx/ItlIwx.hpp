@@ -169,7 +169,10 @@ public:
     void iwx_awdl_ba_send_resp(struct iwx_softc *, const struct iwx_awdl_ba_req *, uint16_t);
     void setAwdlOwnQueue(bool, bool, uint32_t) override;
     static void iwx_awdl_phy2_task(void *);
+    static void iwx_awdl_solo_task(void *);
+    void iwx_awdl_solo_add(struct iwx_softc *);
     static void iwx_awdl_umi_task(void *);
+    void setAwdlSlot(uint32_t, uint32_t, uint32_t) override;
     void setAwdlRadioTest(bool, uint32_t, uint32_t, bool) override;
     bool awdlAmsduReady(const uint8_t *) override;
     void awdlPeerCache(const uint8_t *, uint32_t) override;

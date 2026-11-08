@@ -15,7 +15,7 @@ static inline int iwx_awdl_native_request(struct iwx_awdl_probe *p, bool *reques
     if (*requested) return memcmp(p->tx.self, address, 6) ? -2 : 1;
     if (p->ctx.mode || p->ctx.stage || p->tx.mode) return -2;
     memcpy(p->tx.self, address, 6);
-    p->ctx.mode = 6; p->ctx.qid = -1;
+    p->ctx.mode = 6; p->ctx.qid = -1; p->ctx.phy2_qid = -1;
     p->mode = 3; p->tx.mode = 0; p->assoc_rx = 1;
     *requested = true;
     return 0;

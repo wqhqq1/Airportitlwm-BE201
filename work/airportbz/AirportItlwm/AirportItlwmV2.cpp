@@ -1595,7 +1595,8 @@ bool AirportItlwm::awdlVifTxAllowed()
     return __atomic_load_n(&be201AwdlVifTxValue, __ATOMIC_ACQUIRE) == 1;
 }
 
-// Test only, and only from RAM: data to a peer on that peer's own firmware queue, following where data goes.
+// Data to a peer on that peer's own firmware queue, following where data goes. On with aggregation and both fixes
+// from 1.1.54 when AWDL starts automatically (33 MB/s Mac to phone on 2026-11-07); 0 from RAM turns each off.
 static int be201AwdlOwnQueueValue;
 SYSCTL_INT(_debug, OID_AUTO, be201_awdl_own_queue, CTLFLAG_RW | CTLFLAG_LOCKED, &be201AwdlOwnQueueValue, 0, "");
 // Test only: that queue on TID 0 with A-MPDU parameters and firmware rate control, QoS data, for Mac to phone speed.
@@ -1606,6 +1607,7 @@ static int be201AwdlOwnFixValue;
 SYSCTL_INT(_debug, OID_AUTO, be201_awdl_own_fix, CTLFLAG_RW | CTLFLAG_LOCKED, &be201AwdlOwnFixValue, 0, "");
 
 // Test only, from RAM too: wait out the peer's other channels; link 1 on a channel of its own, with windows.
+// be201_awdl_phy2: 0 off, 1 automatic (the 5 GHz channel of this Mac's own sequence when the AP is elsewhere), 36+ fixed.
 static int be201AwdlTxHoldValue, be201AwdlPhy2Value, be201AwdlPhy2TeValue, be201AwdlAmsduValue;
 SYSCTL_INT(_debug, OID_AUTO, be201_awdl_amsdu, CTLFLAG_RW | CTLFLAG_LOCKED, &be201AwdlAmsduValue, 0, "");
 SYSCTL_INT(_debug, OID_AUTO, be201_awdl_tx_hold, CTLFLAG_RW | CTLFLAG_LOCKED, &be201AwdlTxHoldValue, 0, "");
@@ -1619,8 +1621,18 @@ void AirportItlwm::awdlRadioTest(bool *hold, uint32_t *phy2, uint32_t *te, bool 
     const int channel = __atomic_load_n(&be201AwdlPhy2Value, __ATOMIC_ACQUIRE);
     *phy2 = channel > 0 ? static_cast<uint32_t>(channel) : 0;
     // 1: a window once a second, as in 1.1.42. 2: windows in the reference peer's slots on that channel.
+    // 3: windows in this Mac's own slots on that channel (1.1.54). Channel 1 means automatic.
+    // 4: as 3, and with channel 1 the link itself follows the sequence: the AP's channel for its slots (1.1.60).
+    // 5: as 4, the own queue kept (flushed) across the moves instead of released (1.1.61).
+    // The value is mode + 16 x kind of session protection (0 ASSOC as before, 1 GO_CLIENT_ASSOC, 2 P2P_DEVICE_DISCOV,
+    // 3 P2P_GO_NEGOTIATION), passed above the mode (1.1.62).
     const int windows = __atomic_load_n(&be201AwdlPhy2TeValue, __ATOMIC_ACQUIRE);
-    *te = windows == 1 || windows == 2 ? static_cast<uint32_t>(windows) : 0;
+    // Kind 1 asserted the firmware at once (0x2000150D, last command SESSION_PROTECTION, 2026-11-08 19:18) and kind 3
+    // is the same family: only 0 and 2 are taken (1.1.63).
+    const int mode = windows > 0 ? windows % 16 : 0, kind = windows > 0 ? windows / 16 : 0;
+    // 6: as 5, and AWDL frames leave on a queue of link 1 while it is on the second channel (1.1.64).
+    // 7: as 6 without windows; 8: link 1 stays on the second channel, its queue, no windows (1.1.65).
+    *te = mode >= 1 && mode <= 8 && (kind == 0 || kind == 2) ? static_cast<uint32_t>(mode | (kind << 8)) : 0;
 }
 
 bool AirportItlwm::awdlOwnQueueWanted()
@@ -1801,7 +1813,12 @@ void AirportItlwm::startAWDLAuto()
     __atomic_store_n(&be201AwdlVifTxValue, 1, __ATOMIC_RELEASE);
     __atomic_store_n(&be201AwdlVifDataValue, 1, __ATOMIC_RELEASE);
     __atomic_store_n(&be201AwdlVifArm, 1, __ATOMIC_RELEASE);
+    // Mac to phone speed, as tested on 2026-11-07: own queue, aggregation, both fixes. The 4.6 MB/s path stays the fallback.
+    __atomic_store_n(&be201AwdlOwnQueueValue, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&be201AwdlTxAggValue, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&be201AwdlOwnFixValue, 3, __ATOMIC_RELEASE);
     setProperty("ItlwmAwdlAuto", true);
+    setProperty("ItlwmAwdlSpeedDefault", true);
 }
 
 bool AirportItlwm::awdlLastBootPanicked()
@@ -1833,7 +1850,23 @@ IOReturn AirportItlwm::createAWDLInterfaceGated(OSObject *owner, void *arg0, voi
     uint8_t nonzero = 0;
     for (unsigned i = 0; i < APPLE80211_ADDR_LEN; ++i) nonzero |= request->mac[i];
     if (!nonzero || (request->mac[0] & 1)) return kIOReturnBadArgument;
-    if (controller->awdlFailed) return kIOReturnNotReady;
+    if (controller->awdlFailed) {
+        // A BSD attach that came after the wait gave up is taken on the next request. On 2026-11-08 at boot awdl0
+        // attached 6 s after a 10 s wait had failed; the failure stayed for the boot and AirDrop could not send.
+        auto *late = controller->awdlInterface;
+        const char *name = late ? late->getBSDName() : nullptr;
+        if (controller->awdlStopping || !late || !name || strncmp(name, "awdl", 4) || !late->getBSDInterface())
+            return kIOReturnNotReady;
+        ether_addr old = late->getSelfMacAddr();
+        if (memcmp(&old, request->mac, sizeof(old))) return kIOReturnBusy;
+        late->markDown();
+        strlcpy(reinterpret_cast<char *>(request->bsd_name), name, sizeof(request->bsd_name));
+        late->setProperty("ItlwmAwdlVifStage", 6, 32);
+        controller->setProperty("ItlwmAwdlVifStep", "ready-late");
+        controller->setProperty("ItlwmAwdlVifLateAdopted", ++controller->awdlLateAdopted, 32);
+        controller->awdlFailed = false;
+        return kIOReturnSuccess;
+    }
     if (controller->awdlInterface) {
         ether_addr old = controller->awdlInterface->getSelfMacAddr();
         if (memcmp(&old, request->mac, sizeof(old))) return kIOReturnBusy;
@@ -1859,8 +1892,9 @@ IOReturn AirportItlwm::createAWDLInterfaceGated(OSObject *owner, void *arg0, voi
         if (interface->initForController(controller, mac) && interface->attach(controller) && interface->start(controller)) {
             // The BSD client attaches from the matching thread and may need this gate, so the
             // wait gives it up. Bounded, because a failure here must not hold wifip2pd forever.
+            // 30 s: a busy boot took 16 s on 2026-11-08, past the old 10 s.
             result = kIOReturnNotReady;
-            for (int i = 0; i < 100 && !controller->awdlStopping && !interface->getBSDInterface(); ++i) {
+            for (int i = 0; i < 300 && !controller->awdlStopping && !interface->getBSDInterface(); ++i) {
                 AbsoluteTime deadline;
                 clock_interval_to_deadline(100, kMillisecondScale, &deadline);
                 _fCommandGate->commandSleep(&controller->awdlCreating, deadline, THREAD_UNINT);

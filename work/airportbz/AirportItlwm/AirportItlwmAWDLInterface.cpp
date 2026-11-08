@@ -546,10 +546,6 @@ void AirportItlwmAWDLInterface::awTimerFired(OSObject *owner, IOTimerEventSource
     self->txRoom();
     auto *awdlController = static_cast<AirportItlwm *>(self->ownerController);
     awdlController->setAWDLOwnQueue(AirportItlwm::awdlOwnQueueWanted(), AirportItlwm::awdlTxAggWanted(), AirportItlwm::awdlOwnFixWanted());
-    bool holdTest = false, amsduTest = false;
-    uint32_t phy2Test = 0, teTest = 0;
-    AirportItlwm::awdlRadioTest(&holdTest, &phy2Test, &teTest, &amsduTest);
-    awdlController->setAWDLRadioTest(holdTest, phy2Test, teTest, amsduTest);
     // Layout read from monitorTimeline and logAWStart on 24G824; the channel's flags and any
     // other fields the firmware fills are unverified.
     uint8_t event[0x28] = {};
@@ -571,6 +567,48 @@ void AirportItlwmAWDLInterface::awTimerFired(OSObject *owner, IOTimerEventSource
     const uint32_t number = self->awNumber;
     self->awNumber += self->awSteps;
     const uint32_t slot = (number / self->awSteps) % 16;
+    {
+        // This Mac's own sequence, as the family set it: the slot starting now, the run of that channel's slots that
+        // starts here (0 inside a run), and the 5 GHz channel the sequence uses. On a hotspot on 149 it was
+        // 149 in slots 0, 2 and 10, 6 in slot 8, the rest 0.
+        const uint32_t chan = self->awChannels[slot] <= 255 ? self->awChannels[slot] : 0;
+        uint32_t run = 0;
+        if (chan && self->awChannels[(slot + 15) % 16] != chan)
+            while (run < 16 && self->awChannels[(slot + run) % 16] == chan)
+                ++run;
+        else if (chan) {
+            // One channel in every slot has no run start: a slot in four, as the AP keeps three quarters.
+            bool same = true;
+            for (unsigned i = 0; i < 16; ++i)
+                same &= self->awChannels[i] == chan;
+            run = same && !(slot % 4) ? 1 : 0;
+        }
+        // The first two different 5 GHz channels, low byte first: the HAL takes the one the AP is not on.
+        uint32_t seq5 = 0;
+        for (unsigned i = 0; i < 16; ++i) {
+            const uint32_t c5 = self->awChannels[i];
+            if (c5 < 36 || c5 > 177 || c5 == (seq5 & 0xff))
+                continue;
+            if (!seq5) {
+                seq5 = c5;
+            } else {
+                seq5 |= c5 << 8;
+                break;
+            }
+        }
+        // Mode 4 looks ahead: the 5 GHz channel of the next slot that has one, from this slot on.
+        uint32_t next5 = 0;
+        for (unsigned k = 0; k < 16 && !next5; ++k) {
+            const uint32_t c5 = self->awChannels[(slot + k) % 16];
+            if (c5 >= 36 && c5 <= 177)
+                next5 = c5;
+        }
+        awdlController->setAWDLSlot(chan, run | (next5 << 8), seq5);
+        bool holdTest = false, amsduTest = false;
+        uint32_t phy2Test = 0, teTest = 0;
+        AirportItlwm::awdlRadioTest(&holdTest, &phy2Test, &teTest, &amsduTest);
+        awdlController->setAWDLRadioTest(holdTest, phy2Test, teTest, amsduTest);
+    }
     uint64_t now;
     clock_get_uptime(&now);
     absolutetime_to_nanoseconds(now, &now);

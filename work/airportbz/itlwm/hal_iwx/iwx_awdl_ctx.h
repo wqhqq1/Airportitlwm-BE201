@@ -80,11 +80,16 @@ struct iwx_awdl_sta_disable_tx_cmd {
     uint32_t disable;
 } __packed;
 
-static inline void iwx_awdl_fill_te(struct iwx_session_prot_cmd *cmd, uint32_t action, uint32_t duration_tu) {
+#ifndef IWX_SESSION_PROTECT_CONF_MAX_ID
+#define IWX_SESSION_PROTECT_CONF_MAX_ID 4
+#endif
+/* conf: which kind of protection. The context's own windows always used ASSOC; the second channel tests others (1.1.62). */
+static inline void iwx_awdl_fill_te(struct iwx_session_prot_cmd *cmd, uint32_t action, uint32_t duration_tu,
+                                    uint32_t conf = IWX_SESSION_PROTECT_CONF_ASSOC) {
     memset(cmd, 0, sizeof(*cmd));
     cmd->id_and_color = htole32(IWX_AWDL_LINK_ID);
     cmd->action = htole32(action);
-    cmd->conf_id = htole32(IWX_SESSION_PROTECT_CONF_ASSOC);
+    cmd->conf_id = htole32(conf < IWX_SESSION_PROTECT_CONF_MAX_ID ? conf : IWX_SESSION_PROTECT_CONF_ASSOC);
     cmd->duration_tu = htole32(duration_tu);
 }
 #endif

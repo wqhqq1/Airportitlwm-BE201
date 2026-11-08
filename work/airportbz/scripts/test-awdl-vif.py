@@ -89,11 +89,11 @@ class AirportItlwmLowLatencyInterface;
 static const void *const gIODTPlane=nullptr;struct IORegistryEntry{static IORegistryEntry *fromPath(const char*,const void*){return nullptr;}OSObject *copyProperty(const char*){return nullptr;}void release(){}};
 class AirportItlwm:public IO80211Controller {public:
  IO80211SkywalkInterface *fNetIf=reinterpret_cast<IO80211SkywalkInterface*>(8);uint8_t capabilityCopy[0x18]={};const uint8_t *nativeCapabilityCache() const {return capabilityCopy;}void reloadAWDLCapabilities();
- AirportItlwmAWDLInterface *awdlInterface=nullptr;bool awdlCreating=false,awdlStopping=false,awdlArmRegistered=false,awdlFailed=false;uint32_t awdlUnarmedRefusals=0,awdlAttempts=0;
+ AirportItlwmAWDLInterface *awdlInterface=nullptr;bool awdlCreating=false,awdlStopping=false,awdlArmRegistered=false,awdlFailed=false;uint32_t awdlUnarmedRefusals=0,awdlAttempts=0,awdlLateAdopted=0;
  void registerAWDLArmControl();static bool awdlVifCapabilityArmed();static uint32_t awdlVifPoolFlags();static bool awdlVifAcceptSets();static bool awdlVifLinkAllowed();static bool awdlVifAwAllowed();
  static bool awdlUmiOn();static bool awdlLlwOn();void sendAWDLUmi(const uint8_t*p,const uint8_t*t,size_t n){memcpy(umiPeer,p,6);umiTlvs=t;umiLen=n;++umiSends;}uint8_t umiPeer[6]={};const uint8_t*umiTlvs=nullptr;size_t umiLen=0;unsigned umiSends=0;void awdlUmiDone(const uint8_t*,bool);
  IOReturn createLowLatencyInterface(AirportItlwmAWDLInterface*,const ether_addr&,char*,size_t);static IOReturn createLowLatencyInterfaceGated(OSObject*,void*,void*,void*,void*);AirportItlwmLowLatencyInterface *llwInterface=nullptr;bool llwCreating=false,llwFailed=false;
- void awdlTxRoom();void awdlPeerCache(const uint8_t*,uint32_t){}void awdlPeerCacheDone(const uint8_t*,bool);static bool awdlCacheOn();void startAWDLAuto();static bool awdlLastBootPanicked();static bool awdlOwnQueueWanted();static bool awdlTxAggWanted();static uint32_t awdlOwnFixWanted();void setAWDLOwnQueue(bool,bool,uint32_t){} static void awdlRadioTest(bool*,uint32_t*,uint32_t*,bool*);void setAWDLRadioTest(bool,uint32_t,uint32_t,bool){} bool amsduReadyMock=false;unsigned amsduCalls=0,amsduLast=0;IOReturn amsduResult=0;bool awdlAmsduReady(const uint8_t*){return amsduReadyMock;}IOReturn sendAWDLAmsdu(const uint8_t*const*,const size_t*,unsigned n){++amsduCalls;amsduLast=n;return amsduResult;} static bool awdlVifRadioAllowed();static bool awdlVifRxAllowed();static bool awdlVifTxAllowed();static bool awdlVifDataAllowed();IOReturn sendAWDLData(const uint8_t*,size_t);IOReturn setAWDLTemplate(bool,const uint8_t*,size_t);IOReturn enableAWDLTransmit();
+ void awdlTxRoom();void awdlPeerCache(const uint8_t*,uint32_t){}void awdlPeerCacheDone(const uint8_t*,bool);static bool awdlCacheOn();void startAWDLAuto();static bool awdlLastBootPanicked();static bool awdlOwnQueueWanted();static bool awdlTxAggWanted();static uint32_t awdlOwnFixWanted();void setAWDLOwnQueue(bool,bool,uint32_t){} static void awdlRadioTest(bool*,uint32_t*,uint32_t*,bool*);void setAWDLSlot(uint32_t,uint32_t,uint32_t){}void setAWDLRadioTest(bool,uint32_t,uint32_t,bool){} bool amsduReadyMock=false;unsigned amsduCalls=0,amsduLast=0;IOReturn amsduResult=0;bool awdlAmsduReady(const uint8_t*){return amsduReadyMock;}IOReturn sendAWDLAmsdu(const uint8_t*const*,const size_t*,unsigned n){++amsduCalls;amsduLast=n;return amsduResult;} static bool awdlVifRadioAllowed();static bool awdlVifRxAllowed();static bool awdlVifTxAllowed();static bool awdlVifDataAllowed();IOReturn sendAWDLData(const uint8_t*,size_t);IOReturn setAWDLTemplate(bool,const uint8_t*,size_t);IOReturn enableAWDLTransmit();
  void inputAWDLActionFrame(const uint8_t *,size_t,uint8_t,int,uint32_t);
  IOReturn requestAWDLMonitor(const ether_addr &);
  bool awdlSyncNext(uint16_t*,uint32_t*){return false;}
@@ -282,7 +282,14 @@ int main(){
  failAt=0;
  // The BSD client never attaches: bounded wait, failure, object kept.
  controller.awdlStopping=false;step=0;be201AwdlVifArm=1;bsdNever();gate.sleeps=0;
- assert(controller.createAWDLInterface(&req)==kIOReturnNotReady&&gate.sleeps==100&&controller.awdlFailed&&controller.awdlInterface&&controller.awdlPointer);
+ assert(controller.createAWDLInterface(&req)==kIOReturnNotReady&&gate.sleeps==300&&controller.awdlFailed&&controller.awdlInterface&&controller.awdlPointer);
+ // 1.1.58: the BSD client attaches after the wait gave up; the next request takes the kept object, without the arm.
+ {auto steps=step;assert(be201AwdlVifArm==0);
+  assert(controller.createAWDLInterface(&req)==kIOReturnNotReady&&controller.awdlFailed); // still not attached
+  lastCreated->attachBSD();req.mac[1]^=1;assert(controller.createAWDLInterface(&req)==kIOReturnBusy&&controller.awdlFailed);req.mac[1]^=1;
+  assert(controller.createAWDLInterface(&req)==kIOReturnSuccess&&!controller.awdlFailed&&controller.awdlLateAdopted==1&&step==steps);
+  assert(!strcmp(reinterpret_cast<const char*>(req.bsd_name),"awdl0"));
+  assert(controller.createAWDLInterface(&req)==kIOReturnSuccess&&controller.awdlLateAdopted==1);} // later requests: the normal path
  controller.stopAWDLInterface();drainTerminations();controller.awdlFailed=false;assert(!controller.awdlPointer&&!queuesLive);
  bsdAttaches();
  for(int mode=0;mode<2;++mode){

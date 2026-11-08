@@ -154,6 +154,24 @@ int main(){
  assert(!iwx_awdl_cache_request(&c,M5,0)&&c.cache_full==1&&c.peer_count==4);
  c.peer_failed=1;assert(!iwx_awdl_cache_request(&c,M1,0));c.peer_failed=0;c.assoc_rx=0;assert(!iwx_awdl_cache_request(&c,M1,0));
  assert(!memcmp(c.peer_addr[2],M3,6));
+ /* 1.1.54 mode 3: a window at the first slot of this Mac's own run on the second channel, at most two slots. */
+ {const uint64_t t0=10000000;
+  assert(iwx_awdl_te_own_due(149,1,149,t0,t0+500,0)==IWX_AWDL_OWN_SLOT_TU);
+  assert(iwx_awdl_te_own_due(149,3,149,t0,t0,0)==IWX_AWDL_OWN_SLOT_RUN_MAX*IWX_AWDL_OWN_SLOT_TU);
+  assert(!iwx_awdl_te_own_due(149,0,149,t0,t0,0));            /* inside a run: the first slot's window covers it */
+  assert(!iwx_awdl_te_own_due(36,1,149,t0,t0,0)&&!iwx_awdl_te_own_due(0,1,149,t0,t0,0)&&!iwx_awdl_te_own_due(149,1,0,t0,t0,0));
+  assert(!iwx_awdl_te_own_due(149,1,149,t0,t0,t0+1));         /* an earlier window still runs */
+  assert(iwx_awdl_te_own_due(149,1,149,t0,t0+16*IWX_AWDL_TU_US,0)&&!iwx_awdl_te_own_due(149,1,149,t0,t0+16*IWX_AWDL_TU_US+1,0)); /* late tick */
+  /* Automatic channel: the sequence's 5 GHz channel, never the AP's own, never 2.4 GHz or none. */
+  assert(iwx_awdl_phy2_auto(149,36)==149&&!iwx_awdl_phy2_auto(149,149)&&!iwx_awdl_phy2_auto(6,36)&&!iwx_awdl_phy2_auto(0,36)&&iwx_awdl_phy2_auto(44,149)==44);
+  /* 1.1.58: the router case, 36 first in the sequence, then 149. */
+  assert(iwx_awdl_phy2_auto(36|(149<<8),36)==149&&iwx_awdl_phy2_auto(149|(36<<8),36)==149&&!iwx_awdl_phy2_auto(149|(149<<8),149));
+  /* 1.1.60 mode 4: 149 ahead of its slots, the AP's channel ahead of slot 0, nothing without a candidate. */
+  assert(iwx_awdl_phy2_follow(149,149)==149&&!iwx_awdl_phy2_follow(149,36)&&!iwx_awdl_phy2_follow(0,149)&&!iwx_awdl_phy2_follow(149,0));
+  /* 1.1.64: modes 4 to 6 follow the sequence, 5 and 6 keep the own queue. */
+  assert(!iwx_awdl_te_follows(3)&&iwx_awdl_te_follows(4)&&iwx_awdl_te_follows(7)&&!iwx_awdl_te_follows(8)&&!iwx_awdl_te_keeps_own(4)&&iwx_awdl_te_keeps_own(5)&&iwx_awdl_te_keeps_own(7)&&!iwx_awdl_te_keeps_own(8));
+  /* 1.1.65: link 1's queue in 6 to 8, windows only up to 6. */
+  assert(!iwx_awdl_te_phy2q(5)&&iwx_awdl_te_phy2q(6)&&iwx_awdl_te_phy2q(8)&&!iwx_awdl_te_phy2q(9)&&iwx_awdl_te_windows(1)&&iwx_awdl_te_windows(6)&&!iwx_awdl_te_windows(7)&&!iwx_awdl_te_windows(8)&&!iwx_awdl_te_windows(0));}
  puts("awdl block ack checks passed");return 0;}
 '''
 with tempfile.TemporaryDirectory() as d:
@@ -169,6 +187,7 @@ send = cpp[cpp.index('IOReturn ItlIwx::iwx_awdl_data_gate'):cpp.index('IOReturn 
 assert send.index('kIOReturnNotReady') < send.index('kIOReturnBusy'), 'A dead context must drop, not wait forever'
 assert 'ieee80211_has_qos(wh) && awdlKind != 4' in cpp and 'IWX_TX_CMD_OFFLD_AMSDU' in cpp, 'A-MSDU stays off the AP data queues and tells the firmware'
 ctx = cpp[cpp.index('iwx_awdl_ctx_remove(struct iwx_softc *sc)\n{'):]
+assert 'iwx_mld_disable_txq(sc, c->own_sta, c->own_tid)' in ctx[:ctx.index('IWX_STA_REMOVE_CMD')] and 'iwx_mld_disable_txq(sc, c->own_sta, IWX_MGMT_TID)' not in cpp, 'Teardown disables the own queue on the TID it was made on (1.1.57)'
 assert ctx.index('iwx_awdl_ba_cmd') < ctx.index('IWX_STA_REMOVE_CMD') and ctx.index('iwx_mld_disable_txq(sc, c->own_sta') < ctx.index('IWX_STA_REMOVE_CMD'), 'Block ack and queues go before their station'
 assert 'static int be201AwdlOwnQueueValue;' in v2 and 'be201_awdl_own_queue' not in (ROOT/'scripts/build-sequoia-macos.sh').read_text(), 'Own queue stays a RAM switch, off at boot'
 ph=cpp[cpp.index('void ItlIwx::iwx_awdl_phy2_task'):cpp.index('void ItlIwx::setAwdlOwnQueue')]
@@ -181,7 +200,7 @@ au=v2[v2.index('void AirportItlwm::startAWDLAuto'):v2.index('bool AirportItlwm::
 assert 'be201_awdl_auto' in au and 'awdlLastBootPanicked()' in au and au.index('awdlLastBootPanicked()')<au.index('be201AwdlVifArm'), 'Off without the flag, and not after a panic'
 for gate in ['AcceptSets','Link','Aw','Radio','Rx','Tx','Data']:
     assert f'be201AwdlVif{gate}Value, 1' in au, gate
-for test in ['OwnQueue','TxHold','Phy2','Phy2Te','Amsdu','CacheOn']:
+for test in ['TxHold','Phy2','Phy2Te','Amsdu','CacheOn']:
     assert f'be201Awdl{test}Value' not in au, 'Test switches stay off: '+test
 task=cpp[cpp.index('void ItlIwx::iwx_awdl_peer_task'):cpp.index('void ItlIwx::awdlPeerCache')]
 assert task.index('iwx_send_cmd_pdu')<task.index('awdlPeerCacheDone') and 'i < p->peer_added' in task, 'Answer only for a station really in the firmware'
@@ -205,10 +224,66 @@ ba=cpp[cpp.index('iwx_rx_tx_ba_notif(struct iwx_softc *sc, struct iwx_rx_packet 
 assert 'ba_res->sta_id != IWX_STATION_ID && !ownAgg' in ba and 'awdlCtx->own_ok += done' in ba, 'Aggregates for the own peer are reclaimed and count as progress'
 assert 'ieee80211_has_qos(wh) && awdlKind != 4 && awdlKind != 3' in cpp, 'The own queue keeps its qid for QoS frames'
 assert 'awdlKind == 3 && sc->sc_awdl_probe.ctx.own_agg' in cpp and 'flags &= ~IWX_TX_FLAGS_CMD_RATE' in cpp, 'Firmware rate only on the aggregating own queue'
-assert 'be201AwdlTxAggValue, 0' not in v2.replace('be201AwdlTxAggValue, 0, ""','') and 'be201AwdlTxAggValue' not in au, 'Aggregation stays off unless a test turns it on'
+assert 'be201AwdlTxAggValue, 0' not in v2.replace('be201AwdlTxAggValue, 0, ""','') and 'be201AwdlTxAggValue, 1' in au, 'Aggregation on with automatic start (1.1.54)'
 assert own.index('IWX_MAC_PM_POWER_TABLE') < own.index('iwx_tvqm_enable_txq') and own.index('IWX_LINK_CONTEXT_MODIFY_QOS_PARAMS | IWX_LINK_CONTEXT_MODIFY_BEACON_TIMING') < own.index('iwx_tvqm_enable_txq'), 'Fixes go in before the queue is made'
 assert 'c->own_held = 0;' in own and 'c->own_redo' in own, 'A changed setting retries a held queue'
-assert 'be201AwdlOwnFixValue' not in au, 'Fixes stay off unless a test turns them on'
+assert 'be201AwdlOwnFixValue, 3' in au and 'be201AwdlOwnQueueValue, 1' in au, 'Own queue and both fixes on with automatic start (1.1.54)'
+assert au.index('awdlLastBootPanicked()') < au.index('be201AwdlOwnQueueValue, 1'), 'Not after a panic either'
+assert 'IWX_AWDL_OWN_QUIET_US' in own and own.index('own_busy_us = now_us') < own.index('const bool moved'), 'Moving waits until the current peer is quiet'
+assert own.index('own_recover_fails < IWX_AWDL_OWN_RECOVER_MAX') < own.index('IWX_AWDL_OWN_RECOVER_US') < own.index('c->own_redo = 1;\n                c->own_want = on;'), 'A held queue is rebuilt after a pause, a bounded number of times'
+assert 'c->own_recover_fails = 0;' in own and 'c->own_ok == c->own_recover_ok_mark' in own, 'Rebuilds that carry frames keep the budget'
+retry = own[own.index('IWX_AWDL_OWN_RETRY_US') - 400:own.index('IWX_AWDL_OWN_RETRY_US') + 200]
+assert 'c->own_want && !c->own_active && !c->own_held && !c->own_err' in retry and 'p->peer_added' in retry and 'awdl_ownq_task' in retry, 'A wanted queue never made is tried again (1.1.56)'
+assert own.index('IWX_AWDL_OWN_RETRY_US') < own.index('if (!!c->own_want == on && !moved'), 'The retry comes before the no-change return'
+rt3=cpp[cpp.index('void ItlIwx::setAwdlSlot'):cpp.index('void ItlIwx::iwx_awdl_phy2_task')]
+assert rt3.index('void ItlIwx::setAwdlSlot') < rt3.index('void ItlIwx::setAwdlRadioTest'), 'Slot input sits before the radio switches'
+assert 'iwx_awdl_phy2_auto(c->seq_chan5, home)' in rt3 and 'IWX_AWDL_PHY2_AUTO_STABLE_US' in rt3, 'Automatic channel holds before the link moves'
+assert 'iwx_awdl_probe_publish(&com)' in rt3[:rt3.index('void ItlIwx::setAwdlRadioTest')], 'Counters are published from the AW tick too (1.1.58)'
+assert 'if (iwx_awdl_te_follows(te))' in rt3 and 'iwx_awdl_phy2_follow(cand, c->slot_next5)' in rt3 and 'te == 3 || iwx_awdl_te_follows(te) ?' in rt3, 'Modes 4 and 5: the link follows the own sequence and opens own-slot windows (1.1.60)'
+assert 'c->slot_next5 = uint8_t((run >> 8) & 0xff)' in rt3 and 'run | (next5 << 8)' in iface, 'The next 5 GHz slot channel goes to the HAL'
+assert 'mode >= 1 && mode <= 8 && (kind == 0 || kind == 2)' in v2 and 'if (!iwx_awdl_te_windows(te) || !ready' in cpp and 'mode | (kind << 8)' in v2, 'Modes 1 to 5 with protection kind 0 or 2 only (1.1.63: kind 1 asserted)'
+rt4 = cpp[cpp.index('void ItlIwx::setAwdlRadioTest'):cpp.index('void ItlIwx::iwx_awdl_phy2_task')]
+assert rt4.index('te &= 0xff;') < rt4.index('if (phy2 == 1)') and 'now_us >= c->te_end_us && conf < IWX_SESSION_PROTECT_CONF_MAX_ID' in rt4, 'The kind changes only between windows'
+assert 'IWX_FW_CTXT_ACTION_ADD, duration, c->te_conf' in rt4 and 'IWX_FW_CTXT_ACTION_REMOVE, 0, c->te_conf' in rt4 and 'IWX_FW_CTXT_ACTION_REMOVE, 0, c->te_conf' in ph2, 'Adds and removes use the latched kind'
+assert '!phy2 && !te && (c->phy2_want || c->te_want)' in rt4 and 'c->own_recover_fails = 0;' in rt4, 'Turning the second channel off gives the own queue a fresh start (1.1.62)'
+assert 'iwx_awdl_peer_agg(sc, uint32_t(index))' in ph2[ph2.index('++c->phy2_switches;'):] and 'own_refreshes' in ph2, 'Mode 5 refreshes the kept peer after a move'
+q6 = ph2[ph2.index('++c->phy2_switches;'):]
+assert 'iwx_awdl_te_phy2q(c->te_want) && c->phy2_chan && c->phy2_qid <= 0' in q6 and 'IWX_AWDL_STA_ID)' in q6, 'Mode 6 makes a queue on the AWDL station once on the second channel (1.1.64)'
+tx6 = cpp[cpp.index('bool awdlPhy2q = false;'):cpp.index('data->awdl_phy2q = awdlPhy2q;')]
+assert 'c->mode == 6 && c->phy2_qid > 0 && (c->solo || (iwx_awdl_te_phy2q(c->te_want) && c->phy2_chan))' in tx6 and tx6.index('IWX_AWDL_TX_MAX_QUEUED') < tx6.index('qid = c->phy2_qid;'), 'Mode 6 frames use it while link 1 is on the second channel, bounded'
+assert tx6.index('qid = c->phy2_qid;') < tx6.index('qid = sc->sc_awdl_probe.ctx.own_qid;') and 'awdlPhy2q = false;' in tx6, 'The own queue still wins for its peer'
+rm6 = cpp[cpp.index('iwx_awdl_ctx_remove(struct iwx_softc *sc)\n{'):]
+assert rm6.index('c->mode == 6 && c->phy2_qid > 0') < rm6.index('struct iwx_sta_remove_cmd cmd = { .sta_id = htole32(IWX_AWDL_STA_ID) }'), 'Its queue goes before the AWDL station'
+assert 'sc->sc_awdl_probe.ctx.phy2_qid > 0 &&' in cpp and cpp.count('ctx.phy2_qid = -1;') >= 2, 'Watchdog and resets know it'
+# 1.1.66: AWDL on its own without an infrastructure network.
+so = cpp[cpp.index('iwx_awdl_solo_add(struct iwx_softc *sc)\n{'):cpp.index('iwx_awdl_ctx_add(struct iwx_softc *sc, struct iwx_node *in)\n{')]
+assert so.index('iwx_awdl_solo_idle(sc)') < so.index('iwx_phy_ctxt_update(sc, &sc->sc_phyctxt[1]') < so.index('c->phy2_chan = chan;') < so.index('IWX_FW_CTXT_ACTION_ADD, p->tx.self, true, false') < so.index('IWX_FW_CTXT_ACTION_ADD, 0, 0)') < so.index('IWX_LINK_CONTEXT_MODIFY_ACTIVE | IWX_LINK_CONTEXT_MODIFY_RATES_INFO, 1') < so.index('IWX_STA_CONFIG_CMD') < so.index('IWX_AWDL_STA_ID);') < so.index('IWX_FW_CTXT_ACTION_MODIFY, p->tx.self, true, true'), 'Solo: second PHY on the AWDL channel, MAC, link, active, station, its queue, association'
+assert 'c->solo_failed = 1;' in so and 'tx.tripped = 1' not in so and 'iwx_awdl_ctx_remove(sc);' in so, 'A solo failure stops solo for the boot without tripping AWDL'
+assert '!iwx_awdl_solo_idle(sc)) { iwx_awdl_ctx_remove(sc);' in so, 'Leaving idle mid-way removes what was made'
+au = cpp[cpp.index('iwx_mld_auth(struct iwx_softc *sc, struct iwx_node *in)\n{'):]
+assert au.index('if (sc->sc_awdl_probe.ctx.solo) {') < au.index('iwx_awdl_ctx_remove(sc);') < au.index('IWX_MLD_STEP_MAC_ADD'), 'A join removes solo before the station MAC'
+idle = cpp[cpp.index('static bool iwx_awdl_solo_idle'):cpp.index('void ItlIwx::setAwdlSlot')]
+assert 'IEEE80211_S_INIT' in idle and 'IEEE80211_S_SCAN' in idle and 'IWX_FLAG_STA_ACTIVE' in idle, 'Idle: no association and none starting'
+sl = cpp[cpp.index('void ItlIwx::setAwdlSlot'):cpp.index('void ItlIwx::setAwdlRadioTest')]
+assert 'IWX_AWDL_SOLO_IDLE_US' in sl and '!c->solo_failed' in sl and 'awdl_solo_task' in sl, 'The AW tick starts solo after the idle time'
+rtx = cpp[cpp.index('void ItlIwx::setAwdlRadioTest'):cpp.index('void ItlIwx::iwx_awdl_phy2_task')]
+assert rtx.index('if (c->solo) {') < rtx.index('if (phy2 == 1)'), 'No second channel moves while solo'
+assert 'sc->sc_awdl_probe.ctx.solo && sc->sc_awdl_probe.ctx.phy2_qid > 0 && !memcmp(wh->i_addr3, iwx_awdl_bssid, 6)' in cpp, 'Solo AWDL frames pass the no-AP-queue drop'
+assert 'awdlSolo && min_ridx < iwx_rval2ridx(12)' in cpp and '!awdlSolo &&' in cpp, 'Solo AWDL frames never use CCK or the AP-width fixed rates'
+lk = cpp[cpp.index('iwx_awdl_ctx_link_cmd(struct iwx_softc *sc, struct iwx_node *in, uint32_t action,'):cpp.index('void ItlIwx::iwx_awdl_solo_task')]
+assert 'sc->sc_awdl_probe.ctx.solo ? sc->sc_awdl_probe.ctx.phy2_chan != 0 : in && in->in_phyctxt' in lk and 'cmd.bi = htole32(100);' in lk, 'Solo link: second PHY, fixed rates, beacon timing and EDCA'
+rm = cpp[cpp.index('iwx_awdl_ctx_remove(struct iwx_softc *sc)\n{'):]
+rm = rm[:rm.index('\n}\n')]
+assert rm.index('IWX_FW_CTXT_ACTION_REMOVE, 0, 0)') < rm.index('c->phy2_chan = 0;') and rm.index('IWX_FW_CTXT_ACTION_REMOVE, nullptr') < rm.index('c->solo = 0;'), 'The link keeps naming its real PHY context until it is removed'
+assert 'p->ctx.solo ? !iwx_awdl_solo_idle(sc)' in cpp and '(ic->ic_state == IEEE80211_S_RUN || sc->sc_awdl_probe.ctx.solo)' in cpp, 'Peers and receive work while solo'
+m5 = ph2[ph2.index('iwx_awdl_te_keeps_own(c->te_want) && c->own_active'):ph2.index('IWX_LINK_CONTEXT_MODIFY_ACTIVE, 0')]
+assert 'iwx_flush_sta_tids(sc, c->own_sta, 0xffff)' in m5 and 'own_kept_moves' in m5 and m5.index('own_kept_moves') < m5.index('iwx_awdl_own_release(sc)'), 'Mode 5 flushes and keeps the own queue; other modes still release it (1.1.61)'
+assert 'seq5 |= c5 << 8' in iface and 'c5 == (seq5 & 0xff)' in iface, 'Two different 5 GHz channels go to the HAL'
+assert 'te == 3 || iwx_awdl_te_follows(te) ?' in rt3 and 'iwx_awdl_te_own_due' in rt3 and 'c->slot_run = 0;' in rt3 and 'c->te_end_us' in rt3, 'Mode 3: own slots, one window per slot start'
+aw=iface[iface.index('void AirportItlwmAWDLInterface::awTimerFired'):]
+aw=aw[:aw.index('\n}\n')]
+assert aw.index('const uint32_t slot =') < aw.index('setAWDLSlot') < aw.index('setAWDLRadioTest'), 'Slot first, then the switches, on every tick'
+assert 'self->awChannels[(slot + 15) % 16] != chan' in aw, 'A run starts where the previous slot had another channel'
 assert 'iwx_add_task(sc, systq, &sc->awdl_umi_task)' in cpp and 'controller->awdlUmiDone' in cpp[cpp.index('void ItlIwx::iwx_awdl_umi_task'):cpp.index('void ItlIwx::sendAwdlUmi')], 'Results leave from a task: the status path can send again'
 assert 'data->awdl_umi = 0;' in cpp and 'if (txd->awdl_umi)' in cpp, 'Only a frame marked at queueing reports a result'
 st=v2[v2.index('void AirportItlwm::stopAWDLInterface'):]

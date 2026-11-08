@@ -7,7 +7,7 @@ Intel BE201（PCI 8086:7740）在 macOS Sequoia 15.7.8 上的 Wi-Fi 与蓝牙工
 | 路径 | 内容 |
 |---|---|
 | `work/airportbz` | Wi-Fi 驱动 AirportItlwm 源码，从 AirportBZ 分出，保留了上游历史。版本说明见其中的 `BE201-AWDL-*.md` |
-| `work/awdl-held-1153` | 当前版本 1.1.53 的打包、检查和实验工具 |
+| `work/awdl-speed-1154` | 当前版本 1.1.54 的打包、检查和实验工具（`work/awdl-held-1153` 是上一版） |
 | `work/BE201-CURRENT.md` | 按时间记录的测试结果和结论 |
 | `work/awdl`、`work/ax`、`work/research` | AWDL 和 Intel 固件接口的研究脚本与参考代码 |
 | `work/be201` | BE201 蓝牙固件驱动源码 |
@@ -29,7 +29,7 @@ Intel BE201（PCI 8086:7740）在 macOS Sequoia 15.7.8 上的 Wi-Fi 与蓝牙工
 ## 编译
 
 ```bash
-MAC_KERNEL_SDK="$PWD/work/airportbz-deps/MacKernelSDK" BUILD_OUTPUT="$PWD/work/be201-awdl-held53-build" work/airportbz/scripts/build-sequoia-macos.sh
+MAC_KERNEL_SDK="$PWD/work/airportbz-deps/MacKernelSDK" BUILD_OUTPUT="$PWD/work/be201-awdl-speed54-build" bash work/airportbz/scripts/build-sequoia-macos.sh
 ```
 
-版本号默认是 1.1.53，可以用 `BE201_BUILD_VERSION` 修改。编译后用 `work/awdl-held-1153/run_checks.py` 运行离线测试，再用同目录的 `package.py` 生成 `outputs/` 下的工具包。
+版本号默认是 1.1.54，可以用 `BE201_BUILD_VERSION` 修改。编译后用 `work/awdl-speed-1154/run_checks.py` 运行离线测试，再用同目录的 `package.py` 生成 `outputs/` 下的工具包。

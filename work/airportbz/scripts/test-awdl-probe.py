@@ -63,6 +63,6 @@ with tempfile.TemporaryDirectory() as d:
 s=(ROOT/'itlwm/hal_iwx/ItlIwx.cpp').read_text()
 i=s.index('iwx_mld_mac_config_cmd(struct iwx_softc *sc, struct iwx_node *in,');fn=s[i:s.index('iwx_mld_link_config_cmd(struct iwx_softc *sc',i)]
 assert 'if (assoc && (sc->sc_awdl_probe.mode == 1 || sc->sc_awdl_probe.mode == 2))' in fn
-h=s.index('sc->sc_awdl_probe.mode && ic->ic_state == IEEE80211_S_RUN');assert s.index('Account for padding following the frame header.')<h<s.index('memset(&rxi, 0, sizeof(rxi));',h)
+h=s.index('sc->sc_awdl_probe.mode && (ic->ic_state == IEEE80211_S_RUN || sc->sc_awdl_probe.ctx.solo)');assert s.index('Account for padding following the frame header.')<h<s.index('memset(&rxi, 0, sizeof(rxi));',h)
 assert 'sc->sc_awdl_probe.mode = awdlProbe <= 2 ? awdlProbe : 0;' in s
 print('PASS: filter widens only with the boot argument after association; probe runs before the stack; invalid modes are off')
