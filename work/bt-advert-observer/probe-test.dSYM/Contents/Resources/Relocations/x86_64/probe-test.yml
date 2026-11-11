@@ -1,5 +1,0 @@
----
-triple:          'x86_64-apple-darwin'
-binary-path:     'work/bt-advert-observer/probe-test'
-relocations:     []
-...

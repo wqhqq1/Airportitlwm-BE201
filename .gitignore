@@ -1,37 +1,45 @@
 .DS_Store
+__pycache__/
+*.pyc
 
 # Deployable kits: kexts, EFI backups, configs with machine identity, runtime logs
 /outputs/
 
-# Third-party trees and build output (rebuildable)
-/work/airportbz-deps/
-/work/*-reference/
-/work/*-build/
-/work/*.log
+# Dependencies, build output and reference repositories (see README.md)
+/deps/
+/build/
+/reference/
 
-# Other work folders: keep source, scripts and notes only.
-# Logs, captures, plists, json dumps and object files stay local (device data).
-/work/*/**
-!/work/*/**/
-!/work/*/**/*.c
-!/work/*/**/*.cpp
-!/work/*/**/*.h
-!/work/*/**/*.hpp
-!/work/*/**/*.m
-!/work/*/**/*.py
-!/work/*/**/*.sh
-!/work/*/**/*.command
-!/work/*/**/*.md
-!/work/*/**/*.yml
+# Wi-Fi: the driver keeps its own rules in wifi/airportbz/.gitignore; test results stay local.
+/wifi/kit/checks.json
+/wifi/kit/tests/
 
-# The driver keeps its own rules in work/airportbz/.gitignore
-!/work/airportbz/**
+# Bluetooth: sources, build scripts, Info plists, licences and the firmware only.
+# Test dumps and generated patch pages (they hold device data or Apple code) stay local.
+/bluetooth/**
+!/bluetooth/**/
+!/bluetooth/**/*.c
+!/bluetooth/**/*.cpp
+!/bluetooth/**/*.h
+!/bluetooth/**/*.hpp
+!/bluetooth/**/*.py
+!/bluetooth/**/*.md
+!/bluetooth/release.json
+!/bluetooth/*/Info.plist
+!/bluetooth/*/Info.template.plist
+!/bluetooth/*/LICENSE
+!/bluetooth/firmware/fw/*
+/bluetooth/**/*.dSYM/
 
-# The Wi-Fi kit sources are all tracked; its test results are not.
-!/work/wifi-kit/**
-/work/wifi-kit/checks.json
-/work/wifi-kit/tests/
-/work/wifi-kit/__pycache__/
-
-# Vendored third-party Python packages
-/work/awdl/python-deps/
+# Research: scripts, sources and notes only; dumps, captures, plists and json stay local.
+/research/**
+!/research/**/
+!/research/**/*.c
+!/research/**/*.cpp
+!/research/**/*.h
+!/research/**/*.hpp
+!/research/**/*.m
+!/research/**/*.py
+!/research/**/*.sh
+!/research/**/*.md
+/research/**/*.dSYM/
