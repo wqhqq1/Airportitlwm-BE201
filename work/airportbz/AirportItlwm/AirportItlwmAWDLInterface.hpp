@@ -155,11 +155,24 @@ private:
     uint32_t dataTx = 0, dataTxDropped = 0, dataTxOversize = 0, dataRx = 0, dataRxDropped = 0, dataRxBad = 0, dataRxRetry = 0;
     uint8_t rxEthernet[1600] = {};
     void enableData();
+    uint32_t runningRestores = 0;
+    void restoreRunning();
+    /* What the family's data mode monitor counts, reported as native drivers do (1.1.78). */
+    uint8_t statsBuf[0x700] = {};
+    uint32_t statsTxMark = 0, statsRxMark = 0, statsReports = 0;
+    int statsLast = 0;
+    void reportDataStats();
     void inputDataFrame(const uint8_t *, size_t);
     bool txWaiting = false;
     uint32_t dataTxCalls = 0;
     UInt32 transmit(IOSkywalkPacket *const *, UInt32);
     AirportItlwmLowLatencyInterface *companion = nullptr;
+    // Peers that registered real-time group traffic (ensemble, sidecar): their peer cache requests get answers.
+    struct RtgPeer { uint8_t mac[6]; uint64_t untilNs; bool cached; };
+    RtgPeer rtgPeers[4] = {};
+    uint32_t rtgRegistrations = 0, rtgCacheAnswers = 0, rtgCacheLate = 0;
+    void noteRtgRegistration(const uint8_t *mac, bool active);
+    bool rtgCacheWanted(const uint8_t *mac, uint32_t op);
 public:
     // Queue action, on the Wi-Fi work loop.
     static UInt32 txSubmitAction(OSObject *, IOSkywalkTxSubmissionQueue *, IOSkywalkPacket *const *, UInt32, void *);

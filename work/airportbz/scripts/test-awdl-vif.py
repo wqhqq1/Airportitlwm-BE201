@@ -33,12 +33,12 @@ constexpr unsigned APPLE80211_ADDR_LEN=6;
 struct apple80211_virt_if_create_data {uint32_t version=0;uint8_t mac[6]={2,1,2,3,4,5};uint16_t unk1=0;uint32_t role=6;uint8_t bsd_name[16]={};};
 size_t strlcpy(char *d,const char *s,size_t n){auto z=strlen(s);if(n){auto k=std::min(z,n-1);memcpy(d,s,k);d[k]=0;}return z;}
 constexpr int APPLE80211_VERSION=1, APPLE80211_VIF_AWDL=6,kIOServiceRequired=1,kIOServiceSynchronous=2;
-void clock_get_uptime(uint64_t *t){*t=5000000;}void absolutetime_to_nanoseconds(uint64_t a,uint64_t *n){*n=a;}
+void clock_get_uptime(uint64_t *t){*t=5000000;}void absolutetime_to_nanoseconds(uint64_t a,uint64_t *n){*n=a;}uint64_t mach_absolute_time(){return 5000000;}
 class IOSkywalkPacket;
 struct MockPacket {uint8_t data[2048];unsigned offset=0;unsigned length=0;bool prepared=true;};
 inline MockPacket *mp(const IOSkywalkPacket *p){return reinterpret_cast<MockPacket*>(const_cast<IOSkywalkPacket*>(p));}
 unsigned txEnabled=0,txCompEnabled=0,rxCompEnabled=0,txDeq=0,txCompleted=0,rxEnqueued=0,poolLive=0;int poolResult=0,rxEnqueueResult=0,prepareResult=0,setLengthResult=0;std::vector<MockPacket*> rxSeen;
-constexpr unsigned IFF_RUNNING=0x40;unsigned ifRunning=0;using ifnet_t=void*;int ifnet_set_flags(ifnet_t,unsigned v,unsigned){ifRunning=v;return 0;}using ifnet_offload_t=unsigned;unsigned offloadCalls=0;int ifnet_set_offload(ifnet_t,ifnet_offload_t v){assert(!v);++offloadCalls;return 0;}
+constexpr unsigned IFF_RUNNING=0x40;constexpr unsigned IFF_UP=0x1;unsigned ifRunning=0,ifFlags=0,ifIoctls=0;bool ifIoctlRuns=true;using ifnet_t=void*;int ifnet_set_flags(ifnet_t,unsigned v,unsigned m){ifRunning=v;ifFlags=(ifFlags&~m)|(v&m);return 0;}unsigned ifnet_flags(ifnet_t){return ifFlags;}struct ifreq{char ifr_name[16];short ifr_flags;};constexpr unsigned long SIOCSIFFLAGS=0x80206910;int ifnet_ioctl(ifnet_t,int,unsigned long c,void *a){assert(c==SIOCSIFFLAGS&&a&&(ifFlags&IFF_UP)&&(static_cast<ifreq*>(a)->ifr_flags&IFF_UP));++ifIoctls;if(ifIoctlRuns)ifFlags|=IFF_RUNNING;return 0;}extern "C" int be201UpdateInterfaceDataStats(void*,void*) __asm__("__ZN23IO80211SkywalkInterface24updateInterfaceDataStatsEP36apple80211_data_path_interface_stats");unsigned statsCalls=0,statsTx=0,statsRx=0;int be201UpdateInterfaceDataStats(void*,void*b){++statsCalls;memcpy(&statsTx,(char*)b+8,4);memcpy(&statsRx,(char*)b+0x18,4);return 0;}using ifnet_offload_t=unsigned;unsigned offloadCalls=0;int ifnet_set_offload(ifnet_t,ifnet_offload_t v){assert(!v);++offloadCalls;return 0;}
 enum IO80211LinkState { kIO80211NetworkLinkUndefined,kIO80211NetworkLinkDown,kIO80211NetworkLinkUp };
 struct ether_addr { uint8_t octet[6]; };
 unsigned lastPoolFlags=99;
@@ -93,7 +93,7 @@ class AirportItlwm:public IO80211Controller {public:
  void registerAWDLArmControl();static bool awdlVifCapabilityArmed();static uint32_t awdlVifPoolFlags();static bool awdlVifAcceptSets();static bool awdlVifLinkAllowed();static bool awdlVifAwAllowed();
  static bool awdlUmiOn();static bool awdlLlwOn();void sendAWDLUmi(const uint8_t*p,const uint8_t*t,size_t n){memcpy(umiPeer,p,6);umiTlvs=t;umiLen=n;++umiSends;}uint8_t umiPeer[6]={};const uint8_t*umiTlvs=nullptr;size_t umiLen=0;unsigned umiSends=0;void awdlUmiDone(const uint8_t*,bool);
  IOReturn createLowLatencyInterface(AirportItlwmAWDLInterface*,const ether_addr&,char*,size_t);static IOReturn createLowLatencyInterfaceGated(OSObject*,void*,void*,void*,void*);AirportItlwmLowLatencyInterface *llwInterface=nullptr;bool llwCreating=false,llwFailed=false;
- void awdlTxRoom();void awdlPeerCache(const uint8_t*,uint32_t){}void awdlPeerCacheDone(const uint8_t*,bool);static bool awdlCacheOn();void startAWDLAuto();static bool awdlLastBootPanicked();static bool awdlOwnQueueWanted();static bool awdlTxAggWanted();static uint32_t awdlOwnFixWanted();void setAWDLOwnQueue(bool,bool,uint32_t){} static void awdlRadioTest(bool*,uint32_t*,uint32_t*,bool*);void setAWDLSlot(uint32_t,uint32_t,uint32_t){}void setAWDLRadioTest(bool,uint32_t,uint32_t,bool){} bool amsduReadyMock=false;unsigned amsduCalls=0,amsduLast=0;IOReturn amsduResult=0;bool awdlAmsduReady(const uint8_t*){return amsduReadyMock;}IOReturn sendAWDLAmsdu(const uint8_t*const*,const size_t*,unsigned n){++amsduCalls;amsduLast=n;return amsduResult;} static bool awdlVifRadioAllowed();static bool awdlVifRxAllowed();static bool awdlVifTxAllowed();static bool awdlVifDataAllowed();IOReturn sendAWDLData(const uint8_t*,size_t);IOReturn setAWDLTemplate(bool,const uint8_t*,size_t);IOReturn enableAWDLTransmit();
+ void awdlTxRoom();void awdlPeerCache(const uint8_t*,uint32_t){}void awdlPeerCacheDone(const uint8_t*,bool);static bool awdlCacheOn();static bool awdlCacheRtgOn();void startAWDLAuto();static bool awdlLastBootPanicked();static bool awdlOwnQueueWanted();static bool awdlTxAggWanted();static uint32_t awdlOwnFixWanted();void setAWDLOwnQueue(bool,bool,uint32_t){} static void awdlRadioTest(bool*,uint32_t*,uint32_t*,bool*);void setAWDLSlot(uint32_t,uint32_t,uint32_t){}void setAWDLRadioTest(bool,uint32_t,uint32_t,bool){}static uint32_t awdlRocWanted();uint32_t rocSet=0;void setAWDLRoc(uint32_t v){rocSet=v;} bool amsduReadyMock=false;unsigned amsduCalls=0,amsduLast=0;IOReturn amsduResult=0;bool awdlAmsduReady(const uint8_t*){return amsduReadyMock;}IOReturn sendAWDLAmsdu(const uint8_t*const*,const size_t*,unsigned n){++amsduCalls;amsduLast=n;return amsduResult;} static bool awdlVifRadioAllowed();static bool awdlVifRxAllowed();static bool awdlVifTxAllowed();static bool awdlVifDataAllowed();IOReturn sendAWDLData(const uint8_t*,size_t);IOReturn setAWDLTemplate(bool,const uint8_t*,size_t);IOReturn enableAWDLTransmit();
  void inputAWDLActionFrame(const uint8_t *,size_t,uint8_t,int,uint32_t);
  IOReturn requestAWDLMonitor(const ether_addr &);
  bool awdlSyncNext(uint16_t*,uint32_t*){return false;}
@@ -257,7 +257,7 @@ int main(){
  // Unarmed, as on every boot: refused before anything is allocated, and no capability advertised.
  assert(!AirportItlwm::awdlVifCapabilityArmed());
  assert(controller.createAWDLInterface(&req)==kIOReturnUnsupported&&!controller.awdlInterface&&step==0&&controller.awdlUnarmedRefusals==1);
- controller.registerAWDLArmControl();controller.registerAWDLArmControl();assert(oidRegistered==19);
+ controller.registerAWDLArmControl();controller.registerAWDLArmControl();assert(oidRegistered==21);
  assert(AirportItlwm::awdlVifPoolFlags()==0);be201AwdlVifPoolFlagsValue=3;assert(AirportItlwm::awdlVifPoolFlags()==1);be201AwdlVifPoolFlagsValue=0;
  be201AwdlVifArm=1;assert(AirportItlwm::awdlVifCapabilityArmed());
  assert(controller.createAWDLInterface(&req)==0&&lastPoolFlags==0&&be201AwdlVifArm==0&&controller.awdlAttempts==1&&AirportItlwm::awdlVifCapabilityArmed()&&controller.awdlInterface&&!strcmp(reinterpret_cast<char*>(req.bsd_name),"awdl0"));
@@ -427,12 +427,20 @@ int main(){
    t->setRunningState(true);t->linkTimer->fire();
    assert(t->dataActive&&txEnabled==1&&txCompEnabled==1&&rxCompEnabled==1&&txDeq==1&&t->linkStatus==3&&ifRunning==IFF_RUNNING&&t->nativeRunning==1);
    assert(t->setRunningState(true)==0);
+   /* Wi-Fi off and on clears RUNNING while awdl0 stays up: link up restores it; down or not up leaves it (1.1.74). */
+   ifnet_set_flags(nullptr,0,IFF_RUNNING);t->nativeRunning=0;ifnet_set_flags(nullptr,0,IFF_UP);t->restoreRunning();assert(!(ifFlags&IFF_RUNNING)&&!t->properties.count("ItlwmAwdlRunningRestores"));
+   ifnet_set_flags(nullptr,IFF_UP,IFF_UP);t->setLinkState(kIO80211NetworkLinkDown,0);t->restoreRunning();assert(!(ifFlags&IFF_RUNNING));
+   assert(t->setLinkState(kIO80211NetworkLinkUp,0)&&(ifFlags&IFF_RUNNING)&&t->nativeRunning==1&&t->linkStatus==3&&t->properties["ItlwmAwdlRunningRestores"]==1);
+   t->restoreRunning();assert(t->properties["ItlwmAwdlRunningRestores"]==1);
    // Every submitted packet is completed, sent or dropped, and counted once.
    assert(AirportItlwmAWDLInterface::txSubmitAction(t,nullptr,list,1,nullptr)==1&&controller.mockHAL.sent==1&&controller.mockHAL.lastSent==60&&txCompleted==1&&t->dataTx==1);
    controller.mockHAL.sendResult=-1;assert(AirportItlwmAWDLInterface::txSubmitAction(t,nullptr,list,1,nullptr)==1&&txCompleted==2&&t->dataTxDropped==1);
    /* A full queue keeps the packet: nothing completed, nothing dropped, and one wake per wait. */
    controller.mockHAL.sendResult=kIOReturnBusy;{unsigned d=txDeq;assert(AirportItlwmAWDLInterface::txSubmitAction(t,nullptr,list,1,nullptr)==0&&txCompleted==2&&t->dataTxDropped==1&&t->txWaiting);t->txRoom();assert(txDeq==d+1&&!t->txWaiting);t->txRoom();assert(txDeq==d+1);}controller.mockHAL.sendResult=-1;
   controller.mockHAL.sendResult=0;
+   /* 1.1.78: what went out and came in since the last report reaches the family; nothing new, no report. */
+   {unsigned c0=statsCalls;t->reportDataStats();assert(statsCalls==c0+1&&statsTx==t->dataTx&&statsRx==t->dataRx);t->reportDataStats();assert(statsCalls==c0+1);
+    assert(AirportItlwmAWDLInterface::txSubmitAction(t,nullptr,list,1,nullptr)==1);t->reportDataStats();assert(statsCalls==c0+2&&statsTx==1&&statsRx==0);}
    // Peer data for this address reaches the stack as Ethernet; others and unknown formats do not.
    uint8_t f[80]={};f[0]=0x08;memcpy(f+4,mac.octet,6);f[10]=2;f[15]=7;memcpy(f+16,iwx_awdl_bssid,6);const uint8_t l_[10]={0xaa,0xaa,3,0,0x17,0xf2,8,0,3,4};memcpy(f+24,l_,10);f[38]=0x86;f[39]=0xdd;memset(f+40,0x55,40);
    controller.awdlInterface=t;controller.awdlStopping=false;controller.awdlCreating=false;
@@ -479,7 +487,7 @@ int main(){
     // Its own unique id, not the address awdl0 already uses.
     {ifnet_init_eparams ep={};assert(l->initBSDInterfaceParameters(&ep,nullptr)==0&&ep.uniqueid_len==8&&*static_cast<const void*const*>(ep.uniqueid)==l&&controller.properties["ItlwmAwdlLlwUniqueId"]==1);}
     lastLlw->attachBSD();l->linkTimer->fire();
-    assert(l->dataActive&&l->nativeRunning==1&&l->linkStatus==3&&t->companion==l&&l->mockCompanionId==t->getInterfaceId()&&controller.properties["ItlwmAwdlLlwStage"]==6);
+    assert(l->dataActive&&l->nativeRunning==0&&ifIoctls==1&&(ifFlags&IFF_RUNNING)&&!controller.properties.count("ItlwmAwdlLlwUpFallback")&&l->linkStatus==3&&t->companion==l&&l->mockCompanionId==t->getInterfaceId()&&controller.properties["ItlwmAwdlLlwStage"]==6);
     // What llw0 sends from, it receives on. Neighbor discovery reaches both; the rest stays on awdl0.
     uint8_t rx[120]={};rx[0]=0x08;memcpy(rx+4,mac.octet,6);rx[10]=2;rx[15]=7;memcpy(rx+16,iwx_awdl_bssid,6);memcpy(rx+24,l_,10);rx[38]=0x86;rx[39]=0xdd;rx[40]=0x60;rx[40+6]=17;
     rx[40+42]=0xc1;rx[40+43]=0x10;

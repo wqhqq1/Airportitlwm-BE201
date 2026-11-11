@@ -59,6 +59,8 @@ public:
     virtual void setAwdlOwnQueue(bool, bool, uint32_t) {}
     virtual void setAwdlSlot(uint32_t, uint32_t, uint32_t) {}
     virtual void setAwdlRadioTest(bool, uint32_t, uint32_t, bool) {}
+    virtual void setAwdlRoc(uint32_t) {}
+    virtual bool awdlBulkActive() { return false; }
     virtual bool awdlAmsduReady(const uint8_t *) { return false; }
     virtual void awdlPeerCache(const uint8_t *, uint32_t) {}
     virtual void sendAwdlUmi(const uint8_t *, const uint8_t *, size_t) {}

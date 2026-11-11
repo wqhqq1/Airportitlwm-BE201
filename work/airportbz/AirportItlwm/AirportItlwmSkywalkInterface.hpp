@@ -460,6 +460,14 @@ private:
     bool scanPending;
     bool scanCompleted;
     bool scanSkipCompletion;
+    /*
+     * 1.1.79: while AWDL carries bulk data, a background scan is answered from the cache 300 ms later instead of taking
+     * the radio off channel; one real scan is still let through every 30 s. 2026-11-10 16:00:03-16:00:11: 22 scans back
+     * to back during an AirDrop, and the transfer stalled.
+     */
+    bool wclScanDeferred;
+    uint64_t wclLastRealScanUs;
+    uint32_t wclScanDeferredCount;
     uint32_t wclScanReqCount;
     uint32_t wclScanRejected;
     /*

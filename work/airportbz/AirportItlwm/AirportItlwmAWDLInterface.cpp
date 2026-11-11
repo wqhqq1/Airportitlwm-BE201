@@ -8,6 +8,8 @@
 #define _IOSKYWALKPACKETBUFFERPOOL_H
 #endif
 #include <skywalk/packet/os_packet.h>
+#include <sys/sockio.h>
+#include <net/if.h>
 #include <IOKit/skywalk/IOSkywalkPacketQueue.h>
 #define super IO80211AWDLProtocol
 OSDefineMetaClassAndStructors(AirportItlwmAWDLInterface, IO80211AWDLProtocol)
@@ -467,6 +469,63 @@ void AirportItlwmAWDLInterface::enableData()
     setProperty("ItlwmAwdlDataReady", true);
 }
 
+/*
+ * Turning Wi-Fi off and on clears IFF_RUNNING on awdl0 while it stays up, and the native path sets it again from
+ * enableDatapath. Here the data path stays active from the first link-up, so nothing set it again: every AWDL
+ * connection then failed at once with "Network is down" (AirDrop QUIC on 2026-11-10 12:10-12:12). With the family's
+ * link up and the data path active, the interface is running again, as native reports it (1.1.74).
+ */
+/*
+ * IO80211SkywalkInterface::updateInterfaceDataStats(apple80211_data_path_interface_stats *), exported by the family and
+ * imported by AppleBCMWLAN; a private virtual (slot 0xe28) in these headers, so its base body is named directly. It adds
+ * the struct's counters to the peer manager: +0x08 to the transmitted packets and +0x18 to the received packets that
+ * monitorAWDLDataMode compares each AW. The struct is read up to 0x640 (four 0x140 latency bins from 0x140).
+ */
+extern "C" int be201UpdateInterfaceDataStats(void *self, void *stats)
+    __asm__("__ZN23IO80211SkywalkInterface24updateInterfaceDataStatsEP36apple80211_data_path_interface_stats");
+
+/*
+ * This data path is not the family's flow queues, so its packets were never counted: during a 2.3 GB AirDrop the
+ * family logged "In AW: Tx:0 Rx:0", went Idle, then Low Power ([149 0 149 0 0 0 0 0 6 0 149 ...], three slots on
+ * 149), and the transfer stalled after a while (2026-11-10 15:48-15:50). Report what went out and came in since the
+ * last report, so the family keeps the data schedule while data flows (1.1.78). Called before each AW event (1.1.81):
+ * monitorAWDLDataMode needs at least 8 packets between two checks (initParamsToDefaults: 0x3ea4 = 8, every 8 AWs).
+ */
+void AirportItlwmAWDLInterface::reportDataStats()
+{
+    if (!dataActive || !started || !registered)
+        return;
+    const uint32_t tx = dataTx - statsTxMark, rx = dataRx - statsRxMark;
+    if (!tx && !rx)
+        return;
+    statsTxMark = dataTx;
+    statsRxMark = dataRx;
+    memset(statsBuf, 0, sizeof(statsBuf));
+    memcpy(statsBuf + 0x08, &tx, sizeof(tx));
+    memcpy(statsBuf + 0x18, &rx, sizeof(rx));
+    statsLast = be201UpdateInterfaceDataStats(this, statsBuf);
+    if (!(statsReports++ & 63) || statsLast) {
+        setProperty("ItlwmAwdlDataStatsReports", statsReports, 32);
+        setProperty("ItlwmAwdlDataStatsResult", static_cast<uint32_t>(statsLast), 32);
+    }
+}
+
+void AirportItlwmAWDLInterface::restoreRunning()
+{
+    auto ifp = reinterpret_cast<ifnet_t>(getBSDInterface());
+    if (!dataActive || !started || !registered || !ifp)
+        return;
+    const auto flags = ifnet_flags(ifp);
+    if (!(flags & IFF_UP) || (flags & IFF_RUNNING))
+        return;
+    if (IO80211VirtualInterface::linkState() != kIO80211NetworkLinkUp)
+        return;
+    reportLinkStatus(3, 0x80);
+    ifnet_set_flags(ifp, IFF_RUNNING, IFF_RUNNING);
+    IO80211VirtualInterface::setRunningState(true);
+    setProperty("ItlwmAwdlRunningRestores", ++runningRestores, 32);
+}
+
 void AirportItlwmAWDLInterface::takeTemplate(bool mif, const uint8_t *request, size_t lengthOffset, size_t pointerOffset)
 {
     uint32_t length = 0;
@@ -567,6 +626,8 @@ void AirportItlwmAWDLInterface::awTimerFired(OSObject *owner, IOTimerEventSource
     const uint32_t number = self->awNumber;
     self->awNumber += self->awSteps;
     const uint32_t slot = (number / self->awSteps) % 16;
+    if (slot == 0)
+        self->restoreRunning();
     {
         // This Mac's own sequence, as the family set it: the slot starting now, the run of that channel's slots that
         // starts here (0 inside a run), and the 5 GHz channel the sequence uses. On a hotspot on 149 it was
@@ -608,6 +669,7 @@ void AirportItlwmAWDLInterface::awTimerFired(OSObject *owner, IOTimerEventSource
         uint32_t phy2Test = 0, teTest = 0;
         AirportItlwm::awdlRadioTest(&holdTest, &phy2Test, &teTest, &amsduTest);
         awdlController->setAWDLRadioTest(holdTest, phy2Test, teTest, amsduTest);
+        awdlController->setAWDLRoc(AirportItlwm::awdlRocWanted());
     }
     uint64_t now;
     clock_get_uptime(&now);
@@ -620,6 +682,13 @@ void AirportItlwmAWDLInterface::awTimerFired(OSObject *owner, IOTimerEventSource
     memcpy(event + 0x18, &version, sizeof(version));
     memcpy(event + 0x1c, &self->awChannels[slot], sizeof(uint32_t));
     memcpy(event + 0x20, &self->awFlags[slot], sizeof(uint32_t));
+    /*
+     * The family checks AWDL traffic on this event when the AW number is a multiple of 8 (every other slot here, with
+     * four AWs a slot), and takes its snapshot right after. Reported only at slot 0, most checks saw "Prev Tx:0 Rx:0"
+     * mid-transfer: Idle, back to Data, Idle again, then Low Power, and a 2026-11-10 17:12:57 AirDrop stopped at
+     * 17:13:16 (1.1.80). Report before every event, so each check counts what moved since the last one (1.1.81).
+     */
+    self->reportDataStats();
     self->postMessage(kAwStartMessage, event, sizeof(event), false);
     if ((slot == 0) && !(number % (self->awSteps * 16 * 16)))
         self->setProperty("ItlwmAwdlAwStarts", number / self->awSteps + 1, 32);
@@ -644,7 +713,10 @@ SInt32 AirportItlwmAWDLInterface::setRunningState(bool value)
 IO80211LinkState AirportItlwmAWDLInterface::linkState() { return linkActive ? IO80211VirtualInterface::linkState() : kIO80211NetworkLinkDown; }
 bool AirportItlwmAWDLInterface::setLinkState(IO80211LinkState state, unsigned options) {
     recordRequest(state == kIO80211NetworkLinkUp ? 1004 : 1005);
-    return (linkActive || state == kIO80211NetworkLinkDown) && IO80211VirtualInterface::setLinkState(state, options);
+    const bool done = (linkActive || state == kIO80211NetworkLinkDown) && IO80211VirtualInterface::setLinkState(state, options);
+    if (done && state == kIO80211NetworkLinkUp)
+        restoreRunning();
+    return done;
 }
 bool AirportItlwmAWDLInterface::setLinkState(IO80211LinkState state, unsigned options, bool wait, unsigned timeout) {
     return (linkActive || state == kIO80211NetworkLinkDown) && IO80211SkywalkInterface::setLinkState(state, options, wait, timeout);
@@ -744,14 +816,67 @@ IOReturn AirportItlwmAWDLInterface::setAWDL_PRESENCE_MODE(apple80211_awdl_presen
 IOReturn AirportItlwmAWDLInterface::setPEER_CACHE_CONTROL(apple80211_peer_cache_control *data)
 {
     const IOReturn result = acceptSet(540);
-    // Off by default: on 1.1.45 the family cycled add and delete, and this Mac stopped sending AirDrop.
-    if (result == kIOReturnSuccess && data && AirportItlwm::awdlCacheOn()) {
+    // All peers only by test switch: on 1.1.45 the family cycled add and delete, and this Mac stopped sending AirDrop.
+    // Real-time group peers by default since 1.1.69 (rtgCacheWanted).
+    if (result == kIOReturnSuccess && data) {
         const auto *raw = reinterpret_cast<const uint8_t *>(data);
         uint32_t op = 0;
         memcpy(&op, raw + 4, sizeof(op));
-        static_cast<AirportItlwm *>(ownerController)->awdlPeerCache(raw + 8, op);
+        if (AirportItlwm::awdlCacheOn() || (AirportItlwm::awdlCacheRtgOn() && rtgCacheWanted(raw + 8, op)))
+            static_cast<AirportItlwm *>(ownerController)->awdlPeerCache(raw + 8, op);
     }
     return result;
+}
+
+// Layout from apple80211_ioctl.h and handleEnsembleTrafficReg: peer address at +4, name length +0x0c, name +0x10,
+// active at +0xa8. The family asks for the cache right after an ensemble registration; 10 s covers its 3 s wait.
+void AirportItlwmAWDLInterface::noteRtgRegistration(const uint8_t *mac, bool active)
+{
+    if (!mac || (mac[0] & 1))
+        return;
+    uint64_t now = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+    int slot = -1, oldest = 0;
+    for (int i = 0; i < 4; ++i) {
+        if (!memcmp(rtgPeers[i].mac, mac, 6)) { slot = i; break; }
+        if (rtgPeers[i].untilNs < rtgPeers[oldest].untilNs && !rtgPeers[i].cached) oldest = i;
+    }
+    if (slot < 0) {
+        if (!active)
+            return;
+        slot = oldest;
+        memcpy(rtgPeers[slot].mac, mac, 6);
+        rtgPeers[slot].cached = false;
+    }
+    // A disable closes the window; a peer already answered keeps getting its delete answered.
+    rtgPeers[slot].untilNs = active ? now + 10000000000ULL : 0;
+    if (active)
+        setProperty("ItlwmAwdlRtgRegistrations", ++rtgRegistrations, 32);
+}
+
+bool AirportItlwmAWDLInterface::rtgCacheWanted(const uint8_t *mac, uint32_t op)
+{
+    if (!mac)
+        return false;
+    uint64_t now = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+    for (auto &peer : rtgPeers) {
+        if (memcmp(peer.mac, mac, 6))
+            continue;
+        if (op == 2) {
+            const bool answer = peer.cached;
+            peer.cached = false;
+            return answer;
+        }
+        if (now < peer.untilNs) {
+            peer.cached = true;
+            setProperty("ItlwmAwdlRtgCacheAnswers", ++rtgCacheAnswers, 32);
+            return true;
+        }
+        setProperty("ItlwmAwdlRtgCacheLate", ++rtgCacheLate, 32);
+        return false;
+    }
+    return false;
 }
 
 void AirportItlwmAWDLInterface::peerCacheDone(const uint8_t *mac, bool added)
@@ -809,6 +934,11 @@ IOReturn AirportItlwmAWDLInterface::setAWDL_PEER_TRAFFIC_REGISTRATION(apple80211
         if (length && length < sizeof(name)) {
             memcpy(name, reinterpret_cast<const uint8_t *>(data) + 0x10, length);
             setProperty("ItlwmAwdlTrafficRegistrationName", name);
+            if (!strcmp(name, "ensemble") || !strcmp(name, "sidecar")) {
+                uint32_t active = 0;
+                memcpy(&active, reinterpret_cast<const uint8_t *>(data) + 0xa8, sizeof(active));
+                noteRtgRegistration(reinterpret_cast<const uint8_t *>(data) + 4, active != 0);
+            }
         }
     }
     return acceptSet(544);
@@ -1030,8 +1160,29 @@ void AirportItlwmLowLatencyInterface::linkTimerFired(OSObject *owner, IOTimerEve
     self->dataActive = true;
     be201TxSubRequestDequeue(self->queues[0], nullptr, 0);
     self->reportLinkStatus(3, 0x80);
-    ifnet_set_flags(reinterpret_cast<ifnet_t>(self->getBSDInterface()), IFF_RUNNING, IFF_RUNNING);
-    self->IO80211VirtualInterface::setRunningState(true);
+    /*
+     * IOSkywalkNetworkBSDClient marks llw0 enabled (+0x141) only in its own SIOCSIFFLAGS handling: when IFF_UP is set
+     * and IFF_RUNNING is not, it calls setRunningState(true) and then sets both. Its preConnect, run when the kernel
+     * opens llw0's device port for the first low latency flow (netif_hwna_setup), returns kIOReturnNotReady while that
+     * mark is clear, which reaches the flow as EBUSY ("os_channel_create [16: Resource busy]" on 1.1.67 to 1.1.69).
+     * Through 1.1.69 this set IFF_RUNNING directly, so every later SIOCSIFFLAGS was skipped and the mark never came.
+     * Now the interface goes up through that handler, with the data path already active for setRunningState.
+     */
+    auto ifp = reinterpret_cast<ifnet_t>(self->getBSDInterface());
+    ifnet_set_flags(ifp, IFF_UP, IFF_UP);
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    ifr.ifr_flags = static_cast<short>(ifnet_flags(ifp) & 0xffff);
+    const errno_t upResult = ifnet_ioctl(ifp, 0, SIOCSIFFLAGS, &ifr);
+    const bool running = (ifnet_flags(ifp) & IFF_RUNNING) != 0;
+    controller->setProperty("ItlwmAwdlLlwUpResult", static_cast<uint32_t>(upResult), 32);
+    controller->setProperty("ItlwmAwdlLlwUpRunning", running);
+    if (!running) {
+        // As through 1.1.69, so llw0 at least carries the stack's traffic; low latency flows will still fail.
+        ifnet_set_flags(ifp, IFF_RUNNING, IFF_RUNNING);
+        self->IO80211VirtualInterface::setRunningState(true);
+        controller->setProperty("ItlwmAwdlLlwUpFallback", true);
+    }
     self->setProperty("ItlwmAwdlDataReady", true);
     controller->setProperty("ItlwmAwdlLlwStage", 6, 32);
 }

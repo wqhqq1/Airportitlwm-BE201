@@ -14,13 +14,16 @@ pre=r'''
 #include <unistd.h>
 #include "iwx_awdl_native.h"
 using IOReturn=int;constexpr int kIOReturnSuccess=0,kIOReturnNotPermitted=-90,kIOReturnNotReady=-91,kIOReturnBadArgument=-1,kIOReturnBusy=-2;
-struct OSObject{};constexpr unsigned IEEE80211_S_RUN=4,IWX_FLAG_STA_ACTIVE=1,IWX_FLAG_SHUTDOWN=2,IWX_FLAG_HW_ERR=4;
-struct Node{bool ni_port_valid=true;};struct iwx_node{Node in_ni;};
-struct IC{Node *ic_bss=nullptr;bool ic_wcl_teardown_pending=false;unsigned ic_state=4;};
+struct OSObject{};constexpr unsigned IEEE80211_S_RUN=4,IWX_FLAG_STA_ACTIVE=1,IWX_FLAG_SHUTDOWN=2,IWX_FLAG_HW_ERR=4,IEEE80211_F_RSNON=0x200;
+struct ieee80211_node{bool ni_port_valid=true;};using Node=ieee80211_node;struct iwx_node{Node in_ni;};
+struct ieee80211com{Node *ic_bss=nullptr;bool ic_wcl_teardown_pending=false;unsigned ic_state=4;unsigned ic_flags=IEEE80211_F_RSNON;};using IC=ieee80211com;
+PORT_OPEN
 struct PCI{std::map<std::string,unsigned> n;void setProperty(const char*k,unsigned v,unsigned){n[k]=v;}void setProperty(const char*k,bool v){n[k]=v;}void setProperty(const char*,void*,unsigned){}};
 struct iwx_softc{IC sc_ic;unsigned ns_nstate=4,sc_flags=1;bool sc_awdl_native_requested=false; iw 
 };
 '''.replace(' iw \n',' iwx_awdl_probe sc_awdl_probe={};PCI *sc_pcitag=nullptr;int awdl_native_task=0;\n')
+po=s[s.index('static inline bool iwx_ap_port_open('):];po=po[:po.index('\n}\n')+3]
+pre=pre.replace('PORT_OPEN',po)
 pre+=r'''
 struct Loop{bool gated=true;bool inGate(){return gated;}};
 struct Gate{Loop *loop;unsigned calls=0;OSObject unrelatedOwner;int runAction(int(*fn)(OSObject*,void*,void*,void*,void*),void*a,void*b=nullptr){++calls;loop->gated=true;return fn(&unrelatedOwner,a,b,nullptr,nullptr);}};
@@ -45,7 +48,7 @@ int main(){
  auto pagesize=static_cast<size_t>(getpagesize());auto mem=static_cast<uint8_t*>(mmap(nullptr,pagesize*2,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0));assert(mem!=MAP_FAILED);assert(!mprotect(mem+pagesize,pagesize,PROT_NONE));memcpy(mem+pagesize-6,address,6);iwx_awdl_probe p={};bool requested=false;assert(!iwx_awdl_native_request(&p,&requested,mem+pagesize-6));munmap(mem,pagesize*2);
  for(unsigned test=0;test<16;++test){ItlIwx h;PCI pci;iwx_node node;h.com.sc_pcitag=&pci;h.com.sc_ic.ic_bss=&node.in_ni;h.loop.gated=false;
   assert(!h.requestAwdlMonitor(address)&&h.gate.calls==1&&h.queued==1&&h.adds==0); // Wrong gate owner must not be cast to HAL.
-  switch(test){case 0:h.com.sc_awdl_native_requested=false;break;case 1:h.com.sc_ic.ic_bss=nullptr;break;case 2:node.in_ni.ni_port_valid=false;break;case 3:h.com.sc_ic.ic_wcl_teardown_pending=true;break;case 4:h.com.sc_ic.ic_state=0;break;case 5:h.com.ns_nstate=0;break;case 6:h.com.sc_flags=0;break;case 7:h.com.sc_flags|=IWX_FLAG_SHUTDOWN;break;case 8:h.com.sc_flags|=IWX_FLAG_HW_ERR;break;default:break;}
+  switch(test){case 0:h.com.sc_awdl_native_requested=false;break;case 1:h.com.sc_ic.ic_bss=nullptr;break;case 2:node.in_ni.ni_port_valid=false;break;case 3:h.com.sc_ic.ic_wcl_teardown_pending=true;break;case 4:h.com.sc_ic.ic_state=0;break;case 5:h.com.ns_nstate=0;break;case 6:h.com.sc_flags=0;break;case 7:h.com.sc_flags|=IWX_FLAG_SHUTDOWN;break;case 8:h.com.sc_flags|=IWX_FLAG_HW_ERR;break;case 9:node.in_ni.ni_port_valid=false;h.com.sc_ic.ic_flags=0;break;default:break;} // 9: an open network has no handshake (1.1.83)
   h.loop.gated=test&1;ItlIwx::iwx_awdl_native_task(&h.com);assert(h.adds==(test>=9?1u:0u));++cases;
  }
  printf("PASS: %u actual native binding/worker cases; no AP mutation on conflicts, six-byte boundary, no TX enable, deferred firmware work, unrelated gate-owner safety\n",cases);

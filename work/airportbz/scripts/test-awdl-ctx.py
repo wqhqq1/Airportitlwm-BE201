@@ -59,7 +59,8 @@ assert 'ACTION_ADD, p->tx.self, c->mode >= 3, false)' in s and 'IWX_MAC_CFG_FILT
 rm = s[s.index('iwx_awdl_ctx_remove(struct iwx_softc *sc)\n{'):s.index('iwx_awdl_peer_task(void *arg)\n{')]
 assert rm.index('p->peer_added = p->peer_count = 0') < rm.index('IWX_AWDL_PEER_STA_FIRST + i') < rm.index('stage >= IWX_AWDL_CTX_ASSOC')
 task = s[s.index('iwx_awdl_peer_task(void *arg)\n{'):s.index('iwx_awdl_tx_maybe(struct iwx_softc *sc)\n{')]
-assert 'p->ctx.stage != IWX_AWDL_CTX_ASSOC' in task and task.index('p->peer_added++') < task.index('iwx_send_cmd_pdu') and 'p->peer_failed = 1' in task
+add = task[task.index('while (p->peer_added < p->peer_count)'):]  # 1.1.77: replacements run first
+assert 'p->ctx.stage != IWX_AWDL_CTX_ASSOC' in add and add.index('p->peer_added++') < add.index('iwx_send_cmd_pdu') and 'p->peer_failed = 1' in add
 assert 'iwx_del_task(sc, systq, &sc->awdl_peer_task)' in s and 'task_set(&sc->awdl_peer_task' in s and 'peer_added = sc->sc_awdl_probe.peer_count = 0' in s
 assert 'IWX_FW_MAC_TYPE_IBSS' not in (ROOT/'itlwm/hal_iwx/iwx_awdl_ctx.h').read_text()
 # Native mode: station, then association, no queue, in that order; undone in reverse with no queue teardown.
@@ -81,7 +82,7 @@ assert add.index('IWX_FW_CTXT_ACTION_MODIFY, 0, 0)') < add.index('IWX_LINK_CONTE
 lk = fn('iwx_awdl_ctx_link_cmd(struct iwx_softc *sc, struct iwx_node *in, uint32_t action,', 'iwx_awdl_ctx_add(struct iwx_softc *sc')
 assert 'if (has_phy) {' in lk and 'modify_mask &' not in lk and 'cmd.bi =' in lk and 'cmd.ofdm_rates' in lk
 assert 'p->tx.tripped = 1' in add and 'c->stage = stage - 1' in add and 'c->stage != stage' in add
-rm = fn('iwx_awdl_ctx_remove(struct iwx_softc *sc)\n{', 'iwx_awdl_tx_maybe(struct iwx_softc *sc)\n{')
+rm = fn('iwx_awdl_ctx_remove(struct iwx_softc *sc)\n{', 'iwx_awdl_peer_task(void *arg)\n{')  # 1.1.77: the peer task replaces stations too
 pos = [rm.index(x) for x in ['iwx_flush_sta_tids','iwx_mld_disable_txq']] + [rm.rindex('IWX_STA_REMOVE_CMD')] + [rm.index(x) for x in ['IWX_LINK_CONTEXT_MODIFY_ACTIVE, 0','IWX_FW_CTXT_ACTION_REMOVE, 0, 0','IWX_FW_CTXT_ACTION_REMOVE, nullptr']]
 assert pos == sorted(pos) and rm.index('c->stage = IWX_AWDL_CTX_NONE') < pos[0]
 for f, marker in [('iwx_mld_run_stop(struct iwx_softc *sc, struct iwx_node *in)\n{','iwx_flush_sta_tids(sc, IWX_STATION_ID'),('iwx_mld_deauth(struct iwx_softc *sc, struct iwx_node *in)\n{','iwx_cancel_session_protection')]:

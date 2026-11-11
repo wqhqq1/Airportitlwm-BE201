@@ -27,5 +27,11 @@
 # The driver keeps its own rules in work/airportbz/.gitignore
 !/work/airportbz/**
 
+# The Wi-Fi kit sources are all tracked; its test results are not.
+!/work/wifi-kit/**
+/work/wifi-kit/checks.json
+/work/wifi-kit/tests/
+/work/wifi-kit/__pycache__/
+
 # Vendored third-party Python packages
 /work/awdl/python-deps/

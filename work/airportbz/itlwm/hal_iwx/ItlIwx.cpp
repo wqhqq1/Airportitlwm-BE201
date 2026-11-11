@@ -4056,6 +4056,23 @@ iwx_tvqm_alloc_txq(struct iwx_softc *sc, int tid, int ssn)
     return queue;
 }
 
+/* A live owner still holds this queue number: the AP's TIDs, its management queue, or one of the AWDL queues. */
+bool ItlIwx::
+iwx_txq_owned(struct iwx_softc *sc, int qid)
+{
+    if (qid == sc->first_data_qid)
+        return true;
+    for (int i = 0; i < IWX_MAX_TID_COUNT; i++)
+        if (sc->sc_tid_data[i].qid == qid)
+            return true;
+#ifdef AIRPORT_WCL
+    const auto c = &sc->sc_awdl_probe.ctx;
+    if (c->qid == qid || c->own_qid == qid || c->phy2_qid == qid || sc->sc_awdl_probe.roc.qid == qid)
+        return true;
+#endif
+    return false;
+}
+
 int ItlIwx::
 iwx_tvqm_enable_txq(struct iwx_softc *sc, int tid, int ssn, uint32_t size, int sta_id)
 {
@@ -4211,7 +4228,19 @@ iwx_tvqm_enable_txq(struct iwx_softc *sc, int tid, int ssn, uint32_t size, int s
         goto fail;
     }
 #ifdef AIRPORT_VTD
-    if (fwqid <= sc->first_data_qid || sc->txq[fwqid].queued || wr_idx >= getTxQueueSize()) {
+    /*
+     * A queue number the firmware just handed out is free in the firmware. Host frames still counted on it are left
+     * from an owner whose queue was already removed (the AP's data queue after a link loss): reset below like any
+     * other reuse. Only a number some live owner still holds is refused (1.1.73).
+     */
+    if (fwqid <= sc->first_data_qid || wr_idx >= getTxQueueSize() ||
+        (sc->txq[fwqid].queued && iwx_txq_owned(sc, fwqid))) {
+        /*
+         * The firmware made this queue: remove it again, or it stays on the station and the later MAC removal
+         * asserts the firmware (0x20101E08 at MAC_CONFIG, solo context after a hotspot loss, 1.1.72).
+         */
+        if (iwx_use_mld_api(sc))
+            iwx_mld_disable_txq(sc, sta_id, tid);
         err = -EIO;
         goto fail;
     }
@@ -4229,8 +4258,14 @@ iwx_tvqm_enable_txq(struct iwx_softc *sc, int tid, int ssn, uint32_t size, int s
     return fwqid;
 fail:
 #ifdef AIRPORT_VTD
-    if (submitted)
-        sc->sc_dmat->deferRecycling();
+    /*
+     * The firmware may have read this ring's addresses: keep its pages out of use until the next device stop. Only
+     * this ring: deferRecycling() here retired every later release as well, and the pool ran out (1.1.82). A busy
+     * command ring (ENOSPC) never queued the command, so nothing was handed out.
+     */
+    const bool retire = submitted && !iwx_awdl_err_transient(err);
+    if (retire)
+        sc->sc_dmat->beginRetire();
 #endif
     iwx_free_resp(sc, &hcmd);
 #ifndef AIRPORT_VTD
@@ -4238,6 +4273,8 @@ fail:
 #endif
     iwx_free_tx_ring(sc, ring);
 #ifdef AIRPORT_VTD
+    if (retire)
+        sc->sc_dmat->endRetire();
     delete ring;
 #endif
     return err;
@@ -5087,6 +5124,16 @@ iwx_mld_authorized_task(void *arg)
 #ifdef AIRPORT_WCL
 #include "iwx_awdl_native.h"
 /* Ready to send to this destination now? Anything but success stops the caller. */
+/*
+ * The AP's data port is open: authorized by the 4-way handshake, or an open network, which has no handshake and never
+ * sets ni_port_valid. 2026-11-10 21:15, on an open router on channel 60, the ROC test waited on the port in every
+ * phase (RocBlocked 32) while the AP link worked; the MLD authorized step already counted open networks (1.1.83).
+ */
+static inline bool iwx_ap_port_open(const struct ieee80211com *ic, const struct ieee80211_node *ni)
+{
+    return ni && (ni->ni_port_valid || !(ic->ic_flags & IEEE80211_F_RSNON));
+}
+
 IOReturn ItlIwx::iwx_awdl_data_gate(struct iwx_softc *sc, const uint8_t *eth)
 {
     auto p = &sc->sc_awdl_probe;
@@ -5095,7 +5142,7 @@ IOReturn ItlIwx::iwx_awdl_data_gate(struct iwx_softc *sc, const uint8_t *eth)
     /* On its own (1.1.66) there is no AP port or AP queue to wait for: the AWDL station's queue is the one. */
     const bool solo = p->ctx.solo && p->ctx.phy2_qid > 0;
     if (!sc->sc_awdl_native_requested || p->ctx.stage < IWX_AWDL_CTX_ACTIVE || p->tx.tripped || !ni ||
-        (!solo && (!ni->ni_port_valid || !(sc->sc_flags & IWX_FLAG_MLD_TXQ_ACTIVE))) ||
+        (!solo && (!iwx_ap_port_open(ic, ni) || !(sc->sc_flags & IWX_FLAG_MLD_TXQ_ACTIVE))) ||
         (sc->sc_flags & (IWX_FLAG_SHUTDOWN | IWX_FLAG_HW_ERR)))
         return kIOReturnNotReady;
     if (p->tx.hold) {
@@ -5162,6 +5209,7 @@ IOReturn ItlIwx::sendAwdlData(const uint8_t *eth, size_t length)
         return kIOReturnNoMemory;
     }
     iwx_awdl_note_dest(p, eth);
+    iwx_awdl_note_bytes(p, eth, length);
     const bool qos = p->ctx.own_active && p->ctx.own_agg && !memcmp(eth, p->ctx.own_peer, 6);
     const size_t n = qos ? iwx_awdl_ether_to_qos(p, eth, length, static_cast<uint8_t *>(mbuf_data(m)), mbuf_maxlen(m))
                          : iwx_awdl_ether_to_data(p, eth, length, static_cast<uint8_t *>(mbuf_data(m)), mbuf_maxlen(m));
@@ -5242,6 +5290,57 @@ void ItlIwx::setAwdlSlot(uint32_t chan, uint32_t run, uint32_t seq5)
                  !sc->sc_awdl_probe.tx.tripped && now_us - c->solo_try_us >= IWX_AWDL_SOLO_IDLE_US) {
             c->solo_try_us = now_us;
             iwx_add_task(sc, systq, &sc->awdl_solo_task);
+        }
+    }
+    iwx_awdl_roc_tick(&com, now / 1000);
+    /* One sample a second for stall diagnosis (1.1.80): read ItlwmAwdlHistory after a stall. */
+    {
+        auto sc = &com;
+        auto p = &sc->sc_awdl_probe;
+        const uint64_t now_us = now / 1000;
+        if (!p->hist_us || now_us - p->hist_us >= 1000000) {
+            p->hist_us = now_us;
+            struct iwx_awdl_hist h;
+            memset(&h, 0, sizeof(h));
+            h.t_s = uint32_t(now_us / 1000000);
+            h.own_sent = c->own_sent;
+            h.own_ok = c->own_ok;
+            h.own_agg_fail = c->own_agg_fail;
+            h.own_ba_notifs = c->own_ba_notifs;
+            h.tx_busy = p->tx.busy;
+            h.data_stalls = p->tx.data_stalls;
+            h.own_recovers = c->own_recovers;
+            h.mcast_sent = p->tx.mcast_sent;
+            h.own_queued = uint16_t(c->own_qid > 0 ? sc->txq[c->own_qid].queued : 0);
+            h.ap_queued = uint16_t(sc->txq[sc->first_data_qid].queued);
+            h.flags = (c->own_active ? IWX_AWDL_HIST_OWN_ACTIVE : 0) | (c->own_held ? IWX_AWDL_HIST_OWN_HELD : 0) |
+                ((sc->sc_ic.ic_flags & IEEE80211_F_BGSCAN) ? IWX_AWDL_HIST_BGSCAN : 0) |
+                (sc->sc_tx_timer > 0 ? IWX_AWDL_HIST_TX_TIMER : 0) | (c->solo ? IWX_AWDL_HIST_SOLO : 0) |
+                (p->tx.data_stalled ? IWX_AWDL_HIST_DATA_STALLED : 0) |
+                (iwx_awdl_bulk_active(p, now_us) ? IWX_AWDL_HIST_BULK : 0) |
+                (iwx_awdl_bulk_recent(p, now_us) ? IWX_AWDL_HIST_SCAN_HELD : 0);
+            iwx_awdl_hist_add(p, &h);
+#ifdef AIRPORT_VTD
+            /* The DMA pool, once a second: the 1.1.81 leak was only visible as ENOMEM from queue setup. */
+            /* The AP port as the AWDL and ROC checks see it (1.1.83). */
+            sc->sc_pcitag->setProperty("ItlwmApPortValid", sc->sc_ic.ic_bss ? sc->sc_ic.ic_bss->ni_port_valid : 0, 32);
+            sc->sc_pcitag->setProperty("ItlwmApRsnOn", (sc->sc_ic.ic_flags & IEEE80211_F_RSNON) ? 1 : 0, 32);
+            if (sc->sc_dmat) {
+                uint32_t used = 0, high = 0, failed = 0, retired = 0;
+                bool deferred = false;
+                sc->sc_dmat->stats(used, high, failed, retired, deferred);
+                sc->sc_pcitag->setProperty("ItlwmDmaUsedKiB", used / 1024, 32);
+                sc->sc_pcitag->setProperty("ItlwmDmaHighKiB", high / 1024, 32);
+                sc->sc_pcitag->setProperty("ItlwmDmaFailures", failed, 32);
+                sc->sc_pcitag->setProperty("ItlwmDmaRetiredKiB", retired / 1024, 32);
+                sc->sc_pcitag->setProperty("ItlwmDmaDeferred", deferred);
+            }
+#endif
+            /* Oldest first: rotate so the property reads in time order. */
+            static struct iwx_awdl_hist ordered[IWX_AWDL_HIST_LEN];
+            for (uint32_t i = 0; i < IWX_AWDL_HIST_LEN; ++i)
+                ordered[i] = p->hist[(p->hist_next + i) % IWX_AWDL_HIST_LEN];
+            sc->sc_pcitag->setProperty("ItlwmAwdlHistory", ordered, sizeof(ordered));
         }
     }
     /* Counters from the tick too: without peers nothing is received, and they went stale for whole test phases. */
@@ -5488,9 +5587,23 @@ void ItlIwx::setAwdlOwnQueue(bool on, bool agg, uint32_t fix)
      */
     const bool elsewhere = on && c->own_active && p->tx.last_dest_valid && memcmp(p->tx.last_dest, c->own_peer, 6) &&
         iwx_awdl_peer_index(p, p->tx.last_dest) >= 0;
-    const bool moved = elsewhere && now_us - c->own_busy_us >= IWX_AWDL_OWN_QUIET_US;
+    bool moved = elsewhere && now_us - c->own_busy_us >= IWX_AWDL_OWN_QUIET_US;
     if (elsewhere && !moved)
         ++c->own_quiet_skips;
+    /* Bulk data to another peer takes the queue even while the current one still gets a trickle (1.1.77). */
+    const bool rolled = iwx_awdl_bytes_roll(p, now_us);
+    if (rolled && iwx_awdl_bulk_active(p, now_us))
+        p->tx.bulk_last_us = now_us;
+    if (rolled && on && c->own_active && !moved) {
+        const int current = iwx_awdl_peer_index(p, c->own_peer);
+        const int bulk = iwx_awdl_own_bulk_peer(p->tx.dest_bytes_last,
+            p->peer_added < IWX_AWDL_PEER_STA_MAX ? p->peer_added : IWX_AWDL_PEER_STA_MAX, current);
+        if (bulk >= 0) {
+            c->own_target = bulk;
+            ++c->own_bulk_moves;
+            moved = true;
+        }
+    }
     const bool aggChanged = on && !!c->own_agg_want != agg;
     const bool fixChanged = on && c->own_fix_want != uint8_t(fix & 3);
     c->own_agg_want = agg;
@@ -5533,8 +5646,8 @@ void ItlIwx::setAwdlOwnQueue(bool on, bool agg, uint32_t fix)
     /*
      * A queue wanted but never made. On by default (1.1.55) the switch is set at load, the first task finds no peer
      * and returns, and nothing changed afterwards to queue it again: OwnSent and OwnFixDone stayed 0 all boot and
-     * AirDrop ran at the old speed. Try again once a second while the context and a peer are there. A failed queue
-     * allocation (OwnErr) is not retried.
+     * AirDrop ran at the old speed. Try again once a second while the context and a peer are there. A queue allocation
+     * the firmware refused (OwnErr) is not retried; a busy command ring (OwnTransient) is (1.1.76).
      */
     if (on && c->own_want && !c->own_active && !c->own_held && !c->own_err && c->stage == IWX_AWDL_CTX_ASSOC &&
         p->peer_added && !p->tx.tripped && now_us - c->own_try_us >= IWX_AWDL_OWN_RETRY_US) {
@@ -5593,7 +5706,9 @@ void ItlIwx::iwx_awdl_ownq_task(void *arg)
         p->tx.tripped || (sc->sc_flags & (IWX_FLAG_SHUTDOWN | IWX_FLAG_HW_ERR)))
         return;
     /* The station data goes to; before any data, the peer that set up block ack, as in 1.1.41. */
-    int index = p->tx.last_dest_valid ? iwx_awdl_peer_index(p, p->tx.last_dest) : -1;
+    int index = c->own_target >= 0 && uint32_t(c->own_target) < p->peer_added ? c->own_target :
+        (p->tx.last_dest_valid ? iwx_awdl_peer_index(p, p->tx.last_dest) : -1);
+    c->own_target = -1;
     if (index < 0) {
         index = 0;
         for (uint32_t i = 0; i < IWX_AWDL_BA_MAX; ++i)
@@ -5643,6 +5758,15 @@ void ItlIwx::iwx_awdl_ownq_task(void *arg)
             const int err = that->iwx_awdl_peer_agg(sc, uint32_t(index));
             if (generation != sc->sc_generation)
                 return;
+            /*
+             * A busy command ring is not a refusal. 2026-11-10 15:15: STA_CONFIG got ENOSPC, the queue was built on
+             * TID 15 without aggregation, and AirDrop ran at about 4 MB/s instead of 33. Try the whole build again.
+             */
+            if (err && iwx_awdl_err_transient(err)) {
+                ++c->own_transient;
+                c->own_transient_last = uint32_t(err < 0 ? -err : err);
+                return;
+            }
             agg = !err;
             if (err)
                 tid = IWX_MGMT_TID;
@@ -5654,6 +5778,12 @@ void ItlIwx::iwx_awdl_ownq_task(void *arg)
         if (generation != sc->sc_generation)
             return;
         if (q <= 0) {
+            /* The same busy ring left OwnErr 28 and no own queue for the rest of that boot (1.1.76). */
+            if (iwx_awdl_err_transient(q)) {
+                ++c->own_transient;
+                c->own_transient_last = uint32_t(-q);
+                return;
+            }
             c->own_err = uint32_t(q < 0 ? -q : 1);
             return;
         }
@@ -5851,7 +5981,7 @@ void ItlIwx::iwx_awdl_native_task(void *arg)
     }
     auto ic = &sc->sc_ic;
     auto in = reinterpret_cast<iwx_node *>(ic->ic_bss);
-    if (!sc->sc_awdl_native_requested || !in || !in->in_ni.ni_port_valid ||
+    if (!sc->sc_awdl_native_requested || !in || !iwx_ap_port_open(ic, &in->in_ni) ||
         ic->ic_wcl_teardown_pending || ic->ic_state != IEEE80211_S_RUN ||
         sc->ns_nstate != IEEE80211_S_RUN || !(sc->sc_flags & IWX_FLAG_STA_ACTIVE) ||
         (sc->sc_flags & (IWX_FLAG_SHUTDOWN | IWX_FLAG_HW_ERR))) {
@@ -5919,6 +6049,8 @@ iwx_awdl_probe_publish(struct iwx_softc *sc)
     nub->setProperty("ItlwmAwdlDataRateDowns", p->tx.rate_downs, 32);
     nub->setProperty("ItlwmAwdlPeerStations", p->peer_added, 32);
     nub->setProperty("ItlwmAwdlPeerStationErrors", p->peer_errors, 32);
+    nub->setProperty("ItlwmAwdlPeerReplaced", p->peer_replaced, 32);
+    nub->setProperty("ItlwmAwdlPeerReplaceErr", p->peer_replace_err, 32);
     if (p->peer_added)
         nub->setProperty("ItlwmAwdlPeerStationAddrs", p->peer_addr, p->peer_added * 6);
     nub->setProperty("ItlwmAwdlTxMcastOk", p->tx.mcast_ok, 32);
@@ -5928,6 +6060,8 @@ iwx_awdl_probe_publish(struct iwx_softc *sc)
     nub->setProperty("ItlwmAwdlTxUnicastNoAck", p->tx.unicast_noack, 32);
     nub->setProperty("ItlwmAwdlTxUnicastRetries", p->tx.unicast_retries, 32);
     nub->setProperty("ItlwmAwdlTxLastFailStatus", p->tx.last_fail_status, 32);
+    if (p->roc.want || p->roc.setups)
+        iwx_awdl_roc_publish(sc);
     nub->setProperty("ItlwmAwdlTxBusy", p->tx.busy, 32);
     nub->setProperty("ItlwmAwdlTxAllocFail", p->tx.alloc_fail, 32);
     nub->setProperty("ItlwmAwdlTxQueueLimited", p->tx.queue_limited, 32);
@@ -5991,6 +6125,7 @@ iwx_awdl_probe_publish(struct iwx_softc *sc)
         nub->setProperty("ItlwmAwdlOwnRetries", c->own_retries, 32);
         nub->setProperty("ItlwmAwdlOwnRecoverFails", c->own_recover_fails, 32);
         nub->setProperty("ItlwmAwdlOwnQuietSkips", c->own_quiet_skips, 32);
+        nub->setProperty("ItlwmAwdlOwnBulkMoves", c->own_bulk_moves, 32);
         nub->setProperty("ItlwmAwdlCtxTeOwn", c->te_own, 32);
         nub->setProperty("ItlwmAwdlSeqChan5", c->seq_chan5, 32);
         nub->setProperty("ItlwmAwdlPhy2Auto", c->auto_cand, 32);
@@ -6030,6 +6165,8 @@ iwx_awdl_probe_publish(struct iwx_softc *sc)
         nub->setProperty("ItlwmAwdlOwnOk", c->own_ok, 32);
         nub->setProperty("ItlwmAwdlOwnFail", c->own_fail, 32);
         nub->setProperty("ItlwmAwdlOwnErr", c->own_err, 32);
+        nub->setProperty("ItlwmAwdlOwnTransient", c->own_transient, 32);
+        nub->setProperty("ItlwmAwdlOwnTransientLast", c->own_transient_last, 32);
     }
     nub->setProperty("ItlwmAwdlCtxTeRequests", p->ctx.te_requests, 32);
     nub->setProperty("ItlwmAwdlCtxTeStarted", p->ctx.te_started, 32);
@@ -6230,6 +6367,282 @@ fail:
 }
 
 /*
+ * Remain on channel for the second channel (1.1.75 test, off by default). The firmware schedules a client link on
+ * another PHY from its AP's beacons, and AWDL has none: link 1 there never transmitted (1.1.42-1.1.65). iwlmld sends
+ * off-channel frames during an ROC_CMD instead, through an AUX station, with node_addr as the receive filter.
+ */
+/* For the infrastructure scan gate: AWDL is carrying bulk data right now (1.1.79). */
+bool ItlIwx::awdlBulkActive()
+{
+    uint64_t now = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+    return iwx_awdl_bulk_recent(&com.sc_awdl_probe, now / 1000);
+}
+
+void ItlIwx::setAwdlRoc(uint32_t value)
+{
+    auto sc = &com;
+    if (!getMainWorkLoop()->inGate())
+        return;
+    sc->sc_awdl_probe.roc.want = value;
+}
+
+/*
+ * What an ROC still waits for, one bit per condition; 0 when ready. 2026-11-10 18:45 the ROC test saw RocSetups 0
+ * in every phase and nothing told which condition was missing (1.1.82: ItlwmAwdlRocBlocked).
+ */
+static uint32_t iwx_awdl_roc_blocked(struct iwx_softc *sc)
+{
+    struct ieee80211com *ic = &sc->sc_ic;
+    auto p = &sc->sc_awdl_probe;
+    uint32_t b = 0;
+    if (p->ctx.mode != 6)
+        b |= 1u << 0;
+    if (p->ctx.stage < IWX_AWDL_CTX_ACTIVE)
+        b |= 1u << 1;
+    if (p->ctx.solo)
+        b |= 1u << 2;
+    if (p->tx.tripped)
+        b |= 1u << 3;
+    if (ic->ic_state != IEEE80211_S_RUN || sc->ns_nstate != IEEE80211_S_RUN)
+        b |= 1u << 4;
+    if (!iwx_ap_port_open(ic, ic->ic_bss))
+        b |= 1u << 5;
+    if (ic->ic_wcl_teardown_pending)
+        b |= 1u << 6;
+    if (!(sc->sc_flags & IWX_FLAG_MLD_TXQ_ACTIVE))
+        b |= 1u << 7;
+    if (sc->sc_flags & IWX_FLAG_SHUTDOWN)
+        b |= 1u << 8;
+    if (sc->sc_flags & IWX_FLAG_HW_ERR)
+        b |= 1u << 9;
+    if (sc->sc_flags & IWX_FLAG_TXFLUSH)
+        b |= 1u << 10;
+    return b;
+}
+
+static bool iwx_awdl_roc_ready(struct iwx_softc *sc)
+{
+    return !iwx_awdl_roc_blocked(sc);
+}
+
+void ItlIwx::iwx_awdl_roc_task(void *arg)
+{
+    auto sc = static_cast<iwx_softc *>(arg);
+    auto that = container_of(sc, ItlIwx, com);
+    if (!that->getMainWorkLoop()->inGate()) {
+        that->getMainCommandGate()->runAction(
+            [](OSObject *, void *arg0, void *, void *, void *) -> IOReturn {
+                iwx_awdl_roc_task(arg0); return kIOReturnSuccess;
+            }, arg);
+        return;
+    }
+    auto r = &sc->sc_awdl_probe.roc;
+    const bool wanted = iwx_awdl_roc_mode(r->want) && iwx_awdl_roc_ready(sc) && !r->setup_failed;
+    /*
+     * A new mode or activity rebuilds: the setup latches both, and the tick waits while they differ. Before 1.1.85 the
+     * task did nothing in that case, so after mode 1 the test's modes 2 and 3 sent no ROC at all (2026-11-11 15:40).
+     */
+    if (r->sta_added && (!wanted || iwx_awdl_roc_mode(r->want) != r->mode ||
+                         iwx_awdl_roc_activity(r->want) != r->activity)) {
+        const int generation = sc->sc_generation;
+        that->iwx_awdl_roc_remove(sc);
+        if (generation != sc->sc_generation)
+            return;
+    }
+    if (wanted && !r->sta_added && iwx_awdl_roc_mode(r->want) && iwx_awdl_roc_ready(sc) && !r->setup_failed)
+        that->iwx_awdl_roc_setup(sc);
+    that->iwx_awdl_roc_publish(sc);
+}
+
+/* AUX station, then its queue. A failure removes what was made and stops the test until it is switched off. */
+void ItlIwx::iwx_awdl_roc_setup(struct iwx_softc *sc)
+{
+    auto r = &sc->sc_awdl_probe.roc;
+    const int generation = sc->sc_generation;
+    ++r->setups;
+    r->mode = iwx_awdl_roc_mode(r->want);
+    r->activity = iwx_awdl_roc_activity(r->want);
+    struct iwx_aux_sta_cmd cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.sta_id = htole32(IWX_AWDL_ROC_STA_ID);
+    cmd.lmac_id = htole32(0); /* iwlmld: IWL_LMAC_24G_INDEX */
+    r->setup_stage = 1;
+    int err = iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_AUX_STA_CMD, IWX_MAC_CONF_GROUP, 0), 0, sizeof(cmd), &cmd);
+    if (generation != sc->sc_generation)
+        return;
+    if (err)
+        goto fail;
+    r->sta_added = 1;
+    r->setup_stage = 2;
+    {
+        int q = -EIO;
+        if (iwx_nic_lock(sc)) {
+            q = iwx_tvqm_enable_txq(sc, IWX_AWDL_ROC_TID, 0, IWX_DEFAULT_QUEUE_SIZE, IWX_AWDL_ROC_STA_ID);
+            iwx_nic_unlock(sc);
+        }
+        if (generation != sc->sc_generation)
+            return;
+        if (q <= 0) {
+            err = q < 0 ? q : EIO;
+            goto fail;
+        }
+        r->qid = q;
+    }
+    r->setup_stage = 3;
+    return;
+fail:
+    r->setup_err = uint32_t(err < 0 ? -err : err);
+    r->setup_failed = 1;
+    iwx_awdl_roc_remove(sc);
+}
+
+/* ROC first, then the queue's frames, the queue and the station, as iwl_mld_destroy_roc. */
+void ItlIwx::iwx_awdl_roc_remove(struct iwx_softc *sc)
+{
+    auto r = &sc->sc_awdl_probe.roc;
+    const int generation = sc->sc_generation;
+    if (r->pending || r->active) {
+        struct iwx_roc_req cmd;
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.action = htole32(IWX_FW_CTXT_ACTION_REMOVE);
+        cmd.activity = htole32(r->activity);
+        r->pending = r->active = 0;
+        ++r->removes;
+        iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_ROC_CMD, IWX_MAC_CONF_GROUP, 0), 0, sizeof(cmd), &cmd);
+        if (generation != sc->sc_generation)
+            return;
+    }
+    if (!r->sta_added)
+        return;
+    ++r->teardowns;
+    if (r->qid > 0) {
+        const int q = r->qid;
+        r->qid = -1;
+        sc->sc_flags |= IWX_FLAG_TXFLUSH;
+        iwx_flush_sta_tids(sc, IWX_AWDL_ROC_STA_ID, 0xffff);
+        if (generation != sc->sc_generation)
+            return;
+        sc->sc_flags &= ~IWX_FLAG_TXFLUSH;
+        iwx_mld_disable_txq(sc, IWX_AWDL_ROC_STA_ID, IWX_AWDL_ROC_TID);
+        if (generation != sc->sc_generation)
+            return;
+        iwx_reset_tx_ring(sc, &sc->txq[q]);
+    }
+    r->sta_added = 0;
+    struct iwx_sta_remove_cmd cmd = { .sta_id = htole32(IWX_AWDL_ROC_STA_ID) };
+    iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_STA_REMOVE_CMD, IWX_MAC_CONF_GROUP, 0), 0, sizeof(cmd), &cmd);
+}
+
+/* From the AW tick under the gate, at each slot start: one ROC for each run of slots on the other 5 GHz channel. */
+void ItlIwx::iwx_awdl_roc_tick(struct iwx_softc *sc, uint64_t now_us)
+{
+    struct ieee80211com *ic = &sc->sc_ic;
+    auto p = &sc->sc_awdl_probe;
+    auto r = &p->roc;
+    auto c = &p->ctx;
+    const bool wanted = iwx_awdl_roc_mode(r->want) && !r->setup_failed;
+    if (!iwx_awdl_roc_mode(r->want))
+        r->setup_failed = 0; /* Off clears a failed setup: switching on again retries once. */
+    const bool ready = iwx_awdl_roc_ready(sc);
+    r->blocked = wanted ? iwx_awdl_roc_blocked(sc) : 0;
+    if (r->blocked != r->blocked_pub) {
+        r->blocked_pub = r->blocked;
+        sc->sc_pcitag->setProperty("ItlwmAwdlRocBlocked", r->blocked, 32);
+    }
+    if ((wanted && ready && !r->sta_added) || (r->sta_added && (!wanted || !ready ||
+        iwx_awdl_roc_mode(r->want) != r->mode || iwx_awdl_roc_activity(r->want) != r->activity))) {
+        if (now_us - r->setup_us >= IWX_AWDL_ROC_SETUP_US) {
+            r->setup_us = now_us;
+            iwx_add_task(sc, systq, &sc->awdl_roc_task);
+        }
+        return;
+    }
+    if (!r->sta_added || r->qid <= 0 || !ready)
+        return;
+    if (r->pending && now_us - r->sent_us >= IWX_AWDL_ROC_STALE_US) {
+        struct iwx_roc_req cmd;
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.action = htole32(IWX_FW_CTXT_ACTION_REMOVE);
+        cmd.activity = htole32(r->activity);
+        r->pending = r->active = 0;
+        ++r->stale;
+        iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_ROC_CMD, IWX_MAC_CONF_GROUP, 0), IWX_CMD_ASYNC, sizeof(cmd), &cmd);
+        return;
+    }
+    if (r->pending)
+        return;
+    const uint32_t ap = uint32_t(ieee80211_chan2ieee(ic, ic->ic_bss->ni_chan));
+    uint32_t chan = c->slot_chan;
+    uint32_t duration = iwx_awdl_roc_duration(c->slot_run);
+    uint32_t delay = IWX_AWDL_ROC_DELAY_TU;
+    /* Nothing heard: listen one long ROC on the other 5 GHz channel, to hear the phone and take its AW timing. */
+    const uint32_t other = iwx_awdl_roc_other5(c->seq_chan5, ap);
+    const bool disc = other && iwx_awdl_roc_disc_due(r, now_us);
+    if (disc) {
+        chan = other;
+        duration = IWX_AWDL_ROC_DISC_TU;
+        delay = IWX_AWDL_ROC_DISC_DELAY_TU;
+    }
+    if (!duration || chan < 36 || chan > 177 || chan == ap)
+        return;
+    struct iwx_roc_req cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.action = htole32(IWX_FW_CTXT_ACTION_ADD);
+    cmd.activity = htole32(r->activity);
+    cmd.sta_id = htole32(IWX_AWDL_ROC_STA_ID);
+    cmd.channel_info.channel = htole32(chan);
+    cmd.channel_info.band = IWX_PHY_BAND_5;
+    cmd.channel_info.width = IWX_PHY_VHT_CHANNEL_MODE20;
+    cmd.channel_info.ctrl_pos = IWX_PHY_VHT_CTRL_POS_1_BELOW;
+    memcpy(cmd.node_addr, p->tx.self, 6);
+    cmd.max_delay = htole32(delay);
+    cmd.duration = htole32(duration);
+    if (iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_ROC_CMD, IWX_MAC_CONF_GROUP, 0), IWX_CMD_ASYNC, sizeof(cmd), &cmd)) {
+        ++r->add_err;
+        return;
+    }
+    r->pending = 1;
+    r->chan = uint8_t(chan);
+    r->sent_us = now_us;
+    ++r->adds;
+    r->disc_pending = disc;
+    if (disc) {
+        r->disc_us = now_us;
+        ++r->disc;
+    }
+}
+
+void ItlIwx::iwx_awdl_roc_publish(struct iwx_softc *sc)
+{
+    auto r = &sc->sc_awdl_probe.roc;
+    auto nub = sc->sc_pcitag;
+    nub->setProperty("ItlwmAwdlRocMode", r->sta_added ? r->mode | (r->activity << 4) : 0, 32);
+    nub->setProperty("ItlwmAwdlRocQid", uint32_t(r->qid > 0 ? r->qid : 0), 32);
+    nub->setProperty("ItlwmAwdlRocSetups", r->setups, 32);
+    nub->setProperty("ItlwmAwdlRocSetupErr", r->setup_err, 32);
+    nub->setProperty("ItlwmAwdlRocSetupStage", r->setup_stage, 32);
+    nub->setProperty("ItlwmAwdlRocTeardowns", r->teardowns, 32);
+    nub->setProperty("ItlwmAwdlRocAdds", r->adds, 32);
+    nub->setProperty("ItlwmAwdlRocAddErr", r->add_err, 32);
+    nub->setProperty("ItlwmAwdlRocStarted", r->started, 32);
+    nub->setProperty("ItlwmAwdlRocEnded", r->ended, 32);
+    nub->setProperty("ItlwmAwdlRocFailed", r->failed, 32);
+    nub->setProperty("ItlwmAwdlRocStale", r->stale, 32);
+    nub->setProperty("ItlwmAwdlRocRemoves", r->removes, 32);
+    nub->setProperty("ItlwmAwdlRocChan", r->chan, 32);
+    nub->setProperty("ItlwmAwdlRocTxSent", r->tx_sent, 32);
+    nub->setProperty("ItlwmAwdlRocTxOk", r->tx_ok, 32);
+    nub->setProperty("ItlwmAwdlRocTxFail", r->tx_fail, 32);
+    nub->setProperty("ItlwmAwdlRocTxDrop", r->tx_drop, 32);
+    nub->setProperty("ItlwmAwdlRocRxDuring", r->rx_during, 32);
+    nub->setProperty("ItlwmAwdlRocDiscovery", r->disc, 32);
+    nub->setProperty("ItlwmAwdlRocRxAny", r->rx_any, 32);
+    nub->setProperty("ItlwmAwdlRocRxAnyChan", r->rx_any_chan, 32);
+    nub->setProperty("ItlwmAwdlRocRxAwdlAny", r->rx_awdl_any, 32);
+}
+
+/*
  * Each command wait releases the gate, and teardown may run meanwhile. The stage is
  * set before a command is sent; host commands run in order, so a remove that sees
  * the stage also follows the command in flight. Any failure ends it for this boot.
@@ -6325,10 +6738,22 @@ iwx_awdl_ctx_remove(struct iwx_softc *sc)
     const uint32_t stage = c->stage;
     const int generation = sc->sc_generation;
     int err = 0;
+    /* The ROC test needs the context: it goes first (1.1.75). */
+    iwx_awdl_roc_remove(sc);
+    if (generation != sc->sc_generation)
+        return;
     if (stage == IWX_AWDL_CTX_NONE)
         return;
     c->stage = IWX_AWDL_CTX_NONE;
     c->qid = -1;
+    /*
+     * MAC 1's power table and link 1's QoS parameters (the 1.1.53 fixes behind 33 MB/s) belong to the MAC and the
+     * link removed here. They were marked done once per boot, so every later context went without them: since
+     * 1.1.66 each boot builds the queue on the solo context first, and after a network change before that. The
+     * next own-queue build sends them again (1.1.69).
+     */
+    c->own_fix_done = 0;
+    c->own_fix_err = 0;
     /*
      * Where link 1 sits (the second PHY context, alone or beside the AP) stays known until the link is gone, so
      * the deactivating LINK_CONFIG names the context the link is really on; cleared at the end (1.1.66).
@@ -6372,6 +6797,7 @@ iwx_awdl_ctx_remove(struct iwx_softc *sc)
         }
         const uint32_t peers = p->peer_added;
         p->peer_added = p->peer_count = 0;
+        p->peer_replace = 0;
         p->cache_add_wait = p->cache_del_wait = 0;
         for (uint32_t i = peers; i-- > 0;) {
             struct iwx_sta_remove_cmd cmd = { .sta_id = htole32(IWX_AWDL_PEER_STA_FIRST + i) };
@@ -6472,6 +6898,70 @@ void ItlIwx::iwx_awdl_peer_task(void *arg)
     }
     auto ic = &sc->sc_ic;
     auto p = &sc->sc_awdl_probe;
+    /*
+     * Replacements first (1.1.77): the station's own queue and block ack sessions go before the station, as in
+     * iwx_awdl_ctx_remove, then the new peer takes the same index. A cache answer for it follows below.
+     */
+    while (p->peer_replace) {
+        if (p->ctx.stage != IWX_AWDL_CTX_ASSOC || p->tx.tripped || p->peer_failed ||
+            (p->ctx.solo ? !iwx_awdl_solo_idle(sc) : (ic->ic_state != IEEE80211_S_RUN || sc->ns_nstate != IEEE80211_S_RUN)) ||
+            ic->ic_wcl_teardown_pending || (sc->sc_flags & (IWX_FLAG_SHUTDOWN | IWX_FLAG_HW_ERR)))
+            return;
+        uint32_t v = 0;
+        while (v < IWX_AWDL_PEER_STA_MAX && !(p->peer_replace & (1u << v))) ++v;
+        if (v >= IWX_AWDL_PEER_STA_MAX || v >= p->peer_added) {
+            p->peer_replace = 0;
+            break;
+        }
+        const int generation = sc->sc_generation;
+        const uint8_t sta = uint8_t(IWX_AWDL_PEER_STA_FIRST + v);
+        auto c = &p->ctx;
+        if (c->own_qid > 0 && c->own_sta == sta) {
+            that->iwx_awdl_own_release(sc);
+            if (generation != sc->sc_generation)
+                return;
+        }
+        for (uint32_t i = 0; i < IWX_AWDL_BA_MAX; ++i) {
+            if (!p->ba[i].active || p->ba[i].sta_id != sta)
+                continue;
+            p->ba[i].active = 0;
+            that->iwx_awdl_ba_cmd(sc, &p->ba[i], NULL, NULL);
+            if (generation != sc->sc_generation)
+                return;
+        }
+        int err;
+        {
+            struct iwx_sta_remove_cmd rm = { .sta_id = htole32(sta) };
+            err = that->iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_STA_REMOVE_CMD, IWX_MAC_CONF_GROUP, 0), 0, sizeof(rm), &rm);
+            if (generation != sc->sc_generation)
+                return;
+        }
+        p->peer_replace = uint8_t(p->peer_replace & ~(1u << v));
+        if (err) {
+            /* The old station is still there: keep it, and drop the cache answer that waited for the new one. */
+            ++p->peer_replace_err;
+            p->cache_add_wait = uint8_t(p->cache_add_wait & ~(1u << v));
+            continue;
+        }
+        memcpy(p->peer_addr[v], p->peer_new[v], 6);
+        uint64_t now = 0;
+        absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+        p->peer_seen_us[v] = now / 1000;
+        struct iwx_sta_cfg_cmd cmd;
+        iwx_awdl_fill_peer_sta(&cmd, v, p->peer_addr[v]);
+        err = that->iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_STA_CONFIG_CMD, IWX_MAC_CONF_GROUP, 0), 0, sizeof(cmd), &cmd);
+        if (generation != sc->sc_generation)
+            return;
+        if (err) {
+            /* A hole in the table: stop adding, as a failed add does. */
+            ++p->peer_replace_err;
+            ++p->peer_errors;
+            p->peer_failed = 1;
+            p->cache_add_wait = uint8_t(p->cache_add_wait & ~(1u << v));
+            break;
+        }
+        ++p->peer_replaced;
+    }
     while (p->peer_added < p->peer_count) {
         /* Associated, or on its own and still idle (1.1.66). */
         if (p->ctx.stage != IWX_AWDL_CTX_ASSOC || p->tx.tripped || p->peer_failed ||
@@ -6591,7 +7081,13 @@ void ItlIwx::sendAwdlUmi(const uint8_t *peer, const uint8_t *tlvs, size_t length
 void ItlIwx::awdlPeerCache(const uint8_t *mac, uint32_t op)
 {
     auto sc = &com;
-    if (getMainWorkLoop()->inGate() && iwx_awdl_cache_request(&sc->sc_awdl_probe, mac, op))
+    if (!getMainWorkLoop()->inGate())
+        return;
+    auto p = &sc->sc_awdl_probe;
+    uint64_t now = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+    const int keep = p->ctx.own_qid > 0 ? iwx_awdl_peer_index(p, p->ctx.own_peer) : -1;
+    if (iwx_awdl_cache_request(p, mac, op, now / 1000 ? now / 1000 : 1, keep))
         iwx_add_task(sc, systq, &sc->awdl_peer_task);
 }
 
@@ -6628,7 +7124,7 @@ iwx_awdl_tx_maybe(struct iwx_softc *sc)
     }
     /* On its own (1.1.66) the sync frames do not wait for an AP port or AP queues. */
     const bool solo = p->ctx.solo && p->ctx.phy2_qid > 0;
-    if ((!solo && (!ni->ni_port_valid || !(sc->sc_flags & IWX_FLAG_MLD_TXQ_ACTIVE))) ||
+    if ((!solo && (!iwx_ap_port_open(ic, ni) || !(sc->sc_flags & IWX_FLAG_MLD_TXQ_ACTIVE))) ||
         (sc->sc_flags & (IWX_FLAG_SHUTDOWN | IWX_FLAG_TXFLUSH | IWX_FLAG_HW_ERR)) ||
         !sc->qfullmsk.empty()) {
         ++p->tx.busy;
@@ -8465,6 +8961,20 @@ iwx_rx_mpdu_mq(struct iwx_softc *sc, mbuf_t m, void *pktdata,
         mbuf_freem(m);
         return; /* drop */
     }
+#ifdef AIRPORT_WCL
+    /*
+     * Everything the firmware hands up while an ROC runs, before any filter here (1.1.85): RxAny frames of any kind,
+     * RxAnyChan of those on the ROC channel. RocRxDuring stayed 0 on 2026-11-11 and could not tell a firmware filter
+     * from a phone that was not there.
+     */
+    if (sc->sc_awdl_probe.roc.active) {
+        auto r = &sc->sc_awdl_probe.roc;
+        ++r->rx_any;
+        const uint8_t ch = sc->sc_device_family >= IWX_DEVICE_FAMILY_AX210 ? desc->v3.channel : desc->v1.channel;
+        if (r->chan && ch == r->chan)
+            ++r->rx_any_chan;
+    }
+#endif
     
     len = le16toh(desc->mpdu_len);
     if (ic->ic_opmode == IEEE80211_M_MONITOR) {
@@ -8577,6 +9087,20 @@ iwx_rx_mpdu_mq(struct iwx_softc *sc, mbuf_t m, void *pktdata,
         if (iwx_awdl_probe_rx(probe, frame, frameLength, ic->ic_bss->ni_bssid) == IWX_AWDL_PROBE_DROP) {
             if (probe->ctx.phy2_chan && frameLength >= 24 && !memcmp(frame + 16, iwx_awdl_bssid, 6))
                 ++*(probe->rx_chan == probe->ctx.phy2_chan ? &probe->ctx.rx_phy2 : &probe->ctx.rx_home);
+            /* AWDL frames heard on the ROC channel: proof the radio was there (1.1.75 test). */
+            if (probe->roc.chan && probe->rx_chan == probe->roc.chan && frameLength >= 24 &&
+                !memcmp(frame + 16, iwx_awdl_bssid, 6))
+                ++probe->roc.rx_during;
+            /*
+             * A peer's AWDL frame on a channel other than the AP's: the far side is in reach, so no discovery ROC
+             * (1.1.85). Frames on the AP channel do not count: other AWDL devices there would keep discovery off.
+             */
+            if (frameLength >= 24 && !memcmp(frame + 16, iwx_awdl_bssid, 6) && memcmp(frame + 10, probe->tx.self, 6) &&
+                probe->rx_chan != uint32_t(ieee80211_chan2ieee(ic, ic->ic_bss->ni_chan))) {
+                probe->roc.heard_us = probe->rx_host_us;
+                if (probe->roc.active)
+                    ++probe->roc.rx_awdl_any;
+            }
             if (frameLength >= 24 && (frame[0] & 0x0c) == 0x08 && !memcmp(frame + 4, probe->tx.self, 6)) {
                 const uint32_t rxRate = le32toh(sc->sc_device_family >= IWX_DEVICE_FAMILY_AX210 ?
                     desc->v3.rate_n_flags : desc->v1.rate_n_flags);
@@ -8604,8 +9128,12 @@ iwx_rx_mpdu_mq(struct iwx_softc *sc, mbuf_t m, void *pktdata,
                     awdlRssi, uint32_t(probe->rx_host_us));
                 if ((frame[0] & 0x0c) == 0x00 && iwx_awdl_ba_note(probe, frame, frameLength))
                     iwx_add_task(sc, systq, &sc->awdl_ba_task);
-                if (iwx_awdl_peer_note(probe, frame, frameLength, awdlRssi))
-                    iwx_add_task(sc, systq, &sc->awdl_peer_task);
+                {
+                    /* The own queue's peer keeps its station; others give their place when quiet (1.1.77). */
+                    const int keep = probe->ctx.own_qid > 0 ? iwx_awdl_peer_index(probe, probe->ctx.own_peer) : -1;
+                    if (iwx_awdl_peer_note(probe, frame, frameLength, awdlRssi, probe->rx_host_us ? probe->rx_host_us : 1, keep))
+                        iwx_add_task(sc, systq, &sc->awdl_peer_task);
+                }
             }
             iwx_awdl_tx_maybe(sc);
             /* One frame per heard frame sent only MIFs where a lone phone sends only MIFs (1.1.35). */
@@ -8735,6 +9263,8 @@ iwx_rx_tx_cmd_single(struct iwx_softc *sc, struct iwx_rx_packet *pkt,
         if (status != IWX_TX_STATUS_SUCCESS)
             ++sc->sc_awdl_probe.ctx.phy2_q_fail;
     }
+    if (txd->awdl_roc)
+        ++*(status == IWX_TX_STATUS_SUCCESS ? &sc->sc_awdl_probe.roc.tx_ok : &sc->sc_awdl_probe.roc.tx_fail);
     if (txd->awdl_kind) {
         iwx_awdl_tx_note_presence(sc);
         iwx_awdl_tx_note_done(&sc->sc_awdl_probe, txd->awdl_kind != 1, status == IWX_TX_STATUS_SUCCESS,
@@ -8804,6 +9334,7 @@ iwx_txd_done(struct iwx_softc *sc, struct iwx_tx_data *txd)
     txd->wcl_rsn_kind = txd->wcl_rsn_cookie = 0;
     txd->awdl_kind = 0;
     txd->awdl_phy2q = 0;
+    txd->awdl_roc = 0;
     txd->awdl_umi = 0;
 #endif
     
@@ -9819,7 +10350,10 @@ iwx_tx_fill_cmd(struct iwx_softc *sc, struct iwx_node *in,
 #ifdef AIRPORT_WCL
     /* AWDL on its own sits on 5 GHz whatever the last AP's band was: never a CCK rate there (1.1.66). */
     const bool awdlSolo = sc->sc_awdl_probe.ctx.solo && !memcmp(wh->i_addr3, iwx_awdl_bssid, 6);
-    if (awdlSolo && min_ridx < iwx_rval2ridx(12))
+    /* An ROC is always on 5 GHz too, whatever the AP's band (1.1.75 test). */
+    const bool awdlRoc = iwx_awdl_roc_routes(sc->sc_awdl_probe.roc.mode, sc->sc_awdl_probe.roc.active) &&
+        sc->sc_awdl_probe.roc.sta_added && !memcmp(wh->i_addr3, iwx_awdl_bssid, 6);
+    if ((awdlSolo || awdlRoc) && min_ridx < iwx_rval2ridx(12))
         min_ridx = iwx_rval2ridx(12);
 #endif
     /*
@@ -9831,7 +10365,7 @@ iwx_tx_fill_cmd(struct iwx_softc *sc, struct iwx_node *in,
     if (iwx_use_mld_api(sc) && (sc->sc_flags & IWX_FLAG_STA_ACTIVE) &&
         !IEEE80211_IS_MULTICAST(wh->i_addr1) &&
         IEEE80211_ADDR_EQ(wh->i_addr1, in->in_macaddr) &&
-        (type != IEEE80211_FC0_TYPE_DATA || !ni->ni_port_valid)) {
+        (type != IEEE80211_FC0_TYPE_DATA || !iwx_ap_port_open(ic, ni))) {
         *flags |= IWX_TX_FLAGS_HIGH_PRI;
         *rate_n_flags = 0;
         return &iwx_rates[min_ridx];
@@ -10059,11 +10593,31 @@ iwx_tx(struct iwx_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)
             ++c->phy2_q_sent;
         }
     }
+    /* 1.1.75 test: while an ROC runs, the frames its mode takes leave on the AUX station's queue on that channel. */
+    bool awdlRoc = false;
+    {
+        auto r = &sc->sc_awdl_probe.roc;
+        if (iwx_awdl_roc_routes(r->mode, r->active) && r->sta_added && r->qid > 0 &&
+            iwx_awdl_roc_takes(r->mode, awdlKind, type == IEEE80211_FC0_TYPE_MGT)) {
+            if (sc->txq[r->qid].queued >= IWX_AWDL_TX_MAX_QUEUED) {
+                ++r->tx_drop;
+                mbuf_freem(m);
+                return ENOBUFS;
+            }
+            if (awdlPhy2q) {
+                --sc->sc_awdl_probe.ctx.phy2_q_sent;
+                awdlPhy2q = false;
+            }
+            qid = r->qid;
+            awdlRoc = true;
+            ++r->tx_sent;
+        }
+    }
     /* Only the A-MSDU path builds QoS AWDL data. It stays on this queue, away from the AP's block ack. */
     if (awdlKind == 2 && type == IEEE80211_FC0_TYPE_DATA && ieee80211_has_qos(wh) &&
         (ieee80211_get_qos(wh) & IEEE80211_QOS_AMSDU))
         awdlKind = 4;
-    if (awdlKind == 2 && type == IEEE80211_FC0_TYPE_DATA && sc->sc_awdl_probe.ctx.own_active &&
+    if (awdlKind == 2 && type == IEEE80211_FC0_TYPE_DATA && sc->sc_awdl_probe.ctx.own_active && !awdlRoc &&
         !memcmp(wh->i_addr1, sc->sc_awdl_probe.ctx.own_peer, 6)) {
         qid = sc->sc_awdl_probe.ctx.own_qid;
         awdlKind = 3;
@@ -10116,7 +10670,8 @@ iwx_tx(struct iwx_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)
             !IEEE80211_IS_MULTICAST(wh->i_addr1) &&
             type == IEEE80211_FC0_TYPE_DATA &&
             subtype != IEEE80211_FC0_SUBTYPE_NODATA) {
-            if (!ni->ni_port_valid) {
+            /* An open network has no handshake to wait for (1.1.83). */
+            if (!iwx_ap_port_open(ic, ni)) {
                 ++sc->sc_preauth_mgmtq;
                 sc->sc_pcitag->setProperty("ItlwmTxPreAuthMgmtQ",
                     sc->sc_preauth_mgmtq, 32);
@@ -10263,6 +10818,7 @@ iwx_tx(struct iwx_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)
     data->wcl_rsn_cookie = rsnKind ? ic->ic_wcl_rsn_cookie : 0;
     data->awdl_kind = awdlKind;
     data->awdl_phy2q = awdlPhy2q;
+    data->awdl_roc = awdlRoc;
     data->awdl_umi = 0;
     if (awdlKind == 2 && type == IEEE80211_FC0_TYPE_MGT && sc->sc_awdl_probe.umi_seq_valid &&
         !memcmp(wh->i_addr1, sc->sc_awdl_probe.umi_seq_peer, 6) &&
@@ -15373,6 +15929,7 @@ iwx_stop(struct _ifnet *ifp)
     iwx_del_task(sc, systq, &sc->awdl_peer_task);
     iwx_del_task(sc, systq, &sc->awdl_umi_task);
     iwx_del_task(sc, systq, &sc->awdl_solo_task);
+    iwx_del_task(sc, systq, &sc->awdl_roc_task);
     sc->sc_mld_authorized_epoch = sc->sc_mld_authorized_done_epoch = 0;
 #endif
     iwx_del_task(sc, systq, &sc->mac_ctxt_task);
@@ -15422,13 +15979,28 @@ iwx_stop(struct _ifnet *ifp)
     sc->sc_awdl_probe.ctx.phy2_qid = -1;
     sc->sc_awdl_probe.ctx.solo = 0;
     sc->sc_awdl_probe.peer_added = sc->sc_awdl_probe.peer_count = 0;
+    sc->sc_awdl_probe.peer_replace = 0;
     sc->sc_awdl_probe.cache_add_wait = sc->sc_awdl_probe.cache_del_wait = 0;
     sc->sc_awdl_probe.ctx.own_qid = -1;
     sc->sc_awdl_probe.ctx.own_active = sc->sc_awdl_probe.ctx.own_held = 0;
+    /* A firmware restart loses the power table and link parameters too. */
+    sc->sc_awdl_probe.ctx.own_fix_done = 0;
     sc->sc_awdl_probe.ctx.phy2_chan = sc->sc_awdl_probe.ctx.phy2_want = 0;
     sc->sc_awdl_probe.ba_pending_valid = 0;
     memset(sc->sc_awdl_probe.ba, 0, sizeof(sc->sc_awdl_probe.ba));
     sc->sc_awdl_probe.tx.data_stalled = 0;
+    /* The ROC test's station, queue and ROC went with the firmware; the queue's ring is freed with the others. */
+    sc->sc_awdl_probe.roc.sta_added = sc->sc_awdl_probe.roc.pending = sc->sc_awdl_probe.roc.active = 0;
+    sc->sc_awdl_probe.roc.qid = -1;
+    /* The faulted firmware is gone with everything it held: AWDL may start again on the new one (1.1.73). */
+    if (sc->sc_awdl_probe.tx.fault_tripped && sc->sc_awdl_probe.tx.tripped) {
+        sc->sc_awdl_probe.tx.fault_tripped = 0;
+        sc->sc_awdl_probe.tx.tripped = 0;
+        ++sc->sc_awdl_probe.tx.fault_rearms;
+        sc->sc_awdl_probe.ctx.solo_failed = 0;
+        sc->sc_pcitag->setProperty("ItlwmAwdlTxTripped", 0ULL, 32);
+        sc->sc_pcitag->setProperty("ItlwmAwdlFaultRearms", sc->sc_awdl_probe.tx.fault_rearms, 32);
+    }
     if (sc->sc_awdl_native_requested)
         sc->sc_pcitag->setProperty("ItlwmAwdlNativeMonitorReady", false);
 #endif
@@ -15476,6 +16048,14 @@ iwx_watchdog(struct _ifnet *ifp)
                 others |= i != sc->sc_awdl_probe.ctx.own_qid && sc->txq[i].queued;
             sc->sc_awdl_probe.ctx.own_active = 0;
             sc->sc_awdl_probe.ctx.own_held = 1;
+            if (!others)
+                sc->sc_tx_timer = 0;
+        }
+        /* The ROC test's AUX queue holds frames between ROCs: that must not restart the AP connection (1.1.75). */
+        if (sc->sc_tx_timer == 1 && sc->sc_awdl_probe.roc.qid > 0 && sc->txq[sc->sc_awdl_probe.roc.qid].queued) {
+            bool others = false;
+            for (int i = 0; i < IWX_MAX_QUEUES; i++)
+                others |= i != sc->sc_awdl_probe.roc.qid && i != sc->sc_awdl_probe.ctx.own_qid && sc->txq[i].queued;
             if (!others)
                 sc->sc_tx_timer = 0;
         }
@@ -15897,12 +16477,17 @@ void ItlIwx::
 iwx_nic_error(struct iwx_softc *sc)
 {
 #ifdef AIRPORT_WCL
-    /* One firmware fault ends this boot's AWDL test; recovery must not re-enter it. */
+    /*
+     * A firmware fault stops AWDL until the firmware restarts. The restart re-arms it up to
+     * IWX_AWDL_FAULT_REARM_MAX times; after that it stays off for the boot (1.1.73: before, the first fault did).
+     */
     if ((sc->sc_awdl_probe.tx.mode || sc->sc_awdl_probe.ctx.mode) && !sc->sc_awdl_probe.tx.tripped &&
         (sc->sc_awdl_probe.tx.mcast_sent || sc->sc_awdl_probe.tx.unicast_sent || sc->sc_awdl_probe.ctx.adds)) {
         sc->sc_awdl_probe.tx.tripped = 1;
         ++sc->sc_awdl_probe.tx.firmware_faults;
+        sc->sc_awdl_probe.tx.fault_tripped = sc->sc_awdl_probe.tx.fault_rearms < IWX_AWDL_FAULT_REARM_MAX;
         sc->sc_pcitag->setProperty("ItlwmAwdlTxTripped", sc->sc_awdl_probe.tx.tripped, 32);
+        sc->sc_pcitag->setProperty("ItlwmAwdlFirmwareFaults", sc->sc_awdl_probe.tx.firmware_faults, 32);
     }
 #endif
     ++sc->sc_fw_errors;
@@ -16200,6 +16785,14 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data,
             case IWX_WIDE_ID(IWX_MAC_CONF_GROUP, IWX_LINK_CONFIG_CMD):
             case IWX_WIDE_ID(IWX_MAC_CONF_GROUP, IWX_STA_CONFIG_CMD):
             case IWX_WIDE_ID(IWX_MAC_CONF_GROUP, IWX_STA_REMOVE_CMD):
+            /*
+             * Their replies fell to "unhandled" and never completed: AUX_STA_CMD waited out its timeout and returned
+             * EWOULDBLOCK (35), so the ROC test stopped at setup stage 1 on 2026-11-11 08:33 (ItlwmLastCmdId 0x30b) with
+             * no firmware error; ROC_CMD, sent async, would have kept its command ring slot (1.1.84).
+             */
+            case IWX_WIDE_ID(IWX_MAC_CONF_GROUP, IWX_AUX_STA_CMD):
+            case IWX_WIDE_ID(IWX_MAC_CONF_GROUP, IWX_ROC_CMD):
+            case IWX_WIDE_ID(IWX_MAC_CONF_GROUP, IWX_STA_DISABLE_TX_CMD):
             case IWX_WIDE_ID(IWX_DATA_PATH_GROUP, IWX_SCD_QUEUE_CONFIG_CMD):
             case IWX_WIDE_ID(IWX_DATA_PATH_GROUP, IWX_SEC_KEY_CMD):
             case IWX_WIDE_ID(IWX_DATA_PATH_GROUP, IWX_RLC_CONFIG_CMD):
@@ -16351,6 +16944,27 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data,
                 break;
             }
                 
+#ifdef AIRPORT_WCL
+            case IWX_WIDE_ID(IWX_MAC_CONF_GROUP, IWX_ROC_NOTIF): {
+                struct iwx_roc_notif *notif;
+                SYNC_RESP_STRUCT(notif, pkt, struct iwx_roc_notif *);
+                auto r = &sc->sc_awdl_probe.roc;
+                if (iwx_rx_packet_payload_len(pkt) < sizeof(*notif) || !r->pending ||
+                    le32toh(notif->activity) != r->activity)
+                    break;
+                if (!le32toh(notif->success)) {
+                    ++r->failed;
+                    r->pending = r->active = 0;
+                } else if (le32toh(notif->started)) {
+                    ++r->started;
+                    r->active = 1;
+                } else {
+                    ++r->ended;
+                    r->pending = r->active = 0;
+                }
+                break;
+            }
+#endif
             case IWX_WIDE_ID(IWX_MAC_CONF_GROUP, IWX_SESSION_PROTECTION_NOTIF): {
                 struct iwx_session_prot_notif *notif;
                 SYNC_RESP_STRUCT(notif, pkt, struct iwx_session_prot_notif *);
@@ -18221,6 +18835,8 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
         uint32_t awdlProbe = 0;
         PE_parse_boot_argn("be201_awdl_probe", &awdlProbe, sizeof(awdlProbe));
         memset(&sc->sc_awdl_probe, 0, sizeof(sc->sc_awdl_probe));
+        sc->sc_awdl_probe.roc.qid = -1;
+        sc->sc_awdl_probe.ctx.own_target = -1;
         sc->sc_awdl_native_requested = false;
         sc->sc_awdl_probe.mode = awdlProbe <= 2 ? awdlProbe : 0;
         sc->sc_pcitag->setProperty("ItlwmAwdlProbeMode", sc->sc_awdl_probe.mode, 32);
@@ -18683,6 +19299,7 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
     task_set(&sc->awdl_ownq_task, iwx_awdl_ownq_task, sc, "iwx_awdl_ownq_task");
     task_set(&sc->awdl_phy2_task, iwx_awdl_phy2_task, sc, "iwx_awdl_phy2_task");
     task_set(&sc->awdl_solo_task, iwx_awdl_solo_task, sc, "iwx_awdl_solo_task");
+    task_set(&sc->awdl_roc_task, iwx_awdl_roc_task, sc, "iwx_awdl_roc_task");
     ic->ic_wcl_port_authorized = iwx_wcl_port_authorized;
 #endif
     task_set(&sc->mac_ctxt_task, iwx_mac_ctxt_task, sc, "iwx_mac_ctxt_task");

@@ -1653,12 +1653,30 @@ uint32_t AirportItlwm::awdlOwnFixWanted()
 
 // Test only: answer the family's peer cache requests. Off, a request is taken and never answered, as through 1.1.44.
 static int be201AwdlCacheOnValue;
+// Set by automatic start; awdlUmiDone may then turn the answers off again (1.1.72).
+static bool be201CacheOnByDefault;
+static uint32_t be201UmiFailStreak;
+static constexpr uint32_t kBe201UmiFailsBeforeCacheOff = 4;
 SYSCTL_INT(_debug, OID_AUTO, be201_awdl_cache_on, CTLFLAG_RW | CTLFLAG_LOCKED, &be201AwdlCacheOnValue, 0, "");
+// Peer cache answers only for a peer that just registered real-time group traffic (ensemble, sidecar), 1.1.69.
+static int be201AwdlCacheRtgValue;
+SYSCTL_INT(_debug, OID_AUTO, be201_awdl_cache_rtg, CTLFLAG_RW | CTLFLAG_LOCKED, &be201AwdlCacheRtgValue, 0, "");
 
 static int be201AwdlUmiValue;
 SYSCTL_INT(_debug, OID_AUTO, be201_awdl_umi, CTLFLAG_RW | CTLFLAG_LOCKED, &be201AwdlUmiValue, 0, "");
 static int be201AwdlLlwValue;
 SYSCTL_INT(_debug, OID_AUTO, be201_awdl_llw, CTLFLAG_RW | CTLFLAG_LOCKED, &be201AwdlLlwValue, 0, "");
+/*
+ * 1.1.75 test, off by default: remain on channel for the AWDL sequence's other 5 GHz channel. Mode in the low
+ * nibble (1 ROC only, 2 also management and multicast frames, 3 also unicast data), ROC activity in the next.
+ */
+static int be201AwdlRocValue;
+SYSCTL_INT(_debug, OID_AUTO, be201_awdl_roc, CTLFLAG_RW | CTLFLAG_LOCKED, &be201AwdlRocValue, 0, "");
+uint32_t AirportItlwm::awdlRocWanted()
+{
+    const int value = __atomic_load_n(&be201AwdlRocValue, __ATOMIC_ACQUIRE);
+    return value > 0 && value < 64 ? static_cast<uint32_t>(value) : 0;
+}
 
 bool AirportItlwm::awdlUmiOn()
 {
@@ -1673,6 +1691,11 @@ bool AirportItlwm::awdlLlwOn()
 bool AirportItlwm::awdlCacheOn()
 {
     return __atomic_load_n(&be201AwdlCacheOnValue, __ATOMIC_ACQUIRE) == 1;
+}
+
+bool AirportItlwm::awdlCacheRtgOn()
+{
+    return __atomic_load_n(&be201AwdlCacheRtgValue, __ATOMIC_ACQUIRE) == 1;
 }
 
 static int be201AwdlVifRxValue;
@@ -1707,6 +1730,18 @@ void AirportItlwm::awdlUmiDone(const uint8_t *mac, bool acked)
 {
     if (!getWorkLoop() || !getWorkLoop()->inGate() || awdlStopping || awdlCreating || !awdlInterface)
         return;
+    /*
+     * Safety for the default cache answers: if UMI keeps failing after them, the 1.1.45 failure (cache added, UMI
+     * failing, AirDrop not starting) may be back, so stop answering for this boot. A success resets the count.
+     */
+    if (acked) {
+        be201UmiFailStreak = 0;
+    } else if (++be201UmiFailStreak >= kBe201UmiFailsBeforeCacheOff && be201CacheOnByDefault &&
+               __atomic_load_n(&be201AwdlCacheOnValue, __ATOMIC_ACQUIRE) == 1) {
+        __atomic_store_n(&be201AwdlCacheOnValue, 0, __ATOMIC_RELEASE);
+        setProperty("ItlwmAwdlCacheAutoOff", true);
+    }
+    setProperty("ItlwmAwdlUmiFailStreak", be201UmiFailStreak, 32);
     awdlInterface->umiDone(mac, acked);
 }
 
@@ -1791,8 +1826,10 @@ void AirportItlwm::registerAWDLArmControl()
     sysctl_register_oid(&sysctl__debug_be201_awdl_phy2_te);
     sysctl_register_oid(&sysctl__debug_be201_awdl_amsdu);
     sysctl_register_oid(&sysctl__debug_be201_awdl_cache_on);
+    sysctl_register_oid(&sysctl__debug_be201_awdl_cache_rtg);
     sysctl_register_oid(&sysctl__debug_be201_awdl_umi);
     sysctl_register_oid(&sysctl__debug_be201_awdl_llw);
+    sysctl_register_oid(&sysctl__debug_be201_awdl_roc);
     awdlArmRegistered = true;
 }
 
@@ -1817,8 +1854,36 @@ void AirportItlwm::startAWDLAuto()
     __atomic_store_n(&be201AwdlOwnQueueValue, 1, __ATOMIC_RELEASE);
     __atomic_store_n(&be201AwdlTxAggValue, 1, __ATOMIC_RELEASE);
     __atomic_store_n(&be201AwdlOwnFixValue, 3, __ATOMIC_RELEASE);
+    // UMI (acked by iPhone and iPad since 1.1.47). Universal Control worked with it on 1.1.67.
+    __atomic_store_n(&be201AwdlUmiValue, 1, __ATOMIC_RELEASE);
+    /*
+     * 1.1.69: real-time group peers get their peer cache answer. handleEnsembleTrafficReg waits 3 s for it
+     * ("Waiting for caching of HP-RTG Peer"), and a second registration in that time waits 5 s for the first and
+     * fails with 0xE00002CA: Universal Control's General I/O error while llw0 was on (1.1.67), Sidecar's "failed to
+     * add SideCar to RTG". AirDrop peers still get no answer (1.1.45). llw0 is on again with it, for Continuity
+     * Camera and Sidecar; debug.be201_awdl_llw=0 still brings Universal Control back at once if this is not enough.
+     */
+    __atomic_store_n(&be201AwdlCacheRtgValue, 1, __ATOMIC_RELEASE);
+    /*
+     * 1.1.74: llw0 off by default again. The next work (AirDrop on two channels, then ranging and the camera) is
+     * measured without it; debug.be201_awdl_llw=1 still creates it for a test.
+     */
+    __atomic_store_n(&be201AwdlLlwValue, 0, __ATOMIC_RELEASE);
+    /*
+     * 1.1.72: peer cache answers for every peer. The family asks for the cache before it hands the traffic
+     * registration to the driver, so 1.1.69's registration window never opened (RtgCacheAnswers 0), and it sends UMI
+     * only to a cached peer ("Not sending UMI because peer ... is not cached"): Continuity Camera's ensemble start
+     * failed at "waiting for UMIStatus" and the phone never streamed. On 1.1.45 these answers broke AirDrop while UMI
+     * was not implemented; UMI is acked since 1.1.47. awdlUmiDone turns them off for the boot if UMI keeps failing.
+     */
+    __atomic_store_n(&be201AwdlCacheOnValue, 1, __ATOMIC_RELEASE);
+    be201CacheOnByDefault = true;
     setProperty("ItlwmAwdlAuto", true);
     setProperty("ItlwmAwdlSpeedDefault", true);
+    setProperty("ItlwmAwdlUmiDefault", true);
+    setProperty("ItlwmAwdlRtgCacheDefault", true);
+    setProperty("ItlwmAwdlCacheDefault", true);
+    setProperty("ItlwmAwdlLowLatencyDefault", false);
 }
 
 bool AirportItlwm::awdlLastBootPanicked()
@@ -2021,8 +2086,10 @@ void AirportItlwm::stopAWDLInterface()
         sysctl_unregister_oid(&sysctl__debug_be201_awdl_phy2_te);
         sysctl_unregister_oid(&sysctl__debug_be201_awdl_amsdu);
         sysctl_unregister_oid(&sysctl__debug_be201_awdl_cache_on);
+        sysctl_unregister_oid(&sysctl__debug_be201_awdl_cache_rtg);
         sysctl_unregister_oid(&sysctl__debug_be201_awdl_umi);
         sysctl_unregister_oid(&sysctl__debug_be201_awdl_llw);
+        sysctl_unregister_oid(&sysctl__debug_be201_awdl_roc);
         awdlArmRegistered = false;
     }
     AirportItlwmAWDLInterface *interface = nullptr;

@@ -174,8 +174,9 @@ void ItlDmaArena::deallocate(ItlDmaBuffer &buffer)
         panic("AirportItlwm: invalid DMA pool release");
     }
     auto &block = blocks[buffer.block];
-    if (recyclingDeferred) {
+    if (recyclingDeferred || retireDepth) {
         block.runs[buffer.page] |= Retired;
+        retiredPages += buffer.pages;
     } else {
         for (uint32_t n = 0; n < buffer.pages; n++)
             block.runs[buffer.page + n] = 0;
@@ -189,6 +190,37 @@ void ItlDmaArena::deferRecycling()
 {
     IOSimpleLockLock(lock);
     recyclingDeferred = true;
+    IOSimpleLockUnlock(lock);
+}
+
+/*
+ * 2026-11-10: one refused queue switched every later release to Retired until the next device stop. A boot with ten
+ * network changes and AWDL queue rebuilds then ran out of the 64 MiB pool: the AP's data queues and the AWDL queue
+ * failed with ENOMEM (MldDataQueues 0, MldTxqErr 12, OwnErr 12), AirDrop stopped and ROC never started (1.1.81).
+ */
+void ItlDmaArena::beginRetire()
+{
+    IOSimpleLockLock(lock);
+    ++retireDepth;
+    IOSimpleLockUnlock(lock);
+}
+
+void ItlDmaArena::endRetire()
+{
+    IOSimpleLockLock(lock);
+    if (retireDepth)
+        --retireDepth;
+    IOSimpleLockUnlock(lock);
+}
+
+void ItlDmaArena::stats(uint32_t &used, uint32_t &highWater, uint32_t &failed, uint32_t &retired, bool &deferred)
+{
+    IOSimpleLockLock(lock);
+    used = usedPages * PageSize;
+    highWater = highWaterPages * PageSize;
+    failed = failures;
+    retired = retiredPages * PageSize;
+    deferred = recyclingDeferred;
     IOSimpleLockUnlock(lock);
 }
 
@@ -207,6 +239,7 @@ void ItlDmaArena::reclaim()
             for (uint32_t n = 0; n < count; n++)
                 block.runs[p + n] = 0;
             usedPages -= count;
+            retiredPages -= count <= retiredPages ? count : retiredPages;
             p += count - 1;
         }
     }

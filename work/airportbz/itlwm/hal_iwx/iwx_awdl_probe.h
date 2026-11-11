@@ -27,6 +27,8 @@
 #define IWX_AWDL_TX_WINDOW_US 20000u
 #define IWX_AWDL_PEER_STA_MAX 4u
 #define IWX_AWDL_PEER_MIN_RSSI (-65)
+/* A station not heard from for this long may give its place to a new nearby peer (1.1.77). */
+#define IWX_AWDL_PEER_IDLE_US 3000000u
 #define IWX_AWDL_SELF_METRIC 60u
 /* Far below the ring's high mark, so held frames can never stop the AP's traffic. */
 #define IWX_AWDL_TX_MAX_QUEUED 8
@@ -66,6 +68,35 @@
 #define IWX_AWDL_PHY2_AUTO_STABLE_US 2000000u
 /* The own queue moves to another peer only after its current peer had no frame for this long. */
 #define IWX_AWDL_OWN_QUIET_US 1000000u
+/*
+ * The own queue serves one peer. With Universal Control or other light traffic to an iPad, the quiet rule kept it there
+ * and an AirDrop to the iPhone went out on the AP queue without aggregation, about 4 MB/s (2026-11-10, 4 peers, 11
+ * retargets). Bytes decide too: over a 500 ms window, a peer taking at least 512 KB and four times the current peer's
+ * bytes gets the queue (1.1.77).
+ */
+#define IWX_AWDL_OWN_BULK_WINDOW_US 500000u
+#define IWX_AWDL_OWN_BULK_BYTES (512u * 1024u)
+/*
+ * AWDL bulk data for the scan gate (1.1.79): at least this many unicast bytes to peer stations over the last closed
+ * window and the one being counted, with the last window closed no more than 1.5 s ago.
+ */
+#define IWX_AWDL_SCAN_DEFER_BYTES (256u * 1024u)
+#define IWX_AWDL_SCAN_DEFER_STALE_US 1500000u
+/*
+ * 1.1.80: the gate also holds for this long after the last bulk data. Once a transfer slowed for any reason, its byte
+ * count fell, the scans came back to back and the stall went on (2026-11-10 16:12 boot: 54 real scans, 7 deferred).
+ */
+#define IWX_AWDL_SCAN_HOLD_US 10000000u
+/* Per-second history for stalls (1.1.80): 90 one-second samples, newest last when read from the property. */
+#define IWX_AWDL_HIST_LEN 90u
+enum { IWX_AWDL_HIST_OWN_ACTIVE = 1, IWX_AWDL_HIST_OWN_HELD = 2, IWX_AWDL_HIST_BGSCAN = 4, IWX_AWDL_HIST_TX_TIMER = 8,
+       IWX_AWDL_HIST_SOLO = 16, IWX_AWDL_HIST_DATA_STALLED = 32, IWX_AWDL_HIST_BULK = 64, IWX_AWDL_HIST_SCAN_HELD = 128 };
+struct iwx_awdl_hist {
+    uint32_t t_s, own_sent, own_ok, own_agg_fail, own_ba_notifs, tx_busy, data_stalls, own_recovers, mcast_sent;
+    uint16_t own_queued, ap_queued;
+    uint32_t flags;
+};
+static inline bool iwx_awdl_bulk_active(const struct iwx_awdl_probe *p, uint64_t now_us);
 /* A held own queue (frames that never finish, often the tail left when a peer goes) is freed and rebuilt after this
  * long, again and again while rebuilds still carry frames; after this many rebuilds in a row with nothing done, never. */
 #define IWX_AWDL_OWN_RECOVER_US 3000000u
@@ -75,6 +106,66 @@
 /* With no infrastructure network: how long the driver must sit idle before AWDL runs on its own, and its channel. */
 #define IWX_AWDL_SOLO_IDLE_US 5000000u
 #define IWX_AWDL_SOLO_CHAN 149u
+/* Firmware faults that the restart may recover from; the next one keeps AWDL off for the boot (1.1.73). */
+#define IWX_AWDL_FAULT_REARM_MAX 2u
+#include <sys/errno.h>
+/*
+ * Errors that only say the host command ring was busy at that moment (iwx_send_cmd: ring full or the slot still
+ * owned by a waiting caller). The own queue tries again a second later instead of giving up for the boot (1.1.76).
+ */
+static inline bool iwx_awdl_err_transient(int err) {
+    const int e = err < 0 ? -err : err;
+    return e == ENOSPC || e == EBUSY || e == EAGAIN;
+}
+/*
+ * Remain on channel for the AWDL sequence's other 5 GHz channel (1.1.75 test, debug.be201_awdl_roc, off by default):
+ * an AUX station and its queue carry the frames, node_addr is the AWDL address. Mode in the low nibble, activity in
+ * the next: 1 ROC only, 2 also AWDL management and multicast frames on the AUX queue, 3 also unicast data.
+ */
+#define IWX_AWDL_ROC_STA_ID 12u
+#define IWX_AWDL_ROC_TID 8u
+#define IWX_AWDL_ROC_SLOT_TU 16u
+#define IWX_AWDL_ROC_MAX_TU 128u
+#define IWX_AWDL_ROC_DELAY_TU 16u
+#define IWX_AWDL_ROC_STALE_US 1000000u
+#define IWX_AWDL_ROC_SETUP_US 1000000u
+/*
+ * Discovery ROC (1.1.85): with no AWDL frame heard for IWX_AWDL_ROC_HEARD_US, one ROC of IWX_AWDL_ROC_DISC_TU on the
+ * sequence's other 5 GHz channel every IWX_AWDL_ROC_DISC_GAP_US. 2026-11-11 15:39: 36 slot ROCs of 16 TU on 149
+ * started and ended and heard nothing (RocRxDuring 0): without a heard peer the AW timing is free-running, and a
+ * one-slot ROC rarely meets the phone. 120 TU covers more than one PSF period (110 TU in the family log).
+ */
+#define IWX_AWDL_ROC_HEARD_US 2000000u
+#define IWX_AWDL_ROC_DISC_TU 120u
+#define IWX_AWDL_ROC_DISC_DELAY_TU 64u
+#define IWX_AWDL_ROC_DISC_GAP_US 1000000u
+/*
+ * Mode 4 (1.1.86): as 3, but AWDL frames wait on the AUX queue between ROCs too. 2026-11-11 15:53: with the AWDL link
+ * on the AP's PHY, 139 discovery ROCs of 120 TU on 149 heard no AWDL frame (RocRxAwdlAny 0, RocRxAnyChan 31 of 3729),
+ * while the link on a 149 PHY received AWDL there (RxPhy2 301 at boot, solo). The tool pairs mode 4 with phy2 1: the
+ * link on 149 passes the phone's frames, ROC takes the radio there, and the own queue on that link never sends.
+ */
+static inline uint32_t iwx_awdl_roc_mode(uint32_t v) { return (v & 15u) <= 4u ? (v & 15u) : 0u; }
+/* Frames take the AUX queue only while an ROC runs, or always in mode 4. */
+static inline bool iwx_awdl_roc_routes(uint32_t mode, bool active) { return active || mode >= 4; }
+/*
+ * Modes that send (2 and up) always use P2P_TXRX (1.1.87). 2026-11-11 16:08: the tool picked HOTSPOT (0) for modes 2-4
+ * and the firmware asserted three times (0x20103620, last host command ROC_CMD 0x23030e), AWDL latched off and the
+ * router link dropped. With P2P_TXRX the same modes ran 160+ ROCs with AUX transmit and no error (15:53), and mode 1
+ * with HOTSPOT, which sends nothing, had none either.
+ */
+static inline uint32_t iwx_awdl_roc_activity(uint32_t v) {
+    return iwx_awdl_roc_mode(v) >= 2 ? 2u : (v >> 4) & 3u;
+}
+/* Whether a frame of this AWDL kind (1 multicast, 2 unicast) leaves on the AUX queue while an ROC runs. */
+static inline bool iwx_awdl_roc_takes(uint32_t mode, uint8_t awdl_kind, bool mgmt) {
+    return mode >= 3 ? awdl_kind != 0 : (mode == 2 && (awdl_kind == 1 || (awdl_kind && mgmt)));
+}
+/* Duration of an ROC for a run of this many 16 TU slots; 0 for no ROC. */
+static inline uint32_t iwx_awdl_roc_duration(uint32_t run) {
+    const uint32_t tu = run * IWX_AWDL_ROC_SLOT_TU;
+    return tu > IWX_AWDL_ROC_MAX_TU ? IWX_AWDL_ROC_MAX_TU : tu;
+}
 
 static const uint8_t iwx_awdl_bssid[6] = {0x00, 0x25, 0x00, 0xff, 0x94, 0x73};
 
@@ -113,7 +204,13 @@ struct iwx_awdl_tx {
     /* Destination of the last unicast data frame, which the own queue follows. */
     uint8_t last_dest[6];
     uint8_t last_dest_valid;
+    /* Unicast data bytes per peer station: the window being counted and the last whole one (1.1.77). */
+    uint32_t dest_bytes[IWX_AWDL_PEER_STA_MAX], dest_bytes_last[IWX_AWDL_PEER_STA_MAX];
+    uint64_t dest_window_us;
+    uint64_t bulk_last_us;       /* Last tick with bulk data (1.1.80): the scan gate holds 10 s past it. */
     uint32_t mode, tripped, firmware_faults;
+    /* Set when a firmware fault tripped AWDL: the firmware restart may re-arm it (1.1.73). */
+    uint32_t fault_tripped, fault_rearms;
     uint8_t self[6], peer[6], peer_valid;
     uint16_t seq;
     uint64_t last_psf_us, last_mif_us, last_unicast_us;
@@ -167,7 +264,10 @@ struct iwx_awdl_ctx {
     /* Default from 1.1.54: retarget only after the current peer went quiet; held queues rebuilt, a bounded number of times. */
     uint32_t own_sent_mark, own_recovers, own_recover_fails, own_recover_ok_mark, own_quiet_skips;
     uint64_t own_busy_us, own_held_us, own_try_us;
+    int32_t own_target;          /* Peer index the next build must use: the bulk peer (1.1.77); -1 none. */
+    uint32_t own_bulk_moves;
     uint32_t own_retries;
+    uint32_t own_transient, own_transient_last; /* Busy command ring: retried, not latched (1.1.76). */
     /* This Mac's own schedule, from the AW timer: the slot starting now, how many slots of that channel follow, the
      * 5 GHz channel the sequence uses. Second channel automatic choice and mode 3 windows. */
     uint8_t slot_chan, slot_run, auto_cand;
@@ -202,12 +302,54 @@ struct iwx_awdl_ctx {
     uint32_t te_own, phy2_auto_changes;
 };
 
+struct iwx_awdl_roc {
+    uint32_t want, mode, activity;   /* want: from the switch each tick; mode/activity: latched at setup */
+    int32_t qid;
+    uint8_t sta_added, pending, active, chan, setup_failed;
+    uint64_t sent_us, setup_us;
+    uint32_t adds, add_err, started, ended, failed, stale, removes;
+    uint32_t setups, setup_err, setup_stage, teardowns;
+    uint32_t tx_sent, tx_ok, tx_fail, tx_drop, rx_during;
+    uint32_t blocked, blocked_pub;   /* Readiness bits missing while wanted (1.1.82); published on change. */
+    /* 1.1.85: last AWDL frame heard on any channel, discovery ROCs, and every frame received while an ROC runs. */
+    uint64_t heard_us, disc_us;
+    uint32_t disc, rx_any, rx_any_chan, rx_awdl_any;
+    uint8_t disc_pending;
+};
+
+/* A discovery ROC is due: nothing AWDL heard lately and the last one long enough ago (1.1.85). */
+static inline bool iwx_awdl_roc_disc_due(const struct iwx_awdl_roc *r, uint64_t now_us)
+{
+    const bool heard = r->heard_us && now_us - r->heard_us < IWX_AWDL_ROC_HEARD_US;
+    return !heard && (!r->disc_us || now_us - r->disc_us >= IWX_AWDL_ROC_DISC_GAP_US);
+}
+
+/* The sequence's 5 GHz channel that is not the AP's: seq5 holds two channels, low byte first (0 when none). */
+static inline uint32_t iwx_awdl_roc_other5(uint32_t seq5, uint32_t ap)
+{
+    const uint32_t a = seq5 & 0xff, b = (seq5 >> 8) & 0xff;
+    if (a >= 36 && a != ap)
+        return a;
+    if (b >= 36 && b != ap)
+        return b;
+    return 0;
+}
+
 struct iwx_awdl_probe {
     uint32_t mode;            /* 0 off, 1 mgmt filter, 2 mgmt filter + promiscuous, 3 own context */
     uint32_t assoc_rx;        /* Mode 6 also holds a station and association, for data receive. */
     /* Nearby AWDL senders that get a firmware station. Staged here, sent by the peer task. */
     uint8_t peer_addr[IWX_AWDL_PEER_STA_MAX][6];
     uint32_t peer_count, peer_added, peer_failed, peer_errors;
+    /*
+     * Replacing stations (1.1.77): when last heard, and an address staged to take an index's place. The table has 4
+     * places and nothing ever left it: with 8 devices around, the AirDrop target often had no station (no own queue,
+     * about 4 MB/s), and after Wi-Fi and Bluetooth were turned off and on the peers' new addresses never got one.
+     */
+    uint64_t peer_seen_us[IWX_AWDL_PEER_STA_MAX];
+    uint8_t peer_new[IWX_AWDL_PEER_STA_MAX][6];
+    uint8_t peer_replace;
+    uint32_t peer_replaced, peer_replace_err;
     uint32_t foreign_data;    /* Data in another BSS: the filter is wider than this address. */
     uint32_t awdl_data_self;  /* AWDL data sent to this interface's address. */
     uint32_t rx_data_rate, rx_data_rate_peak, rx_data_ampdu; /* Of those: what the peer really sends. */
@@ -254,6 +396,10 @@ struct iwx_awdl_probe {
     struct iwx_awdl_sync sync;
     struct iwx_awdl_tx tx;
     struct iwx_awdl_ctx ctx;
+    struct iwx_awdl_roc roc;
+    struct iwx_awdl_hist hist[IWX_AWDL_HIST_LEN];
+    uint32_t hist_next;
+    uint64_t hist_us;
 };
 
 struct iwx_awdl_tlvs {
@@ -789,8 +935,9 @@ static inline void iwx_awdl_umi_note(struct iwx_awdl_probe *p, const uint8_t *pe
 }
 
 /*
- * llw0 shares awdl0's address. Native firmware tags which interface a frame is for; nothing here does,
- * so frames follow the ports llw0 has sent from. ICMPv6 goes to both, since either may be resolving a neighbor.
+ * llw0 shares awdl0's address. Native firmware tags which interface a frame is for; nothing here does, so frames
+ * to an IPv6 ULA destination, or to a port llw0 has sent from, go to llw0. ICMPv6 goes to both, since either may be
+ * resolving a neighbor.
  */
 #define IWX_AWDL_LLW_PORTS 16u
 struct iwx_awdl_llw_ports {
@@ -817,6 +964,12 @@ static inline enum iwx_awdl_llw_route iwx_awdl_llw_input(const struct iwx_awdl_l
     const uint8_t proto = iwx_awdl_llw_proto(eth, n);
     if (proto == 58) return IWX_AWDL_ROUTE_BOTH;
     if ((proto != 6 && proto != 17) || n < 14 + 40 + 4 || (eth[0] & 1)) return IWX_AWDL_ROUTE_AWDL;
+    /*
+     * Low latency sessions (Rapport UDPNWPath: Continuity Camera, Sidecar) use per-session IPv6 ULA addresses, fc00::/7,
+     * and the Mac is often the server: on 1.1.70 the phone's RTP to a llw0 listener never matched a port llw0 had sent
+     * from, went to awdl0 and was lost (RTCP timeout). awdl0's own traffic (AirDrop, Universal Control) is link-local.
+     */
+    if ((eth[14 + 24] & 0xfe) == 0xfc) return IWX_AWDL_ROUTE_LLW;
     const uint16_t port = uint16_t(eth[14 + 42] << 8 | eth[14 + 43]);
     for (unsigned i = 0; i < IWX_AWDL_LLW_PORTS; ++i)
         if (t->port[i] == port && t->proto[i] == proto) return IWX_AWDL_ROUTE_LLW;
@@ -950,6 +1103,60 @@ static inline int iwx_awdl_peer_index(const struct iwx_awdl_probe *p, const uint
     for (uint32_t i = 0; i < p->peer_added && i < IWX_AWDL_PEER_STA_MAX; ++i)
         if (!memcmp(p->peer_addr[i], peer, 6)) return int(i);
     return -1;
+}
+
+/* Counts unicast data bytes for a peer station; others are not candidates for the own queue. */
+static inline void iwx_awdl_note_bytes(struct iwx_awdl_probe *p, const uint8_t *eth, size_t n) {
+    if (!eth || (eth[0] & 1)) return;
+    const int i = iwx_awdl_peer_index(p, eth);
+    if (i < 0) return;
+    const uint64_t sum = uint64_t(p->tx.dest_bytes[i]) + n;
+    p->tx.dest_bytes[i] = sum > 0xffffffffull ? 0xffffffffu : uint32_t(sum);
+}
+
+static inline bool iwx_awdl_bulk_active(const struct iwx_awdl_probe *p, uint64_t now_us) {
+    if (!p->tx.dest_window_us || now_us < p->tx.dest_window_us || now_us - p->tx.dest_window_us > IWX_AWDL_SCAN_DEFER_STALE_US)
+        return false;
+    uint64_t sum = 0;
+    for (uint32_t i = 0; i < IWX_AWDL_PEER_STA_MAX; ++i)
+        sum += uint64_t(p->tx.dest_bytes_last[i]) + p->tx.dest_bytes[i];
+    return sum >= IWX_AWDL_SCAN_DEFER_BYTES;
+}
+
+/* Bulk now, or within IWX_AWDL_SCAN_HOLD_US of the last tick that saw it (1.1.80). */
+static inline bool iwx_awdl_bulk_recent(const struct iwx_awdl_probe *p, uint64_t now_us) {
+    return iwx_awdl_bulk_active(p, now_us) ||
+        (p->tx.bulk_last_us && now_us >= p->tx.bulk_last_us && now_us - p->tx.bulk_last_us < IWX_AWDL_SCAN_HOLD_US);
+}
+
+/* Appends one sample; the ring keeps the last IWX_AWDL_HIST_LEN. */
+static inline void iwx_awdl_hist_add(struct iwx_awdl_probe *p, const struct iwx_awdl_hist *h) {
+    p->hist[p->hist_next % IWX_AWDL_HIST_LEN] = *h;
+    p->hist_next = (p->hist_next + 1) % IWX_AWDL_HIST_LEN;
+}
+
+/* Closes the byte window once it is IWX_AWDL_OWN_BULK_WINDOW_US old. True when a new window was closed. */
+static inline bool iwx_awdl_bytes_roll(struct iwx_awdl_probe *p, uint64_t now_us) {
+    if (!p->tx.dest_window_us) {
+        p->tx.dest_window_us = now_us;
+        return false;
+    }
+    if (now_us - p->tx.dest_window_us < IWX_AWDL_OWN_BULK_WINDOW_US) return false;
+    memcpy(p->tx.dest_bytes_last, p->tx.dest_bytes, sizeof(p->tx.dest_bytes_last));
+    memset(p->tx.dest_bytes, 0, sizeof(p->tx.dest_bytes));
+    p->tx.dest_window_us = now_us;
+    return true;
+}
+
+/* The peer that should take the own queue from current (-1 for none yet), or -1 to leave it where it is. */
+static inline int iwx_awdl_own_bulk_peer(const uint32_t *bytes, uint32_t count, int current) {
+    int best = -1;
+    uint32_t most = 0;
+    for (uint32_t i = 0; i < count; ++i)
+        if (bytes[i] > most) { most = bytes[i]; best = int(i); }
+    if (best < 0 || best == current || most < IWX_AWDL_OWN_BULK_BYTES) return -1;
+    const uint64_t cur = current >= 0 && uint32_t(current) < count ? bytes[current] : 0;
+    return uint64_t(most) >= 4 * cur ? best : -1;
 }
 
 static inline struct iwx_awdl_ba *iwx_awdl_ba_find(struct iwx_awdl_probe *p, const uint8_t *peer, uint8_t tid) {
@@ -1096,37 +1303,91 @@ static inline uint8_t iwx_awdl_phy2_auto(uint16_t seq, uint8_t home) {
     return b >= 36 && b != home ? b : 0;
 }
 
-/* True when an AWDL action frame names a new nearby sender. Far ones would use up the table in a crowd. */
-static inline bool iwx_awdl_peer_note(struct iwx_awdl_probe *p, const uint8_t *f, size_t len, int rssi) {
+/*
+ * The station a new peer may replace: an added one with nothing staged for it, not keep (the own queue's peer), heard
+ * least recently; with idle_only, only one quiet for IWX_AWDL_PEER_IDLE_US. now_us 0 (no clock) replaces nothing.
+ */
+static inline int iwx_awdl_peer_victim(const struct iwx_awdl_probe *p, uint64_t now_us, int keep, bool idle_only) {
+    int victim = -1;
+    for (uint32_t i = 0; now_us && i < p->peer_added && i < IWX_AWDL_PEER_STA_MAX; ++i) {
+        if (int(i) == keep || (p->peer_replace & (1u << i))) continue;
+        if (idle_only && now_us - p->peer_seen_us[i] < IWX_AWDL_PEER_IDLE_US) continue;
+        if (victim < 0 || p->peer_seen_us[i] < p->peer_seen_us[victim]) victim = int(i);
+    }
+    return victim;
+}
+
+/* Index whose staged replacement is this address, or -1. */
+static inline int iwx_awdl_peer_pending(const struct iwx_awdl_probe *p, const uint8_t *mac) {
+    for (uint32_t i = 0; i < IWX_AWDL_PEER_STA_MAX; ++i)
+        if ((p->peer_replace & (1u << i)) && !memcmp(p->peer_new[i], mac, 6)) return int(i);
+    return -1;
+}
+
+/*
+ * True when an AWDL action frame names a new nearby sender (a station to add or to put in a quiet station's place).
+ * Far ones would use up the table in a crowd. A known sender only refreshes when it was last heard.
+ */
+static inline bool iwx_awdl_peer_note(struct iwx_awdl_probe *p, const uint8_t *f, size_t len, int rssi,
+                                      uint64_t now_us = 0, int keep = -1) {
     if (!p->assoc_rx || p->peer_failed || !f || len < 24 || f[0] != 0xd0 || (f[10] & 1) ||
-        memcmp(f + 16, iwx_awdl_bssid, 6) || rssi < IWX_AWDL_PEER_MIN_RSSI || p->peer_count >= IWX_AWDL_PEER_STA_MAX)
+        memcmp(f + 16, iwx_awdl_bssid, 6))
         return false;
-    for (uint32_t i = 0; i < p->peer_count; ++i)
-        if (!memcmp(p->peer_addr[i], f + 10, 6)) return false;
-    memcpy(p->peer_addr[p->peer_count++], f + 10, 6);
+    for (uint32_t i = 0; i < p->peer_count && i < IWX_AWDL_PEER_STA_MAX; ++i)
+        if (!memcmp(p->peer_addr[i], f + 10, 6)) {
+            p->peer_seen_us[i] = now_us;
+            return false;
+        }
+    if (rssi < IWX_AWDL_PEER_MIN_RSSI || iwx_awdl_peer_pending(p, f + 10) >= 0)
+        return false;
+    if (p->peer_count < IWX_AWDL_PEER_STA_MAX) {
+        p->peer_seen_us[p->peer_count] = now_us;
+        memcpy(p->peer_addr[p->peer_count++], f + 10, 6);
+        return true;
+    }
+    const int v = iwx_awdl_peer_victim(p, now_us, keep, true);
+    if (v < 0) return false;
+    memcpy(p->peer_new[v], f + 10, 6);
+    p->peer_replace = uint8_t(p->peer_replace | (1u << v));
     return true;
 }
 
 /*
  * The family asks for a peer in the firmware's cache: for this driver that is a peer station. True when the
- * task should run. A delete is answered and the station stays, as it does for every peer heard. Full is no answer.
+ * task should run. A delete is answered and the station stays, but it is the first to give its place (1.1.77). A full
+ * table makes room: the family asks for the peer it is about to send to, so the least recently heard station that
+ * the own queue does not use is replaced, quiet or not. Full with no such station is no answer.
  */
-static inline bool iwx_awdl_cache_request(struct iwx_awdl_probe *p, const uint8_t *mac, uint32_t op) {
+static inline bool iwx_awdl_cache_request(struct iwx_awdl_probe *p, const uint8_t *mac, uint32_t op,
+                                          uint64_t now_us = 0, int keep = -1) {
     if (!p->assoc_rx || p->peer_failed || !mac || (mac[0] & 1)) return false;
     uint32_t i = 0;
     while (i < p->peer_count && memcmp(p->peer_addr[i], mac, 6)) ++i;
     if (op == IWX_AWDL_CACHE_REQ_DELETE) {
         if (i == p->peer_count) return false;
         p->cache_del_wait = uint8_t(p->cache_del_wait | (1u << i));
+        p->peer_seen_us[i] = 0;
         return true;
     }
     if (i == p->peer_count) {
-        if (p->peer_count >= IWX_AWDL_PEER_STA_MAX) {
-            ++p->cache_full;
-            return false;
+        const int pending = iwx_awdl_peer_pending(p, mac);
+        if (pending >= 0) {
+            i = uint32_t(pending);
+        } else if (p->peer_count < IWX_AWDL_PEER_STA_MAX) {
+            p->peer_seen_us[p->peer_count] = now_us;
+            memcpy(p->peer_addr[p->peer_count++], mac, 6);
+        } else {
+            const int v = iwx_awdl_peer_victim(p, now_us, keep, false);
+            if (v < 0) {
+                ++p->cache_full;
+                return false;
+            }
+            memcpy(p->peer_new[v], mac, 6);
+            p->peer_replace = uint8_t(p->peer_replace | (1u << v));
+            i = uint32_t(v);
         }
-        memcpy(p->peer_addr[p->peer_count++], mac, 6);
-    }
+    } else
+        p->peer_seen_us[i] = now_us;
     p->cache_add_wait = uint8_t(p->cache_add_wait | (1u << i));
     return true;
 }

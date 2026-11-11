@@ -94,6 +94,9 @@ bool AirportItlwmSkywalkInterface::initWCL()
     diagIC->ic_wcl_diag_key_cipher = diagIC->ic_wcl_diag_rsn_length = 0;
     scanPending = false;
     scanCompleted = false;
+    wclScanDeferred = false;
+    wclLastRealScanUs = 0;
+    wclScanDeferredCount = 0;
     wclReadyEvents = 0;
     wclBeaconPublishes = 0;
     wclBeaconsPosted = 0;
@@ -398,6 +401,18 @@ IOReturn AirportItlwmSkywalkInterface::startWCLScan(const AirportWCL::ScanReques
     }
     memcpy(ic->ic_wcl_scan_channels, scan.channels, sizeof(scan.channels));
     if (ic->ic_state == IEEE80211_S_RUN) {
+        uint64_t nowNs = 0;
+        absolutetime_to_nanoseconds(mach_absolute_time(), &nowNs);
+        const uint64_t nowUs = nowNs / 1000;
+        if (fHalService->awdlBulkActive() && wclLastRealScanUs && nowUs - wclLastRealScanUs < 30000000ULL) {
+            wclScanDeferred = true;
+            ++wclScanDeferredCount;
+            if (probeDev)
+                probeDev->setProperty("ItlwmWclScanDeferred", wclScanDeferredCount, 32);
+            scanSource->setTimeoutMS(300);
+            return kIOReturnSuccess;
+        }
+        wclLastRealScanUs = nowUs;
         ieee80211_begin_cache_bgscan(&ic->ic_if);
         if (!(ic->ic_flags & IEEE80211_F_BGSCAN)) {
             scanPending = false;
@@ -476,6 +491,7 @@ void AirportItlwmSkywalkInterface::finishWCLScan(IOReturn status)
         return;
     scanPending = false;
     scanCompleted = false;
+    wclScanDeferred = false;
     scanSource->cancelTimeout();
     fHalService->get80211Controller()->ic_wcl_scan_requested = false;
     postWCLScanDone(status);
@@ -491,6 +507,12 @@ void AirportItlwmSkywalkInterface::completeWCLScan()
      * result, otherwise a legacy result-paging timer can cut a live scan.
      */
     (void) scanCompleted;
+    /* A scan answered from the cache while AWDL carried bulk data (1.1.79): no firmware scan ran, none will end it. */
+    if (scanPending && wclScanDeferred) {
+        fHalService->get80211Controller()->ic_wcl_scan_requested = false;
+        finishWCLScan(kIOReturnSuccess);
+        return;
+    }
     kickWCLScanQueue();
 }
 

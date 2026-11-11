@@ -109,6 +109,7 @@ public:
     void awdlPeerCache(const uint8_t *mac, uint32_t op) { if (fHalService) fHalService->awdlPeerCache(mac, op); }
     void awdlPeerCacheDone(const uint8_t *mac, bool added);
     static bool awdlCacheOn();
+    static bool awdlCacheRtgOn();
     static bool awdlUmiOn();
     static bool awdlLlwOn();
     void sendAWDLUmi(const uint8_t *peer, const uint8_t *tlvs, size_t length) { if (fHalService) fHalService->sendAwdlUmi(peer, tlvs, length); }
@@ -120,6 +121,8 @@ public:
     bool llwFailed = false;
     static bool awdlLastBootPanicked();
     static bool awdlOwnQueueWanted();
+    static uint32_t awdlRocWanted();
+    void setAWDLRoc(uint32_t value) { if (fHalService) fHalService->setAwdlRoc(value); }
     static bool awdlTxAggWanted();
     static uint32_t awdlOwnFixWanted();
     void setAWDLOwnQueue(bool on, bool agg, uint32_t fix) { if (fHalService) fHalService->setAwdlOwnQueue(on, agg, fix); }

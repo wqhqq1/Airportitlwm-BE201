@@ -123,7 +123,7 @@ with tempfile.TemporaryDirectory() as d:
 s=(ROOT/'itlwm/hal_iwx/ItlIwx.cpp').read_text()
 assert 'sc->sc_awdl_probe.tx.mode = awdlTx == 1 && sc->sc_awdl_probe.mode ? 1 : 0;' in s
 i=s.index('iwx_awdl_tx_maybe(struct iwx_softc *sc)\n{');fn=s[i:s.index('#endif',i)]
-for need in ['ni->ni_port_valid','IWX_FLAG_MLD_TXQ_ACTIVE','IWX_FLAG_TXFLUSH','qfullmsk.empty()','ieee80211_ref_node(ni)','ieee80211_release_node(ic, ni)','mbuf_freem(m)']:
+for need in ['iwx_ap_port_open(ic, ni)','IWX_FLAG_MLD_TXQ_ACTIVE','IWX_FLAG_TXFLUSH','qfullmsk.empty()','ieee80211_ref_node(ni)','ieee80211_release_node(ic, ni)','mbuf_freem(m)']:
     assert need in fn,need
 i=s.index('iwx_rx_tx_cmd_single(struct iwx_softc *sc');fn=s[i:s.index('iwx_clear_tx_desc',i)]
 assert fn.index('txd->awdl_kind')<fn.index('iwx_toggle_tx_ant')

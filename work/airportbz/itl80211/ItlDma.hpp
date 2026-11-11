@@ -34,6 +34,13 @@ public:
     bool allocate(uint32_t size, uint32_t alignment, ItlDmaBuffer &buffer);
     void deallocate(ItlDmaBuffer &buffer);
     void deferRecycling();
+    /*
+     * Retire only what is freed between these two calls: the rings of one queue the firmware was told about and
+     * then refused. deferRecycling() stays for a dead firmware, where any buffer may still be read (1.1.82).
+     */
+    void beginRetire();
+    void endRetire();
+    void stats(uint32_t &used, uint32_t &highWater, uint32_t &failed, uint32_t &retired, bool &deferred);
     void reclaim();
     void destroy();
 
@@ -67,6 +74,8 @@ private:
     uint32_t usedPages;
     uint32_t highWaterPages;
     uint32_t failures;
+    uint32_t retireDepth;
+    uint32_t retiredPages;
     bool opened;
     bool recyclingDeferred;
     bool enforce4GiBBoundary;

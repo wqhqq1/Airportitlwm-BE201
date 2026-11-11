@@ -4845,6 +4845,39 @@ struct iwx_ac_qos {
 #define IWX_AUX_STA_CMD         0xb
 #define IWX_STA_REMOVE_CMD      0xc
 #define IWX_STA_DISABLE_TX_CMD  0xd
+/* Remain on channel (iwlmld roc.c; version 4 in bz-b0-fm-c0-92, version 5 layout below version 6). */
+#define IWX_ROC_CMD             0xe
+#define IWX_ROC_NOTIF           0xf8
+
+/* AUX_STA_CMD_API_S_VER_1 */
+struct iwx_aux_sta_cmd {
+    uint32_t sta_id;
+    uint32_t lmac_id;
+    uint8_t mac_addr[6];
+    uint16_t reserved_for_mac_addr;
+} __packed;
+
+enum iwx_roc_activity { IWX_ROC_ACTIVITY_HOTSPOT, IWX_ROC_ACTIVITY_P2P_DISC, IWX_ROC_ACTIVITY_P2P_TXRX,
+                        IWX_ROC_ACTIVITY_P2P_NEG };
+
+/* ROC_CMD_API_S_VER_5: max_delay and duration in TU. */
+struct iwx_roc_req {
+    uint32_t action;
+    uint32_t activity;
+    uint32_t sta_id;
+    struct iwx_fw_channel_info channel_info;
+    uint8_t node_addr[6];
+    uint16_t reserved;
+    uint32_t max_delay;
+    uint32_t duration;
+} __packed;
+
+/* ROC_NOTIF_API_S_VER_1 */
+struct iwx_roc_notif {
+    uint32_t success;
+    uint32_t started;
+    uint32_t activity;
+} __packed;
 
 /* DATA_PATH_GROUP subcommand IDs */
 #define IWX_RX_BAID_ALLOCATION_CONFIG_CMD   0x16

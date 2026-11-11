@@ -170,6 +170,13 @@ public:
     void setAwdlOwnQueue(bool, bool, uint32_t) override;
     static void iwx_awdl_phy2_task(void *);
     static void iwx_awdl_solo_task(void *);
+    static void iwx_awdl_roc_task(void *);
+    void setAwdlRoc(uint32_t) override;
+    bool awdlBulkActive() override;
+    void iwx_awdl_roc_setup(struct iwx_softc *);
+    void iwx_awdl_roc_remove(struct iwx_softc *);
+    void iwx_awdl_roc_tick(struct iwx_softc *, uint64_t);
+    void iwx_awdl_roc_publish(struct iwx_softc *);
     void iwx_awdl_solo_add(struct iwx_softc *);
     static void iwx_awdl_umi_task(void *);
     void setAwdlSlot(uint32_t, uint32_t, uint32_t) override;
@@ -495,6 +502,7 @@ public:
                                struct ieee80211_key *, uint32_t);
     int    iwx_mld_sta_remove_cmd(struct iwx_softc *);
     int    iwx_mld_disable_txq(struct iwx_softc *, int, int);
+    bool   iwx_txq_owned(struct iwx_softc *, int);
     int    iwx_mld_rm_sta(struct iwx_softc *, struct iwx_node *);
     int    iwx_mld_auth(struct iwx_softc *, struct iwx_node *);
     int    iwx_mld_deauth(struct iwx_softc *, struct iwx_node *);
