@@ -13,8 +13,8 @@
     "version": "2.7.12",
     "source_date_epoch": 1794398400,
     "note": "Sequoia: BE201 switches on by default (A2DP clock, identity, single-advertisement LE, address pause, LE baseline, probe, recent RPA routing); -be201btstock turns them off",
-    "installed_sha256": "8e9f2d5c18de0bb974d9f257e33441b11442f100d4c07bd2f719b0461a1b1a05",
-    "installed_version": "2.7.11"
+    "installed_sha256": "f38ebfec500b1338e601520e29cfd708164054fe5b493b990964f1429c147c0b",
+    "installed_version": "2.7.12"
   },
   "intelbtpatcher": {
     "bundle": "IntelBTPatcher",
@@ -22,7 +22,7 @@
     "version": "2.5.10",
     "source_date_epoch": 1794398400,
     "note": "Sequoia: BE201 switches on by default (probe, native address, LE baseline); -be201btstock turns them off",
-    "installed_sha256": "29cccca596800c1a80644feeb2efda558a895681b430df79c9239c29b1f8bc50",
-    "installed_version": "2.5.9"
+    "installed_sha256": "75e104d897b7f5025a249efeba9499e20e32974282a83d79c295597214434586",
+    "installed_version": "2.5.10"
   }
 }
