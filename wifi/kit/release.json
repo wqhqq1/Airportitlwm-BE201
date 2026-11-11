@@ -1,4 +1,4 @@
 {
-  "version": "1.1.87",
-  "comment": "sending ROC modes use P2P_TXRX; ROC mode 4, discovery ROC, command replies, DMA fix; ROC test switch (off); llw0 off"
+  "version": "1.1.88",
+  "comment": "AWDL, rate diagnostics on by default (AWDL only on the verified 24G824 kernel); ROC test switch off; llw0 off"
 }

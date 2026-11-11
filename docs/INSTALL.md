@@ -6,9 +6,10 @@
 
 ## 适用范围
 
-- **系统：** 只适用于 macOS Sequoia 15.7.8（24G824），x86_64。
-  - 蓝牙补丁按 24G824 里系统蓝牙进程的确切代码写成，其他版本不会生效。
-  - Wi-Fi 驱动也按 24G824 的内核接口验证过。
+- **系统：** macOS Sequoia 15.2 及以后的版本，x86_64。
+  - Wi-Fi 驱动会拒绝在 Darwin 24.2 以下运行：15.0 和 15.1 的 IO80211 接口不一样。
+  - **AWDL（隔空投送、通用控制等）：** 只在 15.7.8（24G824）上默认开启。AWDL 用到了 IO80211Family 的私有结构，这些结构是从 24G824 读出来的。在其他版本上，AWDL 默认关闭，需要手动加 `be201_awdl_vif=1 be201_awdl_auto=1` 才会打开，风险自负。
+  - **蓝牙补丁：** 按 24G824 里系统蓝牙进程的确切代码匹配。在其他版本上找不到匹配的代码，就什么也不改。蓝牙本身照常工作。
 - **硬件：**
   - Wi-Fi：Intel BE201，PCI `8086:7740`。
   - 蓝牙：Intel BE201，USB `8087:0037`。
@@ -18,14 +19,14 @@
 
 ## 准备驱动
 
-仓库里不放编好的驱动。按 [README](../README.md) 里的步骤，先编出下面这些文件：
+仓库里不放编好的驱动。按 [README](../README.md) 里的步骤编出下面这些文件。运行 `python3 wifi/kit/package.py` 后，前三个都在 `outputs/BE201-WiFi/` 里：
 
-| 驱动 | 版本 | 编译输出 |
+| 驱动 | 版本 | 来源 |
 |---|---|---|
-| `AirportItlwm.kext` | 1.1.87 | `python3 wifi/kit/package.py` 之后在 `outputs/BE201-WiFi/` |
+| `AirportItlwm.kext` | 1.1.88 | `outputs/BE201-WiFi/` |
+| `BlueToolFixup.kext` | 2.7.12 | `outputs/BE201-WiFi/`，或 `build/bluetooth/bluetoolfixup/` |
+| `IntelBTPatcher.kext` | 2.5.10 | `outputs/BE201-WiFi/`，或 `build/bluetooth/intelbtpatcher/` |
 | `BE201BluetoothFirmware.kext` | 2.5.3 | `build/bluetooth/firmware/` |
-| `BlueToolFixup.kext` | 2.7.11 | `build/bluetooth/bluetoolfixup/` |
-| `IntelBTPatcher.kext` | 2.5.9 | `build/bluetooth/intelbtpatcher/` |
 
 另外需要 [Lilu](https://github.com/acidanthera/Lilu) 1.7.3 或更新的版本（用 RELEASE 版即可）。
 
@@ -78,32 +79,39 @@ AirportItlwm.kext
 
 这四项的 `Arch` 都填 `x86_64`，`Enabled` 填 `true`，`PlistPath` 都填 `Contents/Info.plist`。
 
-## 启动参数
+## 启动参数：默认不需要
 
-把下面这些参数加到 `NVRAM/Add/7C436110-AB2A-4BBB-A880-FE41995C9F82/boot-args`，原有的参数保留。
+从 Wi-Fi 1.1.88、BlueToolFixup 2.7.12、IntelBTPatcher 2.5.10 起，下面这些功能不加启动参数就已经开启：
 
-**蓝牙**（本机使用的是下面这一整组）：
+| 功能 | 以前需要的参数 |
+|---|---|
+| A2DP 蓝牙时钟修正（Apple Music 等蓝牙音频） | `-btlfxa2dpcheck` |
+| 系统信息里显示 Intel BE201 | `-be201identity` |
+| 单一广播的 LE 后端 | `-be201leadv` |
+| 与随机地址更新相关的 LE 补丁 | `-be201addrpause` |
+| BlueToolFixup 和 IntelBTPatcher 共用的 LE 基础补丁 | `-be201lebaseline` |
+| IntelBTPatcher 按系统原生方式处理控制器地址 | `-be201nativeaddr` |
+| 只读的诊断计数 | `-be201btprobe` |
+| 近期随机私有地址的连接路由 | `-be201rparoute` |
+| AWDL 接口（awdl0） | `be201_awdl_vif=1` |
+| 开机自动启动 AWDL（上次启动发生内核崩溃时会跳过一次） | `be201_awdl_auto=1` |
+| 速率与加入网络的只读诊断 | `be201_tlc_diag=1` |
+
+旧参数留在 `boot-args` 里也没有影响。
+
+**想关闭某些功能时用这些参数：**
 
 | 参数 | 作用 |
 |---|---|
-| `-btlfxa2dpcheck` | 修正 A2DP 的蓝牙时钟判断。Apple Music 等蓝牙音频需要它 |
-| `-be201identity` | 系统信息里把芯片名显示为 Intel BE201，数字标识不变 |
-| `-be201leadv` | 让系统改用单一广播的 LE 后端 |
-| `-be201addrpause` | 与随机地址更新相关的 LE 补丁，要和 `-be201leadv` 一起用 |
-| `-be201lebaseline` | BlueToolFixup 和 IntelBTPatcher 共用的 LE 基础补丁 |
-| `-be201nativeaddr` | IntelBTPatcher 按系统原生方式处理控制器地址 |
-| `-be201btprobe` | 只读的诊断计数，`-be201rparoute` 需要它 |
-| `-be201rparoute` | 用系统验证过的身份解析近期的随机私有地址，并按它路由连接（2.7.11）。要和 `-be201btprobe` 一起用 |
+| `-be201btstock` | 关闭上面所有 BE201 蓝牙补丁。同时再写上某个开关，可以只打开那一个 |
+| `be201_awdl_vif=0` | 关闭 AWDL |
+| `be201_awdl_auto=0` | 保留 AWDL 接口，但不自动启动 |
+| `be201_tlc_diag=0` | 关闭速率诊断 |
 
-**Wi-Fi：**
-
-| 参数 | 作用 |
-|---|---|
-| `be201_awdl_vif=1` | 提供 AWDL 接口（awdl0），隔空投送、通用控制等功能需要它 |
-| `be201_awdl_auto=1` | 开机后自动启动 AWDL。如果上次启动发生了内核崩溃，会跳过一次 |
-| `be201_tlc_diag=1` | 记录速率与加入网络的诊断信息，只读。本项目的安装脚本会检查它 |
-
-不加 `be201_awdl_*` 这两个参数时，Wi-Fi 仍然可以正常上网，只是没有 AWDL。
+**实验开关默认关闭，不会自动打开：**
+- ROC 和第二信道：`debug.be201_awdl_roc`、`debug.be201_awdl_phy2`。只在运行 `开始ROC实验.command` 时临时打开，实验结束会自动关回去。
+- 低延迟接口 llw0。
+- 蓝牙的 `-be201privacyprobe`、`-be201peeraddr`。
 
 ## 其他配置
 
@@ -115,7 +123,7 @@ AirportItlwm.kext
 
 ### 本机：用工具包安装
 
-`outputs/BE201-WiFi/install.py` 只适用于本机。它会核对这台机器的 EFI 分区 UUID、蓝牙驱动的哈希和机型，在别的机器上会直接拒绝运行。
+`outputs/BE201-WiFi/install.py` 只适用于本机。它会核对这台机器的 EFI 分区 UUID、蓝牙固件驱动的哈希和机型，在别的机器上会直接拒绝运行。它一次安装三个驱动：AirportItlwm、BlueToolFixup 和 IntelBTPatcher。
 
 1. 挂载 macOS 同盘的 EFI 分区。
 2. 运行检查，它不会改动 EFI：
@@ -124,7 +132,7 @@ AirportItlwm.kext
    python3 outputs/BE201-WiFi/install.py --check
    ```
 
-3. 写入。写入前会先备份整个 EFI：
+3. 写入。写入前会先备份整个 EFI，并从 `boot-args` 里去掉已经不需要的参数：
 
    ```bash
    python3 outputs/BE201-WiFi/install.py --install
@@ -139,9 +147,36 @@ AirportItlwm.kext
 1. 备份整个 EFI 文件夹。
 2. 把四个驱动和 Lilu 复制到 `EFI/OC/Kexts/`。
 3. 按上面的顺序在 `Kernel/Add` 里添加条目，并移除冲突的驱动。
-4. 添加启动参数。
-5. 用 OpenCore 1.0.8 的 `ocvalidate` 检查 `config.plist`，确认没有报错。
-6. 重启。如果 NVRAM 里已经存过旧的 `boot-args`，请确认 `NVRAM/Delete` 里包含 `boot-args`，或者先重置一次 NVRAM。
+4. 用 OpenCore 1.0.8 的 `ocvalidate` 检查 `config.plist`，确认没有报错。
+5. 重启。
+
+## Apple Watch 解锁
+
+这个 Wi-Fi 驱动没有 FTM 测距能力，而 macOS 解锁时要先测距离，所以需要让系统跳过测距。
+
+用你自己的账户运行下面的命令（不要加 sudo），或者双击工具包里的 `Apple Watch跳过测距.command`：
+
+```bash
+python3 outputs/BE201-WiFi/install.py --watch-unlock
+```
+
+它实际执行的是：
+
+```bash
+defaults write com.apple.sharingd phoneAutoUnlockSkipRanging -bool true
+```
+
+```bash
+killall sharingd
+```
+
+跳过测距以后，只剩蓝牙信号强度这一道检查。手表离得稍远时也可能解锁，安全性比原来低。
+
+要恢复测距，运行：
+
+```bash
+python3 outputs/BE201-WiFi/install.py --watch-unlock-undo
+```
 
 ## 装好之后怎么确认
 
@@ -151,7 +186,8 @@ kmutil showloaded --list-only | grep -E 'AirportItlwm|BlueToolFixup|IntelBTPatch
 
 - 应该看到五个驱动都已加载，版本和上表一致。
 - 在“系统信息 → 蓝牙”里，芯片显示为 Intel BE201。
-- 加了 AWDL 参数时，`ifconfig awdl0` 能看到这个接口。
+- 在 24G824 上，`ifconfig awdl0` 能看到 AWDL 接口。
+- `ioreg -l | grep ItlwmAwdlLayoutVerified` 显示 `Yes`，表示当前内核是已验证的版本，所以 AWDL 默认开启。
 
 如果 Wi-Fi 驱动没有加载，先看 EFI 根目录最新的 `opencore-*.txt`。注意：RELEASE 版 OpenCore 不会写这个日志，需要临时换成 DEBUG 版并把 `Misc/Debug/Target` 设为 `67`。
 

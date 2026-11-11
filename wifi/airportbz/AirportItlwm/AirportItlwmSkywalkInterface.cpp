@@ -50,7 +50,7 @@ IOReturn AirportItlwmSkywalkInterface::setVIRTUAL_IF_CREATE(apple80211_virt_if_c
 {
 #ifdef AIRPORT_WCL
     static uint32_t requests;
-    if (data && instance && (ItlDiagnosticFlag("be201_awdl_if") || ItlDiagnosticFlag("be201_awdl_vif"))) {
+    if (data && instance && (ItlDiagnosticFlag("be201_awdl_if") || ItlAwdlFlag("be201_awdl_vif"))) {
         char name[IFNAMSIZ + 1] = {};
         memcpy(name, data->bsd_name, IFNAMSIZ);
         instance->setProperty("ItlwmAwdlIfCreateRequests", ++requests, 32);
@@ -58,7 +58,7 @@ IOReturn AirportItlwmSkywalkInterface::setVIRTUAL_IF_CREATE(apple80211_virt_if_c
         instance->setProperty("ItlwmAwdlIfCreateRole", data->role, 32);
         instance->setProperty("ItlwmAwdlIfCreateAddr", data->mac, APPLE80211_ADDR_LEN);
         instance->setProperty("ItlwmAwdlIfCreateName", name);
-        if (ItlDiagnosticFlag("be201_awdl_vif"))
+        if (ItlAwdlFlag("be201_awdl_vif"))
             return instance->createAWDLInterface(data);
     }
 #endif

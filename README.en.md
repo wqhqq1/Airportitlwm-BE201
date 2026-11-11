@@ -2,16 +2,16 @@
 
 # BE201 Hackintosh wireless drivers: Wi-Fi and Bluetooth
 
-Drivers for the Intel BE201 (Wi-Fi PCI 8086:7740, Bluetooth USB 8087:0037) on macOS Sequoia 15.7.8 (24G824).
+Drivers for the Intel BE201 (Wi-Fi PCI 8086:7740, Bluetooth USB 8087:0037) on macOS Sequoia: 15.2 or later, verified on 15.7.8 (24G824).
 
 - **Wi-Fi:** the goal is native AWDL and Continuity (AirDrop, Universal Control, Handoff and so on). The scope ends at ax/80 MHz: no be, 160 MHz, 6 GHz or MLO.
 - **Bluetooth:** firmware loading and BE201 patches in BlueToolFixup and IntelBTPatcher, including the Apple Music fix and recent-address routing.
 
-**Installing:** see the [installation guide](docs/INSTALL.en.md) for the injection order, dependencies, drivers to remove and boot arguments.
+**Installing:** see the [installation guide](docs/INSTALL.en.md) for the injection order, dependencies, drivers to remove and optional boot arguments. Since Wi-Fi 1.1.88, BlueToolFixup 2.7.12 and IntelBTPatcher 2.5.10, no boot arguments need to be added by hand.
 
 ## Status
 
-All results below were measured on this machine: macOS 15.7.8 24G824, Wi-Fi driver 1.1.87, Bluetooth 2.5.3 / 2.7.11 / 2.5.9. Speeds depend heavily on the channel and the surroundings.
+All results below were measured on this machine: macOS 15.7.8 24G824, Wi-Fi driver 1.1.87, Bluetooth 2.5.3 / 2.7.11 / 2.5.9. 1.1.88 / 2.7.12 / 2.5.10 only turn these features on by default; the features themselves are unchanged. Speeds depend heavily on the channel and the surroundings.
 
 ### Working
 
@@ -23,7 +23,7 @@ All results below were measured on this machine: macOS 15.7.8 24G824, Wi-Fi driv
 | AirDrop | Both directions. With the Mac and the phone on the same 5 GHz channel: about 27–33 MB/s Mac to phone and about 39 MB/s phone to Mac, and a 4 GB transfer runs without stalling |
 | AirDrop while joined to a router on another channel | Works, but only at about 3 MB/s: transfers wait for the phone to visit the Mac's channel |
 | Universal Control | Works |
-| Apple Watch unlock | Works, but only after the user sets `phoneAutoUnlockSkipRanging` to skip ranging (see "Not possible yet") |
+| Apple Watch unlock | Works after running `install.py --watch-unlock` once to skip ranging (see "Not possible yet" and the [installation guide](docs/INSTALL.en.md#apple-watch-unlock)) |
 | Bluetooth | Firmware upload, Classic and Low Energy, Bluetooth audio |
 | Apple Music and other Bluetooth audio | Fixed (`-btlfxa2dpcheck`) |
 | Handoff, Universal Clipboard | Confirmed working, but not on every boot (see "In progress") |
@@ -45,7 +45,8 @@ All results below were measured on this machine: macOS 15.7.8 24G824, Wi-Fi driv
 | NAN | This firmware (-92) has no NAN capability |
 | Ranging for Apple Watch unlock | The driver has no FTM ranging, so ranging can only be skipped |
 | iPhone Mirroring | Fails in sharingd's authentication step. Most likely because there is no T2 chip, not Wi-Fi, but that is not proven |
-| Other macOS builds | The Bluetooth patches match 24G824's code only, and Wi-Fi has been verified on 24G824 only |
+| Sequoia 15.0, 15.1 and older systems | The Wi-Fi driver needs the IO80211 interface introduced in 15.2 |
+| AWDL and the Bluetooth patches on Sequoia builds other than 24G824 | AWDL relies on private layouts read from 24G824, so it is off by default; it can be forced on, untested. The Bluetooth patches find no matching code there and do nothing, while Bluetooth itself still works |
 
 ## Layout
 
@@ -120,8 +121,8 @@ python3 bluetooth/build.py
 The [installation guide](docs/INSTALL.en.md) has the full steps. This project's own installer also keeps to these rules:
 
 - It writes only to the EFI partition on the macOS disk.
-- Another project on this machine (an audio driver) edits `config.plist` too. The Wi-Fi installer builds the new config from the config as it is at install time, and changes only three things: the Wi-Fi driver comment, the `be201_awdl_*` boot arguments and TakeoffDelay. It compares the file again just before writing, and stops if anything changed meanwhile.
-- A Wi-Fi install leaves the Bluetooth drivers, the SMBIOS model and OpenCore itself unchanged, and the installer checks each of them.
+- Another project on this machine (an audio driver) edits `config.plist` too. The installer builds the new config from the config as it is at install time, and changes only three things: the driver comments, this project's boot arguments (the now-default ones are removed) and TakeoffDelay. It compares the file again just before writing, and stops if anything changed meanwhile.
+- The kit installs AirportItlwm, BlueToolFixup and IntelBTPatcher together and keeps the previous copy of each for recovery. The Bluetooth firmware driver, the SMBIOS model and OpenCore itself stay unchanged, and the installer checks each of them.
 
 ## Not in the repository
 

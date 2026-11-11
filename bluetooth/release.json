@@ -1,25 +1,28 @@
 {
-  "_about": "Bluetooth drivers built by bluetooth/build.py. version and note go into the kext; source_date_epoch fixes Lilu's build date so a rebuild is byte-identical; installed_sha256 is the binary in the EFI now (build.py reports whether the build matches it). Change version, note and source_date_epoch together for a new release.",
+  "_about": "Bluetooth drivers built by bluetooth/build.py. version and note go into the kext; source_date_epoch fixes Lilu's build date so a rebuild is byte-identical; installed_version and installed_sha256 are the driver in the EFI now (update both after an install) (build.py reports whether the build matches it). Change version, note and source_date_epoch together for a new release.",
   "firmware": {
     "bundle": "BE201BluetoothFirmware",
     "binary": "IntelBluetoothFirmware",
     "version": "2.5.3",
-    "installed_sha256": "bb027eb439c431e91974e55febc86f59c23a4bcaffb961427f6883f9a0f13d53"
+    "installed_sha256": "bb027eb439c431e91974e55febc86f59c23a4bcaffb961427f6883f9a0f13d53",
+    "installed_version": "2.5.3"
   },
   "bluetoolfixup": {
     "bundle": "BlueToolFixup",
     "binary": "BlueToolFixup",
-    "version": "2.7.11",
-    "source_date_epoch": 1793592000,
-    "note": "Sequoia 24G824 opt-in OS-authenticated recent RPA connection routing; preserve prior BLE baseline",
-    "installed_sha256": "8e9f2d5c18de0bb974d9f257e33441b11442f100d4c07bd2f719b0461a1b1a05"
+    "version": "2.7.12",
+    "source_date_epoch": 1794398400,
+    "note": "Sequoia: BE201 switches on by default (A2DP clock, identity, single-advertisement LE, address pause, LE baseline, probe, recent RPA routing); -be201btstock turns them off",
+    "installed_sha256": "8e9f2d5c18de0bb974d9f257e33441b11442f100d4c07bd2f719b0461a1b1a05",
+    "installed_version": "2.7.11"
   },
   "intelbtpatcher": {
     "bundle": "IntelBTPatcher",
     "binary": "IntelBTPatcher",
-    "version": "2.5.9",
-    "source_date_epoch": 1793592000,
-    "note": "Sequoia 24G824 opt-in BE201 passive privacy capability response observer; preserve all current command and event behavior",
-    "installed_sha256": "29cccca596800c1a80644feeb2efda558a895681b430df79c9239c29b1f8bc50"
+    "version": "2.5.10",
+    "source_date_epoch": 1794398400,
+    "note": "Sequoia: BE201 switches on by default (probe, native address, LE baseline); -be201btstock turns them off",
+    "installed_sha256": "29cccca596800c1a80644feeb2efda558a895681b430df79c9239c29b1f8bc50",
+    "installed_version": "2.5.9"
   }
 }

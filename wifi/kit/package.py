@@ -14,10 +14,13 @@ BUILD = Path(os.environ.get('BUILD_OUTPUT', BASE/'build/wifi'))
 OUT = Path(os.environ.get('KIT_OUT', BASE/'outputs/BE201-WiFi'))
 PREV = OUT/'上一版'
 REL = json.loads((KIT/'release.json').read_text())
+# Since 1.1.88 the kit also carries the two Bluetooth drivers whose switches became defaults (bluetooth/build.py).
+BTREL = json.loads((BASE/'bluetooth/release.json').read_text())
+BT = ['bluetoolfixup', 'intelbtpatcher']
 VER = REL['version']
 TOOLS = ['audit_entry.py', 'install.py', 'collect.py', 'capture.py', 'conv.py', 'tv3.py', 'view.py', 'tlc_trace.py',
          'join_trace.py', 'vif_report.py', 'record.py', 'stall_history.py', 'roc_test.py',
-         '卡顿记录.command', '开始ROC实验.command', '开始抓包.command', '开始记录.command', '采集手机日志.command', '采集重启结果.command',
+         '卡顿记录.command', '开始ROC实验.command', 'Apple Watch跳过测距.command', '开始抓包.command', '开始记录.command', '采集手机日志.command', '采集重启结果.command',
          '使用与回退.md']
 # Bluetooth and the OpenCore binary stay as they are; the installer checks them too.
 INFO_NOTE = 'AWDL starts by itself with be201_awdl_auto; own queue with aggregation, solo AWDL and UMI on by default; llw0, second channel and ROC are RAM test switches'
@@ -38,6 +41,14 @@ def main():
     assert binary.is_file(), f'No build at {binary}: run build.sh'
     assert VER.encode() + b'\0' in binary.read_bytes(), f'{binary} was not built as {VER}: run build.sh'
     assert (DEPS/'ocvalidate').is_file(), 'deps/ocvalidate (OpenCore 1.0.8) is missing'
+    bt = {}
+    for d in BT + ['firmware']:
+        r = BTREL[d]
+        k = BASE/'build/bluetooth'/d/(r['bundle']+'.kext')
+        assert plistlib.loads((k/'Contents/Info.plist').read_bytes())['CFBundleVersion'] == r['version'], f'{k}: run bluetooth/build.py'
+        subprocess.run(['codesign', '--verify', '--deep', '--strict', str(k)], check=True)
+        bt[d] = (r, k, sha(k/'Contents/MacOS'/r['binary']))
+    assert bt['firmware'][2] == BTREL['firmware']['installed_sha256'], 'BE201BluetoothFirmware is not packaged; it must stay as installed'
 
     OUT.mkdir(mode=0o700, exist_ok=True)
     current = kit_version(OUT)
@@ -100,7 +111,11 @@ def main():
             assert len(z.namelist()) == len(set(z.namelist())) and z.testzip() is None
 
         kit = dict(version=VER, comment=REL['comment'], uuid=a['uuid'],
-                   new_binary_sha256=sha(new_bin), old_version=kit_version(PREV), old_binary_sha256=sha(old_bin))
+                   new_binary_sha256=sha(new_bin), old_version=kit_version(PREV), old_binary_sha256=sha(old_bin),
+                   bluetooth={bt[d][0]['bundle']: dict(version=bt[d][0]['version'], note=bt[d][0]['note'], new_binary_sha256=bt[d][2],
+                                                        old_version=bt[d][0]['installed_version'], old_binary_sha256=bt[d][0]['installed_sha256'])
+                              for d in BT},
+                   firmware_sha256=BTREL['firmware']['installed_sha256'])
         audit = dict(kit, source_commit=commit, uncommitted_patch_bytes=len(patch),
                      source_archive_sha256=sha(archive), compilation_units=58, constructors=8, destructors=8,
                      import_count=len(i), new_imports=sorted(i - oldi), removed_imports=sorted(oldi - i),
@@ -117,6 +132,11 @@ def main():
         (OUT/name).write_text(json.dumps(d, ensure_ascii=False, indent=2)+'\n')
     for n in TOOLS:
         shutil.copy2(KIT/n, OUT/n)
+    for d in BT:
+        r, k, _ = bt[d]
+        if (OUT/k.name).exists():
+            shutil.rmtree(OUT/k.name)
+        shutil.copytree(k, OUT/k.name)
     shutil.copy2(DEPS/'ocvalidate', OUT/'ocvalidate')
     shutil.copy2(KIT/'checks.json', OUT/'checks.json')
     if (OUT/'test-logs').exists():

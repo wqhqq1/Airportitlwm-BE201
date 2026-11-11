@@ -3,7 +3,7 @@ import json, os, pathlib, subprocess, sys, time
 KIT = pathlib.Path(__file__).resolve().parent
 BASE = KIT.parents[1]
 SUITES = ['test-awdl-abi', 'test-awdl-ba', 'test-awdl-ctx', 'test-awdl-if', 'test-awdl-native', 'test-awdl-probe',
-          'test-awdl-rx', 'test-awdl-tx', 'test-awdl-vif-abi', 'test-awdl-vif', 'test-be201-he', 'test-beacon-peer-tx',
+          'test-awdl-rx', 'test-awdl-tx', 'test-awdl-vif-abi', 'test-awdl-vif', 'test-be201-he', 'test-default-switches', 'test-beacon-peer-tx',
           'test-bz-boot-checks', 'test-continuity-diagnostics', 'test-hotspot-client-ie', 'test-hotspot-join',
           'test-hotspot-mfp', 'test-join-rsn-diag', 'test-key-command-ack', 'test-p2p-mac', 'test-sta-authorized',
           'test-tlc-mode-flags', 'test-wcl-disconnect', 'test-wcl-switch']

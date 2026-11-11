@@ -116,6 +116,9 @@ Gate *_fCommandGate=nullptr;
 using AbsoluteTime=uint64_t;constexpr int kMillisecondScale=1000;
 void clock_interval_to_deadline(unsigned,unsigned,AbsoluteTime *d){*d=0;}
 bool ItlDiagnosticFlag(const char*){return true;}
+bool ItlDefaultOnFlag(const char*,bool=true){return true;}
+bool ItlAwdlFlag(const char*){return true;}
+bool ItlAwdlLayoutVerified(){return true;}
 std::function<void()> duringRegister;
 class IOSkywalkPacketQueue:public IOEventSource {public: IOSkywalkPacketQueue(){++queuesLive;} void free(){--queuesLive;sequence.push_back("queue-release");}};
 class IOSkywalkPacketBufferPool:public OSObject {public:

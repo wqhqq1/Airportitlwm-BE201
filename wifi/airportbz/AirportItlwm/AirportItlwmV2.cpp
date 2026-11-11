@@ -308,6 +308,8 @@ bool AirportItlwm::start(IOService *provider)
         return false;
     }
 #endif
+    // 1.1.88: AWDL is on by default only on the kernel its private layouts were read from (24G824).
+    pciNub->setProperty("ItlwmAwdlLayoutVerified", ItlAwdlLayoutVerified());
     XYLog("%s\n", __PRETTY_FUNCTION__);
     struct IOSkywalkEthernetInterface::RegistrationInfo registInfo;
     int boot_value = 0;
@@ -1144,11 +1146,11 @@ getCARD_CAPABILITIES(OSObject *object,
         cd->capabilities[17] |= 0x80;
     // Capability bit 32 is what wifip2pd checks before VIRTUAL_IF_CREATE with role 6.
     // be201_awdl_vif alone stays silent until armed, so a normal boot behaves as if it were off.
-    if (ItlDiagnosticFlag("be201_awdl_if") || (ItlDiagnosticFlag("be201_awdl_vif") && awdlVifCapabilityArmed()))
+    if (ItlDiagnosticFlag("be201_awdl_if") || (ItlAwdlFlag("be201_awdl_vif") && awdlVifCapabilityArmed()))
         cd->capabilities[4] |= 0x01;
     // The AWDL manager tests these through its cached copy: capabilities[0] bit 2 in configure,
     // and capabilities[3] bit 5 as dual band; without that AWDL stays on 2.4 GHz.
-    if (ItlDiagnosticFlag("be201_awdl_vif") && awdlVifCapabilityArmed()) {
+    if (ItlAwdlFlag("be201_awdl_vif") && awdlVifCapabilityArmed()) {
         cd->capabilities[0] |= 0x04;
         cd->capabilities[3] |= 0x20;
     }
@@ -1808,7 +1810,7 @@ bool AirportItlwm::awdlVifCapabilityArmed()
 
 void AirportItlwm::registerAWDLArmControl()
 {
-    if (awdlArmRegistered || !ItlDiagnosticFlag("be201_awdl_vif")) return;
+    if (awdlArmRegistered || !ItlAwdlFlag("be201_awdl_vif")) return;
     sysctl_register_oid(&sysctl__debug_be201_awdl_vif_arm);
     sysctl_register_oid(&sysctl__debug_be201_awdl_vif_poolflags);
     sysctl_register_oid(&sysctl__debug_be201_awdl_vif_accept);
@@ -1837,7 +1839,7 @@ void AirportItlwm::registerAWDLArmControl()
 // After a panic the record is still in NVRAM at this point, read only here: a panic must not repeat every boot.
 void AirportItlwm::startAWDLAuto()
 {
-    if (!awdlArmRegistered || !ItlDiagnosticFlag("be201_awdl_auto")) return;
+    if (!awdlArmRegistered || !ItlAwdlFlag("be201_awdl_auto")) return;
     if (awdlLastBootPanicked()) {
         setProperty("ItlwmAwdlAutoSkippedAfterPanic", true);
         return;
@@ -1899,7 +1901,7 @@ bool AirportItlwm::awdlLastBootPanicked()
 
 IOReturn AirportItlwm::createAWDLInterface(apple80211_virt_if_create_data *request)
 {
-    if (!request || !ItlDiagnosticFlag("be201_awdl_vif")) return kIOReturnUnsupported;
+    if (!request || !ItlAwdlFlag("be201_awdl_vif")) return kIOReturnUnsupported;
     if (!_fCommandGate) return kIOReturnNotReady;
     return _fCommandGate->runAction(createAWDLInterfaceGated, request);
 }

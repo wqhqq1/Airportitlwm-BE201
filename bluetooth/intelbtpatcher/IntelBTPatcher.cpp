@@ -7,6 +7,7 @@
 #define __ACIDANTHERA_MAC_SDK 2600
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_util.hpp>
+#include "BE201Defaults.hpp"
 #include <Headers/plugin_start.hpp>
 
 #include "IntelBTPatcher.hpp"
@@ -139,9 +140,9 @@ bool CIntelBTPatcher::_randomAddressInit = false;
 bool CIntelBTPatcher::init()
 {
     DBGLOG(DRV_NAME, "%s", __PRETTY_FUNCTION__);
-    be201ProbeEnabled = getKernelVersion() == KernelVersion::Sequoia && checkKernelArgument("-be201btprobe");
-    be201NativeAddressEnabled = getKernelVersion() == KernelVersion::Sequoia && checkKernelArgument("-be201nativeaddr");
-    be201LEBaselineEnabled = getKernelVersion() == KernelVersion::Sequoia && checkKernelArgument("-be201lebaseline");
+    be201ProbeEnabled = getKernelVersion() == KernelVersion::Sequoia && be201Switch("-be201btprobe");
+    be201NativeAddressEnabled = getKernelVersion() == KernelVersion::Sequoia && be201Switch("-be201nativeaddr");
+    be201LEBaselineEnabled = getKernelVersion() == KernelVersion::Sequoia && be201Switch("-be201lebaseline");
     callbackIBTPatcher = this;
     if (getKernelVersion() < KernelVersion::Monterey) {
         lilu.onKextLoadForce(&IntelBTPatcher_IOBluetoothInfo, 1,

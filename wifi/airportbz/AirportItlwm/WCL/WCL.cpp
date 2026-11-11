@@ -9,6 +9,7 @@
 #ifdef AIRPORT_WCL
 #include "../AirportItlwmV2.hpp"
 #include "../AirportItlwmSkywalkInterface.hpp"
+#include "ItlStartupDiagnostics.hpp"
 #include <kern/thread_call.h>
 #include <kern/clock.h>
 #include <net80211/ieee80211_node.h>
@@ -87,9 +88,8 @@ bool AirportItlwmSkywalkInterface::initWCL()
     wclJoinFirstFailurePublished = false;
     auto diagIC = fHalService->get80211Controller();
     bzero(&diagIC->ic_wcl_rsn_trace, sizeof(diagIC->ic_wcl_rsn_trace));
-    int diag = 0;
-    PE_parse_boot_argn("be201_tlc_diag", &diag, sizeof(diag));
-    diagIC->ic_wcl_rsn_trace.enabled = diag == 1;
+    // 1.1.88: on by default, be201_tlc_diag=0 turns it off.
+    diagIC->ic_wcl_rsn_trace.enabled = ItlDefaultOnFlag("be201_tlc_diag");
     diagIC->ic_wcl_rsn_cookie = 0;
     diagIC->ic_wcl_diag_key_cipher = diagIC->ic_wcl_diag_rsn_length = 0;
     scanPending = false;

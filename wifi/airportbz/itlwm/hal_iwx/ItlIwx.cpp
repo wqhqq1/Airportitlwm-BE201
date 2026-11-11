@@ -18829,7 +18829,7 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
     sc->sc_pct = pa->pa_pc;
     sc->sc_pcitag = pa->pa_tag;
     sc->sc_dmat = pa->pa_dmat;
-    sc->sc_tlc_trace_enabled = ItlDiagnosticFlag("be201_tlc_diag");
+    sc->sc_tlc_trace_enabled = ItlDefaultOnFlag("be201_tlc_diag");
 #ifdef AIRPORT_WCL
     {
         uint32_t awdlProbe = 0;

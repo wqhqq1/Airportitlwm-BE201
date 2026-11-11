@@ -5,11 +5,45 @@
 #include <IOKit/IOLib.h>
 #include <kern/clock.h>
 #include <pexpert/pexpert.h>
+#include <libkern/version.h>
 
 inline bool ItlDiagnosticFlag(const char *name)
 {
     int enabled = 0;
     return PE_parse_boot_argn(name, &enabled, sizeof(enabled)) && enabled == 1;
+}
+
+/*
+ * The kernel this driver's AWDL code was verified against: macOS 15.7.8 (24G824). The AWDL path uses private
+ * IO80211Family layouts (ivars, vtable slots, event numbers) read from that build, so on any other kernel it stays
+ * off unless the boot arguments ask for it.
+ */
+inline bool ItlAwdlLayoutVerified()
+{
+    static const char want[] = "xnu-11417.140.69.711.44~1/RELEASE_X86_64";
+    for (const char *p = version; *p; p++) {
+        size_t i = 0;
+        while (want[i] && p[i] == want[i])
+            i++;
+        if (!want[i])
+            return true;
+    }
+    return false;
+}
+
+// 1.1.88: on unless the boot argument sets it to 0 (or to anything but 1); without the argument, the default.
+inline bool ItlDefaultOnFlag(const char *name, bool fallback = true)
+{
+    int enabled = 0;
+    if (PE_parse_boot_argn(name, &enabled, sizeof(enabled)))
+        return enabled == 1;
+    return fallback;
+}
+
+// be201_awdl_vif and be201_awdl_auto: on by default on the verified kernel; elsewhere only with =1.
+inline bool ItlAwdlFlag(const char *name)
+{
+    return ItlDefaultOnFlag(name, ItlAwdlLayoutVerified());
 }
 
 // Persist startup state on the PCI provider: a controller that fails start()

@@ -18,6 +18,7 @@
 
 #define MODULE_SHORT "btlfx"
 #include "BE201Patches.hpp"
+#include "BE201Defaults.hpp"
 
 static bool patchProbeEnabled=false;
 static uint64_t patchPages=0,peerPatchHits=0,legacyPatchHits=0;
@@ -104,7 +105,7 @@ bool BlueToolFixup::start(IOService *provider) {
     }
     setProperty("VersionInfo", kextVersion);
     setProperty("BE201PatchProbeEnabled",patchProbeEnabled);
-    setProperty("BE201LEBaselineRequested",checkKernelArgument("-be201lebaseline"));
+    setProperty("BE201LEBaselineRequested",be201Switch("-be201lebaseline"));
     setProperty("BE201AddressPauseRequested",shouldPatchBE201AddressPause);
     if(patchProbeEnabled) {
         probeLoop=IOWorkLoop::workLoop();
@@ -388,20 +389,20 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
 #pragma mark - Patches on start/stop
 
 static void pluginStart() {
-    patchProbeEnabled=getKernelVersion()==KernelVersion::Sequoia && checkKernelArgument("-be201btprobe");
+    patchProbeEnabled=getKernelVersion()==KernelVersion::Sequoia && be201Switch("-be201btprobe");
     SYSLOG(MODULE_SHORT, "start");
     // There is no point in routing cs_validate_range, because this kext should only be running on Monterey+
     if (getKernelVersion() < KernelVersion::Monterey)
         return;
     lilu.onPatcherLoadForce([](void *user, KernelPatcher &patcher) {
-        shouldPatchBE201RPARoute=getKernelVersion()==KernelVersion::Sequoia && checkKernelArgument("-be201rparoute") && checkKernelArgument("-be201btprobe");
-        shouldPatchBE201PrivacyProbe=!shouldPatchBE201RPARoute && getKernelVersion()==KernelVersion::Sequoia && checkKernelArgument("-be201privacyprobe") && checkKernelArgument("-be201btprobe");
-        shouldPatchBE201AddressPause=getKernelVersion()==KernelVersion::Sequoia && checkKernelArgument("-be201addrpause") && checkKernelArgument("-be201leadv");
-        shouldPatchBE201LEBaseline=getKernelVersion()==KernelVersion::Sequoia && checkKernelArgument("-be201lebaseline");
+        shouldPatchBE201RPARoute=getKernelVersion()==KernelVersion::Sequoia && be201Switch("-be201rparoute") && be201Switch("-be201btprobe");
+        shouldPatchBE201PrivacyProbe=!shouldPatchBE201RPARoute && getKernelVersion()==KernelVersion::Sequoia && checkKernelArgument("-be201privacyprobe") && be201Switch("-be201btprobe");
+        shouldPatchBE201AddressPause=getKernelVersion()==KernelVersion::Sequoia && be201Switch("-be201addrpause") && be201Switch("-be201leadv");
+        shouldPatchBE201LEBaseline=getKernelVersion()==KernelVersion::Sequoia && be201Switch("-be201lebaseline");
         shouldPatchBE201PeerAddress = !shouldPatchBE201RPARoute && getKernelVersion() == KernelVersion::Sequoia && checkKernelArgument("-be201peeraddr");
-        shouldPatchBE201LegacyAdv = checkKernelArgument("-be201leadv");
-        shouldPatchBE201Name = checkKernelArgument("-be201identity");
-        shouldPatchBE201Clock = checkKernelArgument("-btlfxa2dpcheck");
+        shouldPatchBE201LegacyAdv = be201Switch("-be201leadv");
+        shouldPatchBE201Name = be201Switch("-be201identity");
+        shouldPatchBE201Clock = be201Switch("-btlfxa2dpcheck");
         SYSLOG(MODULE_SHORT, "BE201 local build: identity=%d A2DP=%d legacyLE=%d (exact 24G824 context)", shouldPatchBE201Name, shouldPatchBE201Clock, shouldPatchBE201LegacyAdv);
         if (getKernelVersion() >= KernelVersion::Sonoma) {
             shouldPatchBoardId = checkKernelArgument("-btlfxboardid");

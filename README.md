@@ -2,16 +2,16 @@
 
 # BE201 Hackintosh 无线驱动：Wi-Fi 与蓝牙
 
-Intel BE201（Wi-Fi PCI 8086:7740，蓝牙 USB 8087:0037）在 macOS Sequoia 15.7.8（24G824）上的驱动。
+Intel BE201（Wi-Fi PCI 8086:7740，蓝牙 USB 8087:0037）在 macOS Sequoia 上的驱动。支持 15.2 及以后的版本，在 15.7.8（24G824）上验证。
 
 - **Wi-Fi：** 目标是原生 AWDL 和连续互通（隔空投送、通用控制、接力等）。范围只到 ax/80MHz，不包含 be、160MHz、6GHz 和 MLO。
 - **蓝牙：** 固件加载、BlueToolFixup 和 IntelBTPatcher 的 BE201 补丁，包括 Apple Music 修复和近期地址路由。
 
-**安装：** 见 [驱动安装指南](docs/INSTALL.md)，包括注入顺序、依赖、必须移除的驱动和启动参数。
+**安装：** 见 [驱动安装指南](docs/INSTALL.md)，包括注入顺序、依赖、必须移除的驱动和可选的启动参数。从 Wi-Fi 1.1.88、BlueToolFixup 2.7.12、IntelBTPatcher 2.5.10 起，不需要再手动加启动参数。
 
 ## 功能状态
 
-以下都是在本机（macOS 15.7.8 24G824、Wi-Fi 驱动 1.1.87、蓝牙 2.5.3 / 2.7.11 / 2.5.9）上实测的结果。速度受信道和环境影响很大。
+以下都是在本机（macOS 15.7.8 24G824、Wi-Fi 驱动 1.1.87、蓝牙 2.5.3 / 2.7.11 / 2.5.9）上实测的结果。1.1.88 / 2.7.12 / 2.5.10 只是把这些功能的开关改成默认开启，功能本身没有变化。速度受信道和环境影响很大。
 
 ### 已经做到
 
@@ -23,7 +23,7 @@ Intel BE201（Wi-Fi PCI 8086:7740，蓝牙 USB 8087:0037）在 macOS Sequoia 15.
 | 隔空投送 | 双向都可以。Mac 和手机在同一个 5 GHz 信道时，Mac 发给手机约 27–33 MB/s，手机发给 Mac 约 39 MB/s，连续传 4 GB 不中断 |
 | 隔空投送（连着另一信道的路由器） | 可以传，但只有约 3 MB/s，因为要等手机切到 Mac 所在的信道 |
 | 通用控制 | 可用 |
-| Apple Watch 解锁 | 可用，但需要用户自己设置 `phoneAutoUnlockSkipRanging`，跳过距离测量（见下文“暂时做不到”） |
+| Apple Watch 解锁 | 可用，但需要先运行一次 `install.py --watch-unlock` 跳过距离测量（见下文“暂时做不到”和[安装指南](docs/INSTALL.md#apple-watch-解锁)） |
 | 蓝牙 | 固件上传、经典蓝牙和低功耗蓝牙、蓝牙音频 |
 | Apple Music 等蓝牙音频 | 已修复（`-btlfxa2dpcheck`） |
 | 接力、通用剪贴板 | 已验证可用，但不是每次开机都稳定（见“进行中”） |
@@ -45,7 +45,8 @@ Intel BE201（Wi-Fi PCI 8086:7740，蓝牙 USB 8087:0037）在 macOS Sequoia 15.
 | NAN | 这版固件（-92）没有 NAN 能力 |
 | Apple Watch 解锁时的距离测量 | 驱动没有 FTM 测距能力，所以只能跳过测距 |
 | iPhone 镜像 | 在 sharingd 的认证阶段失败。很可能是因为没有 T2 芯片，和 Wi-Fi 无关，但没有证实 |
-| 其他 macOS 版本 | 蓝牙补丁只匹配 24G824 的代码，Wi-Fi 也只在 24G824 上验证过 |
+| Sequoia 15.0、15.1 及更早的系统 | Wi-Fi 驱动需要 15.2 引入的 IO80211 接口 |
+| 24G824 以外的 Sequoia 版本上的 AWDL 和蓝牙补丁 | AWDL 用到了从 24G824 读出来的私有结构，所以默认关闭；可以手动打开，但没有验证过。蓝牙补丁在这些版本上找不到匹配的代码，就不生效，蓝牙本身照常工作 |
 
 ## 目录
 
@@ -120,8 +121,8 @@ python3 bluetooth/build.py
 完整的安装步骤见 [驱动安装指南](docs/INSTALL.md)。本项目自己的安装脚本还有下面这些约束：
 
 - 只写 macOS 同盘的 EFI 分区。
-- 本机的另一个项目（音频驱动）也会改 `config.plist`。Wi-Fi 安装脚本按安装那一刻的 config 生成新 config，只改 Wi-Fi 驱动备注、`be201_awdl_*` 启动参数和 TakeoffDelay 三项。写入前会再比对一次，中途被改过就停止。
-- 安装 Wi-Fi 时，蓝牙驱动、机型和 OpenCore 本体保持不变，安装脚本会逐项核对。
+- 本机的另一个项目（音频驱动）也会改 `config.plist`。安装脚本按安装那一刻的 config 生成新 config，只改三项：驱动备注、本项目的启动参数（已默认开启的那些会被去掉）和 TakeoffDelay。写入前会再比对一次，中途被改过就停止。
+- 工具包一次安装 AirportItlwm、BlueToolFixup 和 IntelBTPatcher，每个都保留上一版作为恢复副本。蓝牙固件驱动、机型和 OpenCore 本体保持不变，安装脚本会逐项核对。
 
 ## 不在仓库里的内容
 
