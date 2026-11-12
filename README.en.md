@@ -32,7 +32,7 @@ All results below were measured on this machine: macOS 15.7.8 24G824, Wi-Fi driv
 
 | Feature | State |
 |---|---|
-| Full-speed AirDrop on a second channel while joined to a router | Uses firmware remain-on-channel (ROC) to receive and send on the phone's channel. 1.1.86 exchanged frames with the phone on channel 149 for the first time, but hit firmware errors. 1.1.88 and 1.1.89 hit firmware errors when the link moved to channel 149, because the driver gave that context the router's 80 MHz width. 1.1.90 uses 20 MHz there and waits for a test |
+| Full-speed AirDrop on a second channel while joined to a router | Uses firmware remain-on-channel (ROC) to receive and send on the phone's channel. 1.1.86 exchanged frames with the phone on channel 149 for the first time, but hit firmware errors. 1.1.88 and 1.1.89 hit firmware errors when the link moved to channel 149, because the driver gave that context the router's 80 MHz width. 1.1.90 uses 20 MHz there: no more errors, frames flow both ways on 149 and the phone sees the Mac, but about half the frames sent to the phone get no ACK and the transfer fails. 1.1.91 records why |
 | Continuity Camera, Sidecar | The low-latency interface llw0 exists, UMI is answered and RTG goes active, but no picture yet. Paused for now |
 | Handoff reliability | Works on some boots and not on others; the cause is still open, so this is only being watched. The boots checked since AirPlay Receiver was turned off all worked |
 
