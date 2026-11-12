@@ -1,4 +1,4 @@
-"""1.1.75 and later (1.1.91: why AUX frames fail and ROC timing; 1.1.90: also the last PHY command's channel and width; 1.1.89: baseline, mode 1 with P2P_TXRX, the AWDL link moved to 149 with ROC off, then mode 4 on that
+"""1.1.75 and later (1.1.92: mode 4 holds unicast AWDL frames in the host for the next ROC; 1.1.91: why AUX frames fail and ROC timing; 1.1.90: also the last PHY command's channel and width; 1.1.89: baseline, mode 1 with P2P_TXRX, the AWDL link moved to 149 with ROC off, then mode 4 on that
 link for 90 s; the first firmware error switches everything off at once): remain-on-channel (ROC) test beside a router link, phase by phase. The firmware gets an ROC for each run of
 the AWDL sequence's other 5 GHz channel, through an AUX station, as Intel's Linux driver sends off-channel frames.
 Results are saved after every phase, and each phase asks whether the phone sees this Mac and the transfer moves.
@@ -7,9 +7,9 @@ import datetime, re, signal, subprocess, sys, threading, time
 from pathlib import Path
 ROC = 'debug.be201_awdl_roc'
 PHY2 = 'debug.be201_awdl_phy2'
-KEYS = ['RocMode', 'RocQid', 'RocSetups', 'RocSetupErr', 'RocSetupStage', 'RocTeardowns', 'RocAdds', 'RocAddErr', 'RocStarted', 'RocEnded', 'RocFailed', 'RocStale', 'RocRemoves', 'RocChan', 'RocTxSent', 'RocTxOk', 'RocTxFail', 'RocTxDrop', 'RocRxDuring', 'RocDiscovery', 'RocRxAny', 'RocRxAnyChan', 'RocRxAwdlAny', 'RxPhy2', 'RxHome', 'Phy2Chan', 'RocPhyHolds', 'RocPhyCancels', 'Phy2Switches', 'Phy2Err', 'FaultRoc', 'FaultPhy2', 'RocLateMaxUs', 'RocTxOkUcast', 'RocTxFailUcast', 'RocTxOkMcast', 'RocTxFailMcast', 'RocTxFailIn', 'RocTxFailOut', 'RocTxOkHere', 'RocTxOkAway', 'RocTxFailHere', 'RocTxFailAway', 'RocTxFailUnknown', 'RocTxFailTries', 'RocTxOkTries', 'RocLateN', 'RocLateSumMs', 'RocOnN', 'RocOnSumMs',
+KEYS = ['RocMode', 'RocQid', 'RocSetups', 'RocSetupErr', 'RocSetupStage', 'RocTeardowns', 'RocAdds', 'RocAddErr', 'RocStarted', 'RocEnded', 'RocFailed', 'RocStale', 'RocRemoves', 'RocChan', 'RocTxSent', 'RocTxOk', 'RocTxFail', 'RocTxDrop', 'RocRxDuring', 'RocDiscovery', 'RocRxAny', 'RocRxAnyChan', 'RocRxAwdlAny', 'RxPhy2', 'RxHome', 'Phy2Chan', 'RocPhyHolds', 'RocPhyCancels', 'Phy2Switches', 'Phy2Err', 'FaultRoc', 'FaultPhy2', 'RocLateMaxUs', 'RocTxOkUcast', 'RocTxFailUcast', 'RocTxOkMcast', 'RocTxFailMcast', 'RocTxFailIn', 'RocTxFailOut', 'RocTxOkHere', 'RocTxOkAway', 'RocTxFailHere', 'RocTxFailAway', 'RocTxFailUnknown', 'RocTxFailTries', 'RocTxOkTries', 'RocLateN', 'RocLateSumMs', 'RocOnN', 'RocOnSumMs', 'RocHeld', 'RocReleased', 'RocHoldFull', 'RocHoldExpired', 'RocHoldFreed',
         'SeqChan5', 'OwnSent', 'OwnOk', 'OwnFail', 'OwnRecovers', 'TxTripped', 'DataTx', 'DataRx', 'FirmwareFaults', 'FaultRearms']
-COUNTERS = ['RocSetups', 'RocTeardowns', 'RocAdds', 'RocAddErr', 'RocStarted', 'RocEnded', 'RocFailed', 'RocStale', 'RocRemoves', 'RocTxSent', 'RocTxOk', 'RocTxFail', 'RocTxDrop', 'RocRxDuring', 'RocDiscovery', 'RocRxAny', 'RocRxAnyChan', 'RocRxAwdlAny', 'RxPhy2', 'RxHome', 'RocPhyHolds', 'RocPhyCancels', 'Phy2Switches', 'RocTxOkUcast', 'RocTxFailUcast', 'RocTxOkMcast', 'RocTxFailMcast', 'RocTxFailIn', 'RocTxFailOut', 'RocTxOkHere', 'RocTxOkAway', 'RocTxFailHere', 'RocTxFailAway', 'RocTxFailUnknown', 'RocTxFailTries', 'RocTxOkTries', 'RocLateN', 'RocLateSumMs', 'RocOnN', 'RocOnSumMs', 'OwnSent', 'OwnOk', 'OwnFail', 'OwnRecovers', 'DataTx', 'DataRx']
+COUNTERS = ['RocSetups', 'RocTeardowns', 'RocAdds', 'RocAddErr', 'RocStarted', 'RocEnded', 'RocFailed', 'RocStale', 'RocRemoves', 'RocTxSent', 'RocTxOk', 'RocTxFail', 'RocTxDrop', 'RocRxDuring', 'RocDiscovery', 'RocRxAny', 'RocRxAnyChan', 'RocRxAwdlAny', 'RxPhy2', 'RxHome', 'RocPhyHolds', 'RocPhyCancels', 'Phy2Switches', 'RocTxOkUcast', 'RocTxFailUcast', 'RocTxOkMcast', 'RocTxFailMcast', 'RocTxFailIn', 'RocTxFailOut', 'RocTxOkHere', 'RocTxOkAway', 'RocTxFailHere', 'RocTxFailAway', 'RocTxFailUnknown', 'RocTxFailTries', 'RocTxOkTries', 'RocLateN', 'RocLateSumMs', 'RocOnN', 'RocOnSumMs', 'RocHeld', 'RocReleased', 'RocHoldFull', 'RocHoldExpired', 'RocHoldFreed', 'OwnSent', 'OwnOk', 'OwnFail', 'OwnRecovers', 'DataTx', 'DataRx']
 def run(*a, timeout=60):
     return subprocess.run(a, capture_output=True, text=True, timeout=timeout)
 
@@ -190,7 +190,7 @@ def main():
             if not faulted(z) and z.get('Phy2Chan'):
                 print('下一段最长：开始后请在手机或电脑上重新发一次文件（发送窗口可以重新打开）。', flush=True)
                 setv(ROC, 4 + 16 * activity)
-                z, d = phase('模式 4：链路已在 149，帧都经 ROC 发送（请重新发一次文件）', 90, lines)
+                z, d = phase('模式 4：链路已在 149，单播帧等 ROC 开始再发（请重新发一次文件）', 90, lines)
             elif not faulted(z):
                 lines.append('链路没有移到 149，模式 4 已跳过')
                 print(lines[-1], flush=True)

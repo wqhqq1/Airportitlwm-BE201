@@ -716,6 +716,7 @@ struct iwx_softc {
     struct task        awdl_phy2_task;
     struct task        awdl_solo_task;
     struct task        awdl_roc_task;
+    struct task        awdl_roc_flush_task;
     struct task        awdl_umi_task;
     bool sc_awdl_native_requested;
     struct iwx_awdl_probe sc_awdl_probe;

@@ -127,6 +127,10 @@ static inline bool iwx_awdl_err_transient(int err) {
 #define IWX_AWDL_ROC_SLOT_TU 16u
 #define IWX_AWDL_ROC_MAX_TU 128u
 #define IWX_AWDL_ROC_DELAY_TU 16u
+/* 1.1.92 host hold for mode 4: frames, how long one may wait, and how much of an ROC must be left to send. */
+#define IWX_AWDL_ROC_HOLD_MAX 16u
+#define IWX_AWDL_ROC_HOLD_US 300000u
+#define IWX_AWDL_ROC_TX_MARGIN_US 4000u
 #define IWX_AWDL_ROC_STALE_US 1000000u
 #define IWX_AWDL_ROC_SETUP_US 1000000u
 /*
@@ -339,7 +343,38 @@ struct iwx_awdl_roc {
     uint64_t started_us;
     uint32_t late_n, late_sum_ms, late_max_us; /* ADD sent to started */
     uint32_t on_n, on_sum_ms;                  /* started to ended */
+    /*
+     * 1.1.92, mode 4: unicast AWDL frames wait here, in the host, until an ROC runs with time left. 2026-11-12 09:02:
+     * 24 unicast AUX frames failed, 23 of them completing after their ROC, 3 retries in all (0x83), none acknowledged;
+     * frames queued to the firmware between ROCs were never really sent. mbufs and node references, oldest first.
+     */
+    uint32_t dur_tu;                       /* the running ROC's requested duration */
+    void *hold_m[IWX_AWDL_ROC_HOLD_MAX], *hold_ni[IWX_AWDL_ROC_HOLD_MAX];
+    uint64_t hold_us[IWX_AWDL_ROC_HOLD_MAX];
+    uint32_t hold_head, hold_n;
+    uint8_t flushing;                      /* the flush task is sending: no new hold */
+    uint32_t held, released, hold_full, hold_expired, hold_freed;
 };
+
+/* Whether a unicast AWDL frame for the AUX queue waits in the host (1.1.92): mode 4, no ROC with margin left. */
+static inline bool iwx_awdl_roc_hold(uint32_t mode, bool active, uint64_t started_us, uint32_t dur_tu, uint64_t now_us)
+{
+    if (mode < 4)
+        return false;
+    if (!active || !started_us)
+        return true;
+    const uint64_t end = started_us + uint64_t(dur_tu) * IWX_AWDL_TU_US;
+    return now_us + IWX_AWDL_ROC_TX_MARGIN_US >= end;
+}
+/* Ring positions for the hold queue: the slot a new frame takes, and whether the oldest has waited too long. */
+static inline uint32_t iwx_awdl_roc_hold_tail(const struct iwx_awdl_roc *r)
+{
+    return (r->hold_head + r->hold_n) % IWX_AWDL_ROC_HOLD_MAX;
+}
+static inline bool iwx_awdl_roc_hold_stale(const struct iwx_awdl_roc *r, uint64_t now_us)
+{
+    return r->hold_n && now_us - r->hold_us[r->hold_head] >= IWX_AWDL_ROC_HOLD_US;
+}
 
 /* Failure status buckets: 0 short limit, 1 long limit, 2 drain, 3 lifetime, 4 dest PS, 5 FIFO flushed, 6 aborted, 7 other. */
 static inline uint32_t iwx_awdl_roc_status_bucket(uint32_t s)

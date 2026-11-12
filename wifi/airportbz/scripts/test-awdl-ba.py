@@ -264,7 +264,16 @@ int main(){
   q.sent_us=1000; iwx_awdl_roc_note_start(&q,5000); assert(q.late_n==1&&q.late_sum_ms==4&&q.late_max_us==4000&&q.started_us==5000);
   iwx_awdl_roc_note_end(&q,105000); assert(q.on_n==1&&q.on_sum_ms==100&&q.started_us==0);
   iwx_awdl_roc_note_end(&q,200000); assert(q.on_n==1);
-  q.sent_us=10000; iwx_awdl_roc_note_start(&q,9000); assert(q.late_n==2&&q.late_max_us==4000);}
+  q.sent_us=10000; iwx_awdl_roc_note_start(&q,9000); assert(q.late_n==2&&q.late_max_us==4000);
+  /* 1.1.92 host hold */
+  assert(!iwx_awdl_roc_hold(3,false,0,0,0)&&!iwx_awdl_roc_hold(1,false,0,0,0));
+  assert(iwx_awdl_roc_hold(4,false,0,0,0)&&iwx_awdl_roc_hold(4,true,0,64,0));
+  { const uint64_t st=1000000, end=st+64ull*IWX_AWDL_TU_US;
+    assert(!iwx_awdl_roc_hold(4,true,st,64,st)&&!iwx_awdl_roc_hold(4,true,st,64,end-IWX_AWDL_ROC_TX_MARGIN_US-1)&&
+           iwx_awdl_roc_hold(4,true,st,64,end-IWX_AWDL_ROC_TX_MARGIN_US)&&iwx_awdl_roc_hold(4,true,st,64,end+1)); }
+  struct iwx_awdl_roc h={}; assert(iwx_awdl_roc_hold_tail(&h)==0&&!iwx_awdl_roc_hold_stale(&h,1u<<30));
+  h.hold_head=IWX_AWDL_ROC_HOLD_MAX-1; h.hold_n=3; assert(iwx_awdl_roc_hold_tail(&h)==2);
+  h.hold_us[h.hold_head]=100; assert(!iwx_awdl_roc_hold_stale(&h,100+IWX_AWDL_ROC_HOLD_US-1)&&iwx_awdl_roc_hold_stale(&h,100+IWX_AWDL_ROC_HOLD_US));}
  puts("awdl block ack checks passed");return 0;}
 '''
 with tempfile.TemporaryDirectory() as d:
@@ -549,6 +558,24 @@ for k in ['ItlwmAwdlRocTxFailUcast','ItlwmAwdlRocTxFailIn','ItlwmAwdlRocTxFailHe
     assert f'{{"{k}"' in cpp, k
 assert 'setProperty("ItlwmAwdlRocTxStatus", (void *)r->txs.status, sizeof(r->txs.status))' in cpp
 assert 'sc->sc_awdl_probe.roc.started_us = 0;' in cpp
+# 1.1.92: unicast AWDL frames wait in the host in mode 4 and leave only inside an ROC with time left.
+tx=cpp[cpp.index('iwx_tx(struct iwx_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)\n{'):]; tx=tx[:tx.index('\n}\n')]
+hb=tx[tx.index('/* 1.1.92, mode 4'):tx.index('++r->tx_sent;')]
+assert 'awdlKind == 2 && !r->flushing &&' in hb and 'iwx_awdl_roc_hold(r->mode, r->active, r->started_us, r->dur_tu, holdNow / 1000)' in hb
+assert hb.index('if (r->hold_n == IWX_AWDL_ROC_HOLD_MAX) {\n                    iwx_awdl_roc_hold_pop(sc, true);') < hb.index('r->hold_ni[slot] = ni;') < hb.index('return 0;') < hb.index('if (sc->txq[r->qid].queued >= IWX_AWDL_TX_MAX_QUEUED)'), 'held before the ring, oldest dropped when full'
+fl=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_flush_task(void *arg)'):]; fl=fl[:fl.index('\n}\n')]
+assert fl.index('iwx_awdl_roc_hold_stale(r, now / 1000)') < fl.index('iwx_awdl_roc_hold(r->mode, r->active, r->started_us, r->dur_tu, now / 1000)') < fl.index('r->flushing = 1;') < fl.index('that->iwx_tx(sc, m, ni, EDCA_AC_BE)') < fl.index('r->flushing = 0;')
+assert 'sc->txq[r->qid].queued >= IWX_AWDL_TX_MAX_QUEUED' in fl and 'ieee80211_release_node(&sc->sc_ic, ni); /* iwx_tx freed the frame */' in fl
+hp=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_hold_pop('):]; hp=hp[:hp.index('\n}\n')]
+assert 'mbuf_freem(hm);\n        ieee80211_release_node(&sc->sc_ic, hn);' in hp, 'a dropped frame frees its mbuf and node reference'
+rm=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_remove(struct iwx_softc *sc)'):]; rm=rm[:rm.index('\n}\n')]
+assert rm.index('iwx_awdl_roc_hold_clear(sc);') < rm.index('if (r->pending || r->active)'), 'the test stopping frees held frames'
+assert 'sc->sc_awdl_probe.roc.started_us = 0;\n    container_of(sc, ItlIwx, com)->iwx_awdl_roc_hold_clear(sc);' in cpp, 'and so does a stop'
+assert rn.index('iwx_awdl_roc_note_start(r, now / 1000);') < rn.index('iwx_add_task(sc, systq, &sc->awdl_roc_flush_task);'), 'an ROC start releases held frames'
+assert 'if (r->hold_n)\n        iwx_add_task(sc, systq, &sc->awdl_roc_flush_task);' in tk and 'r->dur_tu = duration;' in tk
+assert 'iwx_del_task(sc, systq, &sc->awdl_roc_flush_task);' in cpp and 'task_set(&sc->awdl_roc_flush_task, iwx_awdl_roc_flush_task, sc,' in cpp
+for k in ['ItlwmAwdlRocHeld','ItlwmAwdlRocReleased','ItlwmAwdlRocHoldFull','ItlwmAwdlRocHoldExpired','ItlwmAwdlRocHoldFreed']:
+    assert f'{{"{k}"' in cpp, k
 # The ROC tool: the link moves with ROC off before mode 4, and the first new firmware error switches both off.
 tool=(ROOT.parent/'kit/roc_test.py').read_text()
 m4=tool.index("setv(ROC, 4 + 16 * activity)")

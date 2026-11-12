@@ -1,4 +1,4 @@
 {
-  "version": "1.1.91",
-  "comment": "ROC test diagnostics: AUX TX failure status, ROC window and phone channel at completion, ROC start delay and dwell. Defaults as 1.1.88; ROC off"
+  "version": "1.1.92",
+  "comment": "ROC test mode 4: unicast AWDL frames wait in the host until an ROC runs with time left. Defaults as 1.1.88; ROC off"
 }

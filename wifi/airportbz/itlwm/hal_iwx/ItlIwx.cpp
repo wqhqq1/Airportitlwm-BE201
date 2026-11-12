@@ -6533,6 +6533,7 @@ void ItlIwx::iwx_awdl_roc_remove(struct iwx_softc *sc)
 {
     auto r = &sc->sc_awdl_probe.roc;
     const int generation = sc->sc_generation;
+    iwx_awdl_roc_hold_clear(sc);
     if (r->pending || r->active) {
         struct iwx_roc_req cmd;
         memset(&cmd, 0, sizeof(cmd));
@@ -6576,6 +6577,8 @@ void ItlIwx::iwx_awdl_roc_tick(struct iwx_softc *sc, uint64_t now_us)
     if (!iwx_awdl_roc_mode(r->want))
         r->setup_failed = 0; /* Off clears a failed setup: switching on again retries once. */
     const bool ready = iwx_awdl_roc_ready(sc);
+    if (r->hold_n)
+        iwx_add_task(sc, systq, &sc->awdl_roc_flush_task);
     r->blocked = wanted ? iwx_awdl_roc_blocked(sc) : 0;
     if (r->blocked != r->blocked_pub) {
         r->blocked_pub = r->blocked;
@@ -6640,6 +6643,7 @@ void ItlIwx::iwx_awdl_roc_tick(struct iwx_softc *sc, uint64_t now_us)
     r->pending = 1;
     r->chan = uint8_t(chan);
     r->sent_us = now_us;
+    r->dur_tu = duration;
     ++r->adds;
     r->disc_pending = disc;
     if (disc) {
@@ -6692,6 +6696,81 @@ void ItlIwx::iwx_awdl_roc_publish(struct iwx_softc *sc)
     for (const auto &e : txs)
         nub->setProperty(e.key, e.value, 32);
     nub->setProperty("ItlwmAwdlRocTxStatus", (void *)r->txs.status, sizeof(r->txs.status));
+    const struct { const char *key; uint32_t value; } hold[] = {
+        {"ItlwmAwdlRocHeld", r->held}, {"ItlwmAwdlRocReleased", r->released}, {"ItlwmAwdlRocHoldFull", r->hold_full},
+        {"ItlwmAwdlRocHoldExpired", r->hold_expired}, {"ItlwmAwdlRocHoldFreed", r->hold_freed}, {"ItlwmAwdlRocHoldNow", r->hold_n},
+    };
+    for (const auto &e : hold)
+        nub->setProperty(e.key, e.value, 32);
+}
+
+/* The oldest held frame: freed with its node reference when drop, otherwise handed back through the out arguments. */
+void ItlIwx::iwx_awdl_roc_hold_pop(struct iwx_softc *sc, bool drop, mbuf_t *m, struct ieee80211_node **ni)
+{
+    auto r = &sc->sc_awdl_probe.roc;
+    if (!r->hold_n)
+        return;
+    const uint32_t i = r->hold_head;
+    auto hm = static_cast<mbuf_t>(r->hold_m[i]);
+    auto hn = static_cast<struct ieee80211_node *>(r->hold_ni[i]);
+    r->hold_m[i] = r->hold_ni[i] = NULL;
+    r->hold_head = (i + 1) % IWX_AWDL_ROC_HOLD_MAX;
+    --r->hold_n;
+    if (drop) {
+        mbuf_freem(hm);
+        ieee80211_release_node(&sc->sc_ic, hn);
+        return;
+    }
+    *m = hm;
+    *ni = hn;
+}
+
+/* Every held frame goes: the ROC test stops, or the firmware restarts. */
+void ItlIwx::iwx_awdl_roc_hold_clear(struct iwx_softc *sc)
+{
+    auto r = &sc->sc_awdl_probe.roc;
+    while (r->hold_n) {
+        iwx_awdl_roc_hold_pop(sc, true);
+        ++r->hold_freed;
+    }
+}
+
+/* Under the gate, at an ROC's start and at each slot tick: send held frames while the ROC has time left. */
+void ItlIwx::iwx_awdl_roc_flush_task(void *arg)
+{
+    auto sc = static_cast<iwx_softc *>(arg);
+    auto that = container_of(sc, ItlIwx, com);
+    if (!that->getMainWorkLoop()->inGate()) {
+        that->getMainCommandGate()->runAction(
+            [](OSObject *, void *arg0, void *, void *, void *) -> IOReturn {
+                iwx_awdl_roc_flush_task(arg0); return kIOReturnSuccess;
+            }, arg);
+        return;
+    }
+    auto r = &sc->sc_awdl_probe.roc;
+    while (r->hold_n) {
+        uint64_t now = 0;
+        absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+        if (iwx_awdl_roc_hold_stale(r, now / 1000)) {
+            that->iwx_awdl_roc_hold_pop(sc, true);
+            ++r->hold_expired;
+            continue;
+        }
+        if (!r->sta_added || r->qid <= 0 || (sc->sc_flags & (IWX_FLAG_SHUTDOWN | IWX_FLAG_HW_ERR | IWX_FLAG_TXFLUSH)) ||
+            iwx_awdl_roc_hold(r->mode, r->active, r->started_us, r->dur_tu, now / 1000) ||
+            sc->txq[r->qid].queued >= IWX_AWDL_TX_MAX_QUEUED)
+            break;
+        mbuf_t m = NULL;
+        struct ieee80211_node *ni = NULL;
+        that->iwx_awdl_roc_hold_pop(sc, false, &m, &ni);
+        r->flushing = 1;
+        const int err = that->iwx_tx(sc, m, ni, EDCA_AC_BE);
+        r->flushing = 0;
+        if (err)
+            ieee80211_release_node(&sc->sc_ic, ni); /* iwx_tx freed the frame */
+        else
+            ++r->released;
+    }
 }
 
 /*
@@ -10672,6 +10751,23 @@ iwx_tx(struct iwx_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)
         auto r = &sc->sc_awdl_probe.roc;
         if (iwx_awdl_roc_routes(r->mode, r->active) && r->sta_added && r->qid > 0 &&
             iwx_awdl_roc_takes(r->mode, awdlKind, type == IEEE80211_FC0_TYPE_MGT)) {
+            /* 1.1.92, mode 4: a unicast frame waits in the host for an ROC with time left (iwx_awdl_roc_hold). */
+            uint64_t holdNow = 0;
+            absolutetime_to_nanoseconds(mach_absolute_time(), &holdNow);
+            if (awdlKind == 2 && !r->flushing &&
+                iwx_awdl_roc_hold(r->mode, r->active, r->started_us, r->dur_tu, holdNow / 1000)) {
+                if (r->hold_n == IWX_AWDL_ROC_HOLD_MAX) {
+                    iwx_awdl_roc_hold_pop(sc, true);
+                    ++r->hold_full;
+                }
+                const uint32_t slot = iwx_awdl_roc_hold_tail(r);
+                r->hold_m[slot] = m;
+                r->hold_ni[slot] = ni;
+                r->hold_us[slot] = holdNow / 1000;
+                ++r->hold_n;
+                ++r->held;
+                return 0;
+            }
             if (sc->txq[r->qid].queued >= IWX_AWDL_TX_MAX_QUEUED) {
                 ++r->tx_drop;
                 mbuf_freem(m);
@@ -16003,6 +16099,7 @@ iwx_stop(struct _ifnet *ifp)
     iwx_del_task(sc, systq, &sc->awdl_umi_task);
     iwx_del_task(sc, systq, &sc->awdl_solo_task);
     iwx_del_task(sc, systq, &sc->awdl_roc_task);
+    iwx_del_task(sc, systq, &sc->awdl_roc_flush_task);
     sc->sc_mld_authorized_epoch = sc->sc_mld_authorized_done_epoch = 0;
 #endif
     iwx_del_task(sc, systq, &sc->mac_ctxt_task);
@@ -16066,6 +16163,7 @@ iwx_stop(struct _ifnet *ifp)
     /* The ROC test's station, queue and ROC went with the firmware; the queue's ring is freed with the others. */
     sc->sc_awdl_probe.roc.sta_added = sc->sc_awdl_probe.roc.pending = sc->sc_awdl_probe.roc.active = 0;
     sc->sc_awdl_probe.roc.started_us = 0;
+    container_of(sc, ItlIwx, com)->iwx_awdl_roc_hold_clear(sc);
     sc->sc_awdl_probe.roc.qid = -1;
     /* The faulted firmware is gone with everything it held: AWDL may start again on the new one (1.1.73). */
     if (sc->sc_awdl_probe.tx.fault_tripped && sc->sc_awdl_probe.tx.tripped) {
@@ -17051,6 +17149,8 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data,
                     ++r->started;
                     r->active = 1;
                     iwx_awdl_roc_note_start(r, now / 1000);
+                    if (r->hold_n)
+                        iwx_add_task(sc, systq, &sc->awdl_roc_flush_task);
                 } else {
                     ++r->ended;
                     r->pending = r->active = 0;
@@ -19394,6 +19494,7 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
     task_set(&sc->awdl_phy2_task, iwx_awdl_phy2_task, sc, "iwx_awdl_phy2_task");
     task_set(&sc->awdl_solo_task, iwx_awdl_solo_task, sc, "iwx_awdl_solo_task");
     task_set(&sc->awdl_roc_task, iwx_awdl_roc_task, sc, "iwx_awdl_roc_task");
+    task_set(&sc->awdl_roc_flush_task, iwx_awdl_roc_flush_task, sc, "iwx_awdl_roc_flush_task");
     ic->ic_wcl_port_authorized = iwx_wcl_port_authorized;
 #endif
     task_set(&sc->mac_ctxt_task, iwx_mac_ctxt_task, sc, "iwx_mac_ctxt_task");

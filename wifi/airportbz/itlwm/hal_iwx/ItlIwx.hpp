@@ -172,6 +172,9 @@ public:
     void iwx_awdl_phy2_move(struct iwx_softc *);
     static void iwx_awdl_solo_task(void *);
     static void iwx_awdl_roc_task(void *);
+    static void iwx_awdl_roc_flush_task(void *);
+    void iwx_awdl_roc_hold_pop(struct iwx_softc *, bool, mbuf_t *m = NULL, struct ieee80211_node **ni = NULL);
+    void iwx_awdl_roc_hold_clear(struct iwx_softc *);
     void setAwdlRoc(uint32_t) override;
     bool awdlBulkActive() override;
     void iwx_awdl_roc_setup(struct iwx_softc *);
