@@ -169,6 +169,7 @@ public:
     void iwx_awdl_ba_send_resp(struct iwx_softc *, const struct iwx_awdl_ba_req *, uint16_t);
     void setAwdlOwnQueue(bool, bool, uint32_t) override;
     static void iwx_awdl_phy2_task(void *);
+    void iwx_awdl_phy2_move(struct iwx_softc *);
     static void iwx_awdl_solo_task(void *);
     static void iwx_awdl_roc_task(void *);
     void setAwdlRoc(uint32_t) override;

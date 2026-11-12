@@ -241,7 +241,11 @@ int main(){
   r.disc_us=5000000; assert(!iwx_awdl_roc_disc_due(&r,5000000+IWX_AWDL_ROC_DISC_GAP_US-1)&&iwx_awdl_roc_disc_due(&r,5000000+IWX_AWDL_ROC_DISC_GAP_US));
   r.heard_us=9000000; assert(!iwx_awdl_roc_disc_due(&r,9000000+IWX_AWDL_ROC_HEARD_US-1)&&iwx_awdl_roc_disc_due(&r,9000000+IWX_AWDL_ROC_HEARD_US));
   assert(iwx_awdl_roc_other5(149|(60<<8),60)==149&&iwx_awdl_roc_other5(60|(149<<8),60)==149&&iwx_awdl_roc_other5(149,149)==0&&iwx_awdl_roc_other5(0,60)==0&&iwx_awdl_roc_other5(6|(149<<8),157)==149);
-  assert(IWX_AWDL_ROC_DISC_TU>110&&IWX_AWDL_ROC_DISC_TU<=IWX_AWDL_ROC_MAX_TU);}
+  assert(IWX_AWDL_ROC_DISC_TU>110&&IWX_AWDL_ROC_DISC_TU<=IWX_AWDL_ROC_MAX_TU);
+  /* 1.1.89 fault snapshots */
+  struct iwx_awdl_roc f={}; assert(iwx_awdl_fault_roc(&f)==0);
+  f.pending=1;f.active=1;f.sta_added=1;f.activity=2;f.mode=4;f.chan=149; assert(iwx_awdl_fault_roc(&f)==(7u|0x20u|0x400u|(149u<<16)));
+  assert(iwx_awdl_fault_phy2(1,149,0)==(1u|(149u<<8))&&iwx_awdl_fault_phy2(0,0,149)==(149u<<16)&&iwx_awdl_fault_phy2(0,0,0)==0);}
  puts("awdl block ack checks passed");return 0;}
 '''
 with tempfile.TemporaryDirectory() as d:
@@ -490,4 +494,26 @@ assert mq.index('IWX_RX_MPDU_RES_STATUS_CRC_OK') < mq.index('++r->rx_any;') < mq
 assert 'probe->roc.heard_us = probe->rx_host_us;' in cpp and 'probe->rx_chan != uint32_t(ieee80211_chan2ieee(ic, ic->ic_bss->ni_chan))' in cpp
 for k in ['ItlwmAwdlRocDiscovery','ItlwmAwdlRocRxAny','ItlwmAwdlRocRxAnyChan','ItlwmAwdlRocRxAwdlAny']:
     assert f'setProperty("{k}"' in cpp, k
+# 1.1.89: no ROC overlaps a move of link 1 between PHY contexts (07:47: three asserts at PHY_CONTEXT_CMD).
+pt=cpp[cpp.index('void ItlIwx::iwx_awdl_phy2_task(void *arg)'):]; pt=pt[:pt.index('\n}\n')]
+assert pt.index('ctx.phy2_moving = 1;') < pt.index('that->iwx_awdl_phy2_move(sc);') < pt.index('ctx.phy2_moving = 0;') and 'if (generation == sc->sc_generation)' in pt, 'The task marks the move around it'
+mv=cpp[cpp.index('void ItlIwx::iwx_awdl_phy2_move(struct iwx_softc *sc)'):cpp.index('void ItlIwx::setAwdlOwnQueue')]
+assert mv.index('++r->phy_cancels;') < mv.index('IWX_ROC_CMD') < mv.index('IWX_LINK_CONTEXT_MODIFY_ACTIVE, 0)') < mv.index('iwx_phy_ctxt_update(sc, &sc->sc_phyctxt[1]'), 'A running ROC is removed before the link leaves its PHY'
+assert 'cmd.action = htole32(IWX_FW_CTXT_ACTION_REMOVE);' in mv[:mv.index('iwx_phy_ctxt_update')] and ', 0, sizeof(cmd), &cmd) ?: err;' in mv, 'The removal waits for its answer'
+q=cpp[cpp.index('if (c->phy2_want != phy2) {'):]; q=q[:q.index('}')]
+assert 'c->phy2_moving = 1;' in q and q.index('c->phy2_moving = 1;') < q.index('iwx_add_task(sc, systq, &sc->awdl_phy2_task);'), 'A queued move holds ROCs before the task runs'
+assert tk.index('if (r->pending)\n        return;') < tk.index('if (c->phy2_moving) {\n        ++r->phy_holds;\n        return;\n    }') < tk.index('cmd.action = htole32(IWX_FW_CTXT_ACTION_ADD);'), 'No ROC is added during a move'
+assert 'sc->sc_awdl_probe.ctx.phy2_chan = sc->sc_awdl_probe.ctx.phy2_want = 0;\n    sc->sc_awdl_probe.ctx.phy2_moving = 0;' in cpp, 'A restart clears the mark'
+ne=cpp[cpp.index('iwx_nic_error(struct iwx_softc *sc)\n{'):]; ne=ne[:ne.index('\n}\n')]
+assert ne.index('iwx_awdl_fault_roc(&sc->sc_awdl_probe.roc)') < ne.index('++sc->sc_fw_errors;') and 'setProperty("ItlwmAwdlFaultRoc"' in ne and 'setProperty("ItlwmAwdlFaultPhy2"' in ne
+for k in ['ItlwmAwdlRocPhyHolds','ItlwmAwdlRocPhyCancels']:
+    assert f'setProperty("{k}"' in cpp, k
+# The ROC tool: the link moves with ROC off before mode 4, and the first new firmware error switches both off.
+tool=(ROOT.parent/'kit/roc_test.py').read_text()
+m4=tool.index("setv(ROC, 4 + 16 * activity)")
+assert tool.index("setv(ROC, 0)\n            time.sleep(2)\n            setv(PHY2, 1)") < tool.index("if props().get('Phy2Chan'):") < m4, 'mode 4 starts after the move'
+assert "if not faulted(z) and z.get('Phy2Chan'):" in tool[:m4]
+w=tool[tool.index('fault_at = None'):tool.index('for j in jobs:\n        j.join()')]
+assert "props().get('FwErrors', 0) > FW0[0]" in w and w.index('setv(ROC, 0)') < w.index('setv(PHY2, 0)'), 'fault watch'
+assert "FW0[0] = props().get('FwErrors', 0)" in tool and "z.get('FwErrors', 0) > FW0[0]" in tool
 print('awdl block ack source checks passed')

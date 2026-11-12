@@ -211,6 +211,8 @@ struct iwx_awdl_tx {
     uint32_t mode, tripped, firmware_faults;
     /* Set when a firmware fault tripped AWDL: the firmware restart may re-arm it (1.1.73). */
     uint32_t fault_tripped, fault_rearms;
+    /* What the ROC test and link 1 were doing at the last firmware fault (1.1.89): iwx_awdl_fault_roc, _phy2. */
+    uint32_t fault_roc, fault_phy2;
     uint8_t self[6], peer[6], peer_valid;
     uint16_t seq;
     uint64_t last_psf_us, last_mif_us, last_unicast_us;
@@ -254,6 +256,8 @@ struct iwx_awdl_ctx {
     /* Test: link 1 on its own PHY context, another channel than the AP's. 0 is the AP's. */
     uint32_t phy2_want, phy2_chan, phy2_err, phy2_switches, rx_phy2, rx_home;
     uint8_t te_want, link_no_phy;
+    /* A move of link 1 between PHY contexts is queued or running: no ROC starts meanwhile (1.1.89). */
+    uint8_t phy2_moving;
     uint32_t te_removed, own_released;
     /* The own queue follows where data goes; with aggregation it is a TID 0 queue the firmware aggregates. */
     uint8_t own_tid, own_agg_want, own_agg;
@@ -315,7 +319,26 @@ struct iwx_awdl_roc {
     uint64_t heard_us, disc_us;
     uint32_t disc, rx_any, rx_any_chan, rx_awdl_any;
     uint8_t disc_pending;
+    /* 1.1.89: ticks an ROC waited for a move of link 1, and ROCs the move removed first. */
+    uint32_t phy_holds, phy_cancels;
 };
+
+/*
+ * Snapshots for a firmware fault (1.1.89). 2026-11-12 07:47, mode 4 with P2P_TXRX and phy2 1: three asserts, all
+ * 0x200008FE with data 145 and last host command PHY_CONTEXT_CMD (0x08), while 1.1.86 moved the same link beside
+ * HOTSPOT ROCs without one. Whether an ROC was running at the move is what these record.
+ * ROC: bit 0 pending, 1 active, 2 station added, bits 4-7 activity, 8-11 mode, 16-23 channel.
+ */
+static inline uint32_t iwx_awdl_fault_roc(const struct iwx_awdl_roc *r)
+{
+    return (r->pending ? 1u : 0u) | (r->active ? 2u : 0u) | (r->sta_added ? 4u : 0u) |
+           (r->activity & 15u) << 4 | (r->mode & 15u) << 8 | uint32_t(r->chan) << 16;
+}
+/* Link 1: bit 0 a move queued or running, bits 8-15 the wanted channel, 16-23 the channel it is on (0 the AP's). */
+static inline uint32_t iwx_awdl_fault_phy2(uint8_t moving, uint32_t want, uint32_t chan)
+{
+    return (moving ? 1u : 0u) | (want & 0xffu) << 8 | (chan & 0xffu) << 16;
+}
 
 /* A discovery ROC is due: nothing AWDL heard lately and the last one long enough ago (1.1.85). */
 static inline bool iwx_awdl_roc_disc_due(const struct iwx_awdl_roc *r, uint64_t now_us)

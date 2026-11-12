@@ -5413,6 +5413,7 @@ void ItlIwx::setAwdlRadioTest(bool hold, uint32_t phy2, uint32_t te, bool amsdu)
     c->te_want = uint8_t(te);
     if (c->phy2_want != phy2) {
         c->phy2_want = phy2;
+        c->phy2_moving = 1;
         iwx_add_task(sc, systq, &sc->awdl_phy2_task);
     }
     if (!iwx_awdl_te_windows(te) || !ready || c->phy2_want != c->phy2_chan)
@@ -5435,7 +5436,11 @@ void ItlIwx::setAwdlRadioTest(bool hold, uint32_t phy2, uint32_t te, bool amsdu)
     }
 }
 
-/* Linux moves a link between PHY contexts the same way: inactive, new context, active. */
+/*
+ * Linux moves a link between PHY contexts the same way: inactive, new context, active. While a move is queued or runs
+ * no ROC starts, and one in progress is removed first (1.1.89): the 07:47 asserts at PHY_CONTEXT_CMD came with P2P_TXRX
+ * ROCs on the channel the link was moving to. A firmware restart clears the mark with the rest.
+ */
 void ItlIwx::iwx_awdl_phy2_task(void *arg)
 {
     auto sc = static_cast<iwx_softc *>(arg);
@@ -5447,6 +5452,16 @@ void ItlIwx::iwx_awdl_phy2_task(void *arg)
             }, arg);
         return;
     }
+    const int generation = sc->sc_generation;
+    sc->sc_awdl_probe.ctx.phy2_moving = 1;
+    that->iwx_awdl_phy2_move(sc);
+    if (generation == sc->sc_generation)
+        sc->sc_awdl_probe.ctx.phy2_moving = 0;
+}
+
+void ItlIwx::iwx_awdl_phy2_move(struct iwx_softc *sc)
+{
+    auto that = this;
     auto ic = &sc->sc_ic;
     auto p = &sc->sc_awdl_probe;
     auto c = &p->ctx;
@@ -5495,6 +5510,20 @@ void ItlIwx::iwx_awdl_phy2_task(void *arg)
             ++c->own_kept_moves;
         } else if (c->own_qid > 0) {
             err = that->iwx_awdl_own_release(sc) ?: err;
+            if (generation != sc->sc_generation)
+                return;
+        }
+    }
+    {
+        auto r = &p->roc;
+        if (r->pending || r->active) {
+            struct iwx_roc_req cmd;
+            memset(&cmd, 0, sizeof(cmd));
+            cmd.action = htole32(IWX_FW_CTXT_ACTION_REMOVE);
+            cmd.activity = htole32(r->activity);
+            r->pending = r->active = 0;
+            ++r->phy_cancels;
+            err = that->iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_ROC_CMD, IWX_MAC_CONF_GROUP, 0), 0, sizeof(cmd), &cmd) ?: err;
             if (generation != sc->sc_generation)
                 return;
         }
@@ -6572,6 +6601,10 @@ void ItlIwx::iwx_awdl_roc_tick(struct iwx_softc *sc, uint64_t now_us)
     }
     if (r->pending)
         return;
+    if (c->phy2_moving) {
+        ++r->phy_holds;
+        return;
+    }
     const uint32_t ap = uint32_t(ieee80211_chan2ieee(ic, ic->ic_bss->ni_chan));
     uint32_t chan = c->slot_chan;
     uint32_t duration = iwx_awdl_roc_duration(c->slot_run);
@@ -6640,6 +6673,8 @@ void ItlIwx::iwx_awdl_roc_publish(struct iwx_softc *sc)
     nub->setProperty("ItlwmAwdlRocRxAny", r->rx_any, 32);
     nub->setProperty("ItlwmAwdlRocRxAnyChan", r->rx_any_chan, 32);
     nub->setProperty("ItlwmAwdlRocRxAwdlAny", r->rx_awdl_any, 32);
+    nub->setProperty("ItlwmAwdlRocPhyHolds", r->phy_holds, 32);
+    nub->setProperty("ItlwmAwdlRocPhyCancels", r->phy_cancels, 32);
 }
 
 /*
@@ -15986,6 +16021,7 @@ iwx_stop(struct _ifnet *ifp)
     /* A firmware restart loses the power table and link parameters too. */
     sc->sc_awdl_probe.ctx.own_fix_done = 0;
     sc->sc_awdl_probe.ctx.phy2_chan = sc->sc_awdl_probe.ctx.phy2_want = 0;
+    sc->sc_awdl_probe.ctx.phy2_moving = 0;
     sc->sc_awdl_probe.ba_pending_valid = 0;
     memset(sc->sc_awdl_probe.ba, 0, sizeof(sc->sc_awdl_probe.ba));
     sc->sc_awdl_probe.tx.data_stalled = 0;
@@ -16489,6 +16525,11 @@ iwx_nic_error(struct iwx_softc *sc)
         sc->sc_pcitag->setProperty("ItlwmAwdlTxTripped", sc->sc_awdl_probe.tx.tripped, 32);
         sc->sc_pcitag->setProperty("ItlwmAwdlFirmwareFaults", sc->sc_awdl_probe.tx.firmware_faults, 32);
     }
+    sc->sc_awdl_probe.tx.fault_roc = iwx_awdl_fault_roc(&sc->sc_awdl_probe.roc);
+    sc->sc_awdl_probe.tx.fault_phy2 = iwx_awdl_fault_phy2(sc->sc_awdl_probe.ctx.phy2_moving,
+        sc->sc_awdl_probe.ctx.phy2_want, sc->sc_awdl_probe.ctx.phy2_chan);
+    sc->sc_pcitag->setProperty("ItlwmAwdlFaultRoc", sc->sc_awdl_probe.tx.fault_roc, 32);
+    sc->sc_pcitag->setProperty("ItlwmAwdlFaultPhy2", sc->sc_awdl_probe.tx.fault_phy2, 32);
 #endif
     ++sc->sc_fw_errors;
     sc->sc_pcitag->setProperty("ItlwmFwErrors", sc->sc_fw_errors, 32);

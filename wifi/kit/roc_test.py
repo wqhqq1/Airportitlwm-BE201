@@ -1,4 +1,5 @@
-"""1.1.75 and later (1.1.87: baseline, mode 1 with P2P_TXRX, then mode 4 with the AWDL link on 149 for 90 s): remain-on-channel (ROC) test beside a router link, phase by phase. The firmware gets an ROC for each run of
+"""1.1.75 and later (1.1.89: baseline, mode 1 with P2P_TXRX, the AWDL link moved to 149 with ROC off, then mode 4 on that
+link for 90 s; the first firmware error switches everything off at once): remain-on-channel (ROC) test beside a router link, phase by phase. The firmware gets an ROC for each run of
 the AWDL sequence's other 5 GHz channel, through an AUX station, as Intel's Linux driver sends off-channel frames.
 Results are saved after every phase, and each phase asks whether the phone sees this Mac and the transfer moves.
 RAM switch only (debug.be201_awdl_roc); it is off again at the end or on any exit."""
@@ -6,9 +7,9 @@ import datetime, re, signal, subprocess, sys, threading, time
 from pathlib import Path
 ROC = 'debug.be201_awdl_roc'
 PHY2 = 'debug.be201_awdl_phy2'
-KEYS = ['RocMode', 'RocQid', 'RocSetups', 'RocSetupErr', 'RocSetupStage', 'RocTeardowns', 'RocAdds', 'RocAddErr', 'RocStarted', 'RocEnded', 'RocFailed', 'RocStale', 'RocRemoves', 'RocChan', 'RocTxSent', 'RocTxOk', 'RocTxFail', 'RocTxDrop', 'RocRxDuring', 'RocDiscovery', 'RocRxAny', 'RocRxAnyChan', 'RocRxAwdlAny', 'RxPhy2', 'RxHome', 'Phy2Chan',
+KEYS = ['RocMode', 'RocQid', 'RocSetups', 'RocSetupErr', 'RocSetupStage', 'RocTeardowns', 'RocAdds', 'RocAddErr', 'RocStarted', 'RocEnded', 'RocFailed', 'RocStale', 'RocRemoves', 'RocChan', 'RocTxSent', 'RocTxOk', 'RocTxFail', 'RocTxDrop', 'RocRxDuring', 'RocDiscovery', 'RocRxAny', 'RocRxAnyChan', 'RocRxAwdlAny', 'RxPhy2', 'RxHome', 'Phy2Chan', 'RocPhyHolds', 'RocPhyCancels', 'Phy2Switches', 'Phy2Err', 'FaultRoc', 'FaultPhy2',
         'SeqChan5', 'OwnSent', 'OwnOk', 'OwnFail', 'OwnRecovers', 'TxTripped', 'DataTx', 'DataRx', 'FirmwareFaults', 'FaultRearms']
-COUNTERS = ['RocSetups', 'RocTeardowns', 'RocAdds', 'RocAddErr', 'RocStarted', 'RocEnded', 'RocFailed', 'RocStale', 'RocRemoves', 'RocTxSent', 'RocTxOk', 'RocTxFail', 'RocTxDrop', 'RocRxDuring', 'RocDiscovery', 'RocRxAny', 'RocRxAnyChan', 'RocRxAwdlAny', 'RxPhy2', 'RxHome', 'OwnSent', 'OwnOk', 'OwnFail', 'OwnRecovers', 'DataTx', 'DataRx']
+COUNTERS = ['RocSetups', 'RocTeardowns', 'RocAdds', 'RocAddErr', 'RocStarted', 'RocEnded', 'RocFailed', 'RocStale', 'RocRemoves', 'RocTxSent', 'RocTxOk', 'RocTxFail', 'RocTxDrop', 'RocRxDuring', 'RocDiscovery', 'RocRxAny', 'RocRxAnyChan', 'RocRxAwdlAny', 'RxPhy2', 'RxHome', 'RocPhyHolds', 'RocPhyCancels', 'Phy2Switches', 'OwnSent', 'OwnOk', 'OwnFail', 'OwnRecovers', 'DataTx', 'DataRx']
 def run(*a, timeout=60):
     return subprocess.run(a, capture_output=True, text=True, timeout=timeout)
 
@@ -20,6 +21,9 @@ def props(text=None):
     out = {k: int(m[1]) for k in KEYS if (m := re.search(rf'"ItlwmAwdl{k}" = (\d+)', text))}
     m = re.search(r'"ItlwmFwErrors" = (\d+)', text)
     out['FwErrors'] = int(m[1]) if m else 0
+    for k in ['ItlwmFwErrorId', 'ItlwmFwErrorCmd', 'ItlwmFwErrorData1']:
+        m = re.search(rf'"{k}" = (\d+)', text)
+        out[k] = int(m[1]) if m else None
     # 1.1.82: which readiness condition an ROC still waits for, and the DMA pool (the 1.1.81 leak ended in ENOMEM).
     for k in ['ItlwmAwdlRocBlocked', 'ItlwmDmaUsedKiB', 'ItlwmDmaFailures', 'ItlwmDmaRetiredKiB', 'ItlwmMldDataQueues', 'ItlwmAwdlOwnErr', 'ItlwmApPortValid', 'ItlwmApRsnOn']:
         m = re.search(rf'"{k}" = (\d+)', text)
@@ -90,7 +94,17 @@ def phase(name, seconds, lines):
         jobs.append(threading.Thread(target=pinger, args=('peer', ['ping6', '-c', str(seconds * 2), '-i', '0.5', peer])))
     for j in jobs:
         j.start()
-    time.sleep(seconds)
+    # 1.1.89: the first new firmware error turns both switches off at once. On 07:47 the driver re-armed twice and
+    # each re-arm moved the link again into the same assert, so the router link dropped three times.
+    fault_at = None
+    start = time.monotonic()
+    while time.monotonic() - start < seconds:
+        time.sleep(2)
+        if fault_at is None and props().get('FwErrors', 0) > FW0[0]:
+            setv(ROC, 0)
+            setv(PHY2, 0)
+            fault_at = int(time.monotonic() - start)
+            print(f'固件报错（第 {fault_at} 秒），已关闭 ROC 和第二信道', flush=True)
     for j in jobs:
         j.join()
     text = ioreg()
@@ -104,7 +118,11 @@ def phase(name, seconds, lines):
             f"关闭标记 {z.get('TxTripped')} 固件报错 {z.get('FwErrors')}；ROC 缺少条件 {z.get('ItlwmAwdlRocBlocked')}；"
             f"DMA 已用 {z.get('ItlwmDmaUsedKiB')} KiB 失败 {z.get('ItlwmDmaFailures')} 搁置 {z.get('ItlwmDmaRetiredKiB')} KiB；"
             f"路由器数据队列 {z.get('ItlwmMldDataQueues')} 聚合队列错误 {z.get('ItlwmAwdlOwnErr')}；"
-            f"AP 端口标志 {z.get('ItlwmApPortValid')} 加密网络 {z.get('ItlwmApRsnOn')}")
+            f"AP 端口标志 {z.get('ItlwmApPortValid')} 加密网络 {z.get('ItlwmApRsnOn')}；"
+            f"链路信道 {z.get('Phy2Chan')} 换信道错误 {z.get('Phy2Err')}")
+    if fault_at is not None or z.get('FwErrors', 0) > FW0[0]:
+        line += (f"；固件报错 第 {fault_at} 秒 错误 0x{(z.get('ItlwmFwErrorId') or 0):08X} 命令 0x{(z.get('ItlwmFwErrorCmd') or 0):06X} "
+                 f"数据 {z.get('ItlwmFwErrorData1')} 当时 ROC 0x{(z.get('FaultRoc') or 0):06X} 链路 0x{(z.get('FaultPhy2') or 0):06X}")
     print(line, flush=True)
     lines.append(line)
     lines.append(f"{name} 用户：" + input('这一段里，手机分享面板能看到这台电脑吗？电脑上的传输有没有动？（直接描述，回车继续）').strip())
@@ -117,6 +135,7 @@ def _closed(signum, frame):
 signal.signal(signal.SIGHUP, _closed)
 signal.signal(signal.SIGTERM, _closed)
 
+FW0 = [0]  # firmware errors before the test: anything above is new
 PATH = Path(__file__).resolve().parent / f"roc-{datetime.datetime.now():%Y%m%d-%H%M%S}.txt"
 
 def main():
@@ -137,24 +156,38 @@ def main():
     print('每一段结束时会问你手机能不能看到电脑、传输有没有动；结果每段都会保存。', flush=True)
     print('这个实验可能让 Wi-Fi 断开十几秒，请先保存工作。', flush=True)
     input('现在用隔空投送把文件发给手机（发不出去也没关系，保持发送窗口开着），然后按回车。')
+    FW0[0] = props().get('FwErrors', 0)
     lines = [f'开始 {datetime.datetime.now()} 当前信道 {home}；时间表 {seq}']
     save(lines, PATH)
     activity = 2
+    faulted = lambda z: z.get('TxTripped') or z.get('FwErrors', 0) > FW0[0]
     try:
         z, d = phase('基准（ROC 关闭）', 20, lines)
-        if not z.get('TxTripped'):
+        if not faulted(z):
             # 1.1.87: P2P_TXRX only; HOTSPOT with AUX transmit asserted the firmware on 16:08.
             setv(ROC, 1 + 16 * activity)
             z, d = phase('模式 1：只做 ROC（P2P 收发），看固件是否接受、是否收到 149 上的帧', 20, lines)
-        if not z.get('TxTripped') and d.get('RocStarted'):
-            # The AWDL link on a 149 PHY lets the phone's frames through; ROC takes the radio there and sends (1.1.86).
-            print('下一段最长：开始后请在手机或电脑上重新发一次文件（发送窗口可以重新打开）。', flush=True)
+        if not faulted(z) and d.get('RocStarted'):
+            # 1.1.89: the link moves with ROC off, and only then do ROCs start. On 07:47 the move and the P2P_TXRX ROCs
+            # overlapped and the firmware asserted at PHY_CONTEXT_CMD.
+            setv(ROC, 0)
+            time.sleep(2)
             setv(PHY2, 1)
-            setv(ROC, 4 + 16 * activity)
-            z, d = phase('模式 4：AWDL 链路放到 149，帧都经 ROC 发送（请重新发一次文件）', 90, lines)
+            for _ in range(10):
+                time.sleep(1.5)
+                if props().get('Phy2Chan'):
+                    break
+            z, d = phase('链路先移到 149（ROC 关闭），看能否收到手机的帧', 20, lines)
+            if not faulted(z) and z.get('Phy2Chan'):
+                print('下一段最长：开始后请在手机或电脑上重新发一次文件（发送窗口可以重新打开）。', flush=True)
+                setv(ROC, 4 + 16 * activity)
+                z, d = phase('模式 4：链路已在 149，帧都经 ROC 发送（请重新发一次文件）', 90, lines)
+            elif not faulted(z):
+                lines.append('链路没有移到 149，模式 4 已跳过')
+                print(lines[-1], flush=True)
             setv(ROC, 0)
             setv(PHY2, 0)
-        if z.get('TxTripped'):
+        if faulted(z):
             lines.append('固件报错或 AWDL 已停用，后面的阶段已跳过')
             print(lines[-1], flush=True)
     finally:
