@@ -1,4 +1,4 @@
 {
-  "version": "1.1.90",
-  "comment": "ROC test: second PHY context 20 MHz (no AP width off its channel); a fault during a link move holds it. Defaults as 1.1.88; ROC off"
+  "version": "1.1.91",
+  "comment": "ROC test diagnostics: AUX TX failure status, ROC window and phone channel at completion, ROC start delay and dwell. Defaults as 1.1.88; ROC off"
 }

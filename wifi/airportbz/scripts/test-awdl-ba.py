@@ -249,7 +249,22 @@ int main(){
   /* 1.1.90 fault hold */
   uint8_t hold=0; assert(iwx_awdl_phy2_after_fault(&hold,1)==1&&!hold);
   hold=1; assert(iwx_awdl_phy2_after_fault(&hold,1)==0&&hold&&iwx_awdl_phy2_after_fault(&hold,149)==0);
-  assert(iwx_awdl_phy2_after_fault(&hold,0)==0&&!hold&&iwx_awdl_phy2_after_fault(&hold,1)==1);}
+  assert(iwx_awdl_phy2_after_fault(&hold,0)==0&&!hold&&iwx_awdl_phy2_after_fault(&hold,1)==1);
+  /* 1.1.91 AUX TX diagnostics */
+  assert(iwx_awdl_roc_status_bucket(0x82)==0&&iwx_awdl_roc_status_bucket(0x83)==1&&iwx_awdl_roc_status_bucket(0x85)==2&&iwx_awdl_roc_status_bucket(0x87)==3&&
+         iwx_awdl_roc_status_bucket(0x88)==4&&iwx_awdl_roc_status_bucket(0x8e)==5&&iwx_awdl_roc_status_bucket(0x89)==6&&iwx_awdl_roc_status_bucket(0x92)==6&&
+         iwx_awdl_roc_status_bucket(0x01)==7&&iwx_awdl_roc_status_bucket(0x90)==7);
+  struct iwx_awdl_roc q={}; q.chan=149;
+  iwx_awdl_roc_note_tx(&q,false,true,1,0,true,0); iwx_awdl_roc_note_tx(&q,false,false,0x8e,0,false,149);
+  assert(q.txs.ok_mcast==1&&q.txs.fail_mcast==1&&q.txs.status[5]==1&&q.txs.fail_ucast==0&&q.txs.fail_in==0&&q.txs.fail_out==0);
+  iwx_awdl_roc_note_tx(&q,true,true,1,2,true,149); iwx_awdl_roc_note_tx(&q,true,true,1,0,true,44); iwx_awdl_roc_note_tx(&q,true,true,1,0,true,0);
+  assert(q.txs.ok_ucast==3&&q.txs.ok_here==1&&q.txs.ok_away==1&&q.txs.ok_tries==2);
+  iwx_awdl_roc_note_tx(&q,true,false,0x83,7,true,149); iwx_awdl_roc_note_tx(&q,true,false,0x83,3,false,6); iwx_awdl_roc_note_tx(&q,true,false,0x87,0,false,0);
+  assert(q.txs.fail_ucast==3&&q.txs.status[1]==2&&q.txs.status[3]==1&&q.txs.fail_in==1&&q.txs.fail_out==2&&q.txs.fail_here==1&&q.txs.fail_away==1&&q.txs.fail_unknown==1&&q.txs.fail_tries==10);
+  q.sent_us=1000; iwx_awdl_roc_note_start(&q,5000); assert(q.late_n==1&&q.late_sum_ms==4&&q.late_max_us==4000&&q.started_us==5000);
+  iwx_awdl_roc_note_end(&q,105000); assert(q.on_n==1&&q.on_sum_ms==100&&q.started_us==0);
+  iwx_awdl_roc_note_end(&q,200000); assert(q.on_n==1);
+  q.sent_us=10000; iwx_awdl_roc_note_start(&q,9000); assert(q.late_n==2&&q.late_max_us==4000);}
  puts("awdl block ack checks passed");return 0;}
 '''
 with tempfile.TemporaryDirectory() as d:
@@ -525,6 +540,15 @@ ra=cpp[cpp.index('void ItlIwx::setAwdlRadioTest('):]; ra=ra[:ra.index('if (phy2 
 assert ra.index('if (c->solo) {') < ra.index('phy2 = iwx_awdl_phy2_after_fault(&c->phy2_fault_hold, phy2);'), 'the hold applies before any move'
 assert ne.index('if (sc->sc_awdl_probe.ctx.phy2_moving) {\n        sc->sc_awdl_probe.ctx.phy2_fault_hold = 1;') < ne.index('++sc->sc_fw_errors;')
 assert 'phy2_fault_hold' not in cpp[cpp.index('sc->sc_awdl_probe.ctx.phy2_chan = sc->sc_awdl_probe.ctx.phy2_want = 0;'):][:300], 'a restart keeps the hold'
+# 1.1.91: every AUX completion and ROC notification feeds the diagnostics.
+cs=cpp[cpp.index('iwx_rx_tx_cmd_single(struct iwx_softc *sc'):]; cs=cs[:cs.index('\n}\n')]
+assert 'iwx_awdl_roc_note_tx(&sc->sc_awdl_probe.roc, txd->awdl_kind != 1, status == IWX_TX_STATUS_SUCCESS,' in cs and 'iwx_awdl_peer_slot_chan(&sc->sc_awdl_probe, now / 1000)' in cs
+rn=cpp[cpp.index('case IWX_WIDE_ID(IWX_MAC_CONF_GROUP, IWX_ROC_NOTIF): {'):]; rn=rn[:rn.index('break;\n            }')]
+assert rn.index('++r->started;') < rn.index('iwx_awdl_roc_note_start(r, now / 1000);') < rn.index('iwx_awdl_roc_note_end(r, now / 1000);')
+for k in ['ItlwmAwdlRocTxFailUcast','ItlwmAwdlRocTxFailIn','ItlwmAwdlRocTxFailHere','ItlwmAwdlRocTxFailAway','ItlwmAwdlRocLateMaxUs','ItlwmAwdlRocOnSumMs']:
+    assert f'{{"{k}"' in cpp, k
+assert 'setProperty("ItlwmAwdlRocTxStatus", (void *)r->txs.status, sizeof(r->txs.status))' in cpp
+assert 'sc->sc_awdl_probe.roc.started_us = 0;' in cpp
 # The ROC tool: the link moves with ROC off before mode 4, and the first new firmware error switches both off.
 tool=(ROOT.parent/'kit/roc_test.py').read_text()
 m4=tool.index("setv(ROC, 4 + 16 * activity)")

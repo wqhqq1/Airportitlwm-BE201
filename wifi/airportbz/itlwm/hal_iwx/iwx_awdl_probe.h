@@ -324,7 +324,82 @@ struct iwx_awdl_roc {
     uint8_t disc_pending;
     /* 1.1.89: ticks an ROC waited for a move of link 1, and ROCs the move removed first. */
     uint32_t phy_holds, phy_cancels;
+    /*
+     * 1.1.91, why AUX frames fail. 2026-11-12 08:48, mode 4 with the link on 149: 634 sent, 311 ok, 321 failed, all
+     * multicast fine, unicast without ACK (last status 0x83), 144 retries over 427 boot-wide failures; AirDrop failed.
+     * See iwx_awdl_roc_note_tx and the start/end timing in the ROC notification.
+     */
+    struct iwx_awdl_roc_tx_stats {
+        uint32_t status[8];                 /* failures by iwx_awdl_roc_status_bucket */
+        uint32_t ok_ucast, fail_ucast, ok_mcast, fail_mcast;
+        uint32_t fail_in, fail_out;         /* the ROC still running at completion, or not */
+        uint32_t ok_here, ok_away, fail_here, fail_away, fail_unknown; /* phone's schedule: the ROC's channel, another, unknown */
+        uint32_t fail_tries, ok_tries;      /* failure_frame summed */
+    } txs;
+    uint64_t started_us;
+    uint32_t late_n, late_sum_ms, late_max_us; /* ADD sent to started */
+    uint32_t on_n, on_sum_ms;                  /* started to ended */
 };
+
+/* Failure status buckets: 0 short limit, 1 long limit, 2 drain, 3 lifetime, 4 dest PS, 5 FIFO flushed, 6 aborted, 7 other. */
+static inline uint32_t iwx_awdl_roc_status_bucket(uint32_t s)
+{
+    switch (s) {
+    case 0x82: return 0;
+    case 0x83: return 1;
+    case 0x85: return 2;
+    case 0x87: return 3;
+    case 0x88: return 4;
+    case 0x8e: return 5;
+    case 0x89: case 0x92: return 6;
+    default: return 7;
+    }
+}
+
+/* One AUX frame's result. peer_chan: the reference peer's slot channel then (0 unknown); chan: the ROC's. */
+static inline void iwx_awdl_roc_note_tx(struct iwx_awdl_roc *r, bool unicast, bool ok, uint32_t status, uint32_t tries,
+                                        bool active, uint8_t peer_chan)
+{
+    auto t = &r->txs;
+    if (!unicast) {
+        ++*(ok ? &t->ok_mcast : &t->fail_mcast);
+        if (!ok)
+            ++t->status[iwx_awdl_roc_status_bucket(status)];
+        return;
+    }
+    const bool here = peer_chan && peer_chan == r->chan;
+    if (ok) {
+        ++t->ok_ucast;
+        t->ok_tries += tries;
+        if (peer_chan)
+            ++*(here ? &t->ok_here : &t->ok_away);
+        return;
+    }
+    ++t->fail_ucast;
+    t->fail_tries += tries;
+    ++t->status[iwx_awdl_roc_status_bucket(status)];
+    ++*(active ? &t->fail_in : &t->fail_out);
+    ++*(!peer_chan ? &t->fail_unknown : here ? &t->fail_here : &t->fail_away);
+}
+
+/* ROC timing from its notifications (1.1.91): how late after the ADD it started, and how long it ran. */
+static inline void iwx_awdl_roc_note_start(struct iwx_awdl_roc *r, uint64_t now_us)
+{
+    r->started_us = now_us;
+    const uint64_t late = now_us > r->sent_us ? now_us - r->sent_us : 0;
+    ++r->late_n;
+    r->late_sum_ms += uint32_t(late / 1000);
+    if (late > r->late_max_us)
+        r->late_max_us = late > 0xffffffffull ? 0xffffffffu : uint32_t(late);
+}
+static inline void iwx_awdl_roc_note_end(struct iwx_awdl_roc *r, uint64_t now_us)
+{
+    if (r->started_us && now_us > r->started_us) {
+        ++r->on_n;
+        r->on_sum_ms += uint32_t((now_us - r->started_us) / 1000);
+    }
+    r->started_us = 0;
+}
 
 /*
  * Snapshots for a firmware fault (1.1.89). 2026-11-12 07:47, mode 4 with P2P_TXRX and phy2 1: three asserts, all

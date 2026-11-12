@@ -6677,6 +6677,21 @@ void ItlIwx::iwx_awdl_roc_publish(struct iwx_softc *sc)
     nub->setProperty("ItlwmAwdlRocRxAwdlAny", r->rx_awdl_any, 32);
     nub->setProperty("ItlwmAwdlRocPhyHolds", r->phy_holds, 32);
     nub->setProperty("ItlwmAwdlRocPhyCancels", r->phy_cancels, 32);
+    /* 1.1.91: why AUX frames fail, and when ROCs really ran. */
+    const struct { const char *key; uint32_t value; } txs[] = {
+        {"ItlwmAwdlRocTxOkUcast", r->txs.ok_ucast}, {"ItlwmAwdlRocTxFailUcast", r->txs.fail_ucast},
+        {"ItlwmAwdlRocTxOkMcast", r->txs.ok_mcast}, {"ItlwmAwdlRocTxFailMcast", r->txs.fail_mcast},
+        {"ItlwmAwdlRocTxFailIn", r->txs.fail_in}, {"ItlwmAwdlRocTxFailOut", r->txs.fail_out},
+        {"ItlwmAwdlRocTxOkHere", r->txs.ok_here}, {"ItlwmAwdlRocTxOkAway", r->txs.ok_away},
+        {"ItlwmAwdlRocTxFailHere", r->txs.fail_here}, {"ItlwmAwdlRocTxFailAway", r->txs.fail_away},
+        {"ItlwmAwdlRocTxFailUnknown", r->txs.fail_unknown},
+        {"ItlwmAwdlRocTxFailTries", r->txs.fail_tries}, {"ItlwmAwdlRocTxOkTries", r->txs.ok_tries},
+        {"ItlwmAwdlRocLateN", r->late_n}, {"ItlwmAwdlRocLateSumMs", r->late_sum_ms}, {"ItlwmAwdlRocLateMaxUs", r->late_max_us},
+        {"ItlwmAwdlRocOnN", r->on_n}, {"ItlwmAwdlRocOnSumMs", r->on_sum_ms},
+    };
+    for (const auto &e : txs)
+        nub->setProperty(e.key, e.value, 32);
+    nub->setProperty("ItlwmAwdlRocTxStatus", (void *)r->txs.status, sizeof(r->txs.status));
 }
 
 /*
@@ -9300,8 +9315,14 @@ iwx_rx_tx_cmd_single(struct iwx_softc *sc, struct iwx_rx_packet *pkt,
         if (status != IWX_TX_STATUS_SUCCESS)
             ++sc->sc_awdl_probe.ctx.phy2_q_fail;
     }
-    if (txd->awdl_roc)
+    if (txd->awdl_roc) {
         ++*(status == IWX_TX_STATUS_SUCCESS ? &sc->sc_awdl_probe.roc.tx_ok : &sc->sc_awdl_probe.roc.tx_fail);
+        uint64_t now = 0;
+        absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+        iwx_awdl_roc_note_tx(&sc->sc_awdl_probe.roc, txd->awdl_kind != 1, status == IWX_TX_STATUS_SUCCESS,
+            static_cast<uint32_t>(status), tx_resp->failure_frame, sc->sc_awdl_probe.roc.active,
+            iwx_awdl_peer_slot_chan(&sc->sc_awdl_probe, now / 1000));
+    }
     if (txd->awdl_kind) {
         iwx_awdl_tx_note_presence(sc);
         iwx_awdl_tx_note_done(&sc->sc_awdl_probe, txd->awdl_kind != 1, status == IWX_TX_STATUS_SUCCESS,
@@ -16044,6 +16065,7 @@ iwx_stop(struct _ifnet *ifp)
     sc->sc_awdl_probe.tx.data_stalled = 0;
     /* The ROC test's station, queue and ROC went with the firmware; the queue's ring is freed with the others. */
     sc->sc_awdl_probe.roc.sta_added = sc->sc_awdl_probe.roc.pending = sc->sc_awdl_probe.roc.active = 0;
+    sc->sc_awdl_probe.roc.started_us = 0;
     sc->sc_awdl_probe.roc.qid = -1;
     /* The faulted firmware is gone with everything it held: AWDL may start again on the new one (1.1.73). */
     if (sc->sc_awdl_probe.tx.fault_tripped && sc->sc_awdl_probe.tx.tripped) {
@@ -17019,15 +17041,20 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data,
                 if (iwx_rx_packet_payload_len(pkt) < sizeof(*notif) || !r->pending ||
                     le32toh(notif->activity) != r->activity)
                     break;
+                uint64_t now = 0;
+                absolutetime_to_nanoseconds(mach_absolute_time(), &now);
                 if (!le32toh(notif->success)) {
                     ++r->failed;
                     r->pending = r->active = 0;
+                    r->started_us = 0;
                 } else if (le32toh(notif->started)) {
                     ++r->started;
                     r->active = 1;
+                    iwx_awdl_roc_note_start(r, now / 1000);
                 } else {
                     ++r->ended;
                     r->pending = r->active = 0;
+                    iwx_awdl_roc_note_end(r, now / 1000);
                 }
                 break;
             }

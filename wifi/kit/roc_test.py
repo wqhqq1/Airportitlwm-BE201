@@ -1,4 +1,4 @@
-"""1.1.75 and later (1.1.90: also the last PHY command's channel and width; 1.1.89: baseline, mode 1 with P2P_TXRX, the AWDL link moved to 149 with ROC off, then mode 4 on that
+"""1.1.75 and later (1.1.91: why AUX frames fail and ROC timing; 1.1.90: also the last PHY command's channel and width; 1.1.89: baseline, mode 1 with P2P_TXRX, the AWDL link moved to 149 with ROC off, then mode 4 on that
 link for 90 s; the first firmware error switches everything off at once): remain-on-channel (ROC) test beside a router link, phase by phase. The firmware gets an ROC for each run of
 the AWDL sequence's other 5 GHz channel, through an AUX station, as Intel's Linux driver sends off-channel frames.
 Results are saved after every phase, and each phase asks whether the phone sees this Mac and the transfer moves.
@@ -7,9 +7,9 @@ import datetime, re, signal, subprocess, sys, threading, time
 from pathlib import Path
 ROC = 'debug.be201_awdl_roc'
 PHY2 = 'debug.be201_awdl_phy2'
-KEYS = ['RocMode', 'RocQid', 'RocSetups', 'RocSetupErr', 'RocSetupStage', 'RocTeardowns', 'RocAdds', 'RocAddErr', 'RocStarted', 'RocEnded', 'RocFailed', 'RocStale', 'RocRemoves', 'RocChan', 'RocTxSent', 'RocTxOk', 'RocTxFail', 'RocTxDrop', 'RocRxDuring', 'RocDiscovery', 'RocRxAny', 'RocRxAnyChan', 'RocRxAwdlAny', 'RxPhy2', 'RxHome', 'Phy2Chan', 'RocPhyHolds', 'RocPhyCancels', 'Phy2Switches', 'Phy2Err', 'FaultRoc', 'FaultPhy2',
+KEYS = ['RocMode', 'RocQid', 'RocSetups', 'RocSetupErr', 'RocSetupStage', 'RocTeardowns', 'RocAdds', 'RocAddErr', 'RocStarted', 'RocEnded', 'RocFailed', 'RocStale', 'RocRemoves', 'RocChan', 'RocTxSent', 'RocTxOk', 'RocTxFail', 'RocTxDrop', 'RocRxDuring', 'RocDiscovery', 'RocRxAny', 'RocRxAnyChan', 'RocRxAwdlAny', 'RxPhy2', 'RxHome', 'Phy2Chan', 'RocPhyHolds', 'RocPhyCancels', 'Phy2Switches', 'Phy2Err', 'FaultRoc', 'FaultPhy2', 'RocLateMaxUs', 'RocTxOkUcast', 'RocTxFailUcast', 'RocTxOkMcast', 'RocTxFailMcast', 'RocTxFailIn', 'RocTxFailOut', 'RocTxOkHere', 'RocTxOkAway', 'RocTxFailHere', 'RocTxFailAway', 'RocTxFailUnknown', 'RocTxFailTries', 'RocTxOkTries', 'RocLateN', 'RocLateSumMs', 'RocOnN', 'RocOnSumMs',
         'SeqChan5', 'OwnSent', 'OwnOk', 'OwnFail', 'OwnRecovers', 'TxTripped', 'DataTx', 'DataRx', 'FirmwareFaults', 'FaultRearms']
-COUNTERS = ['RocSetups', 'RocTeardowns', 'RocAdds', 'RocAddErr', 'RocStarted', 'RocEnded', 'RocFailed', 'RocStale', 'RocRemoves', 'RocTxSent', 'RocTxOk', 'RocTxFail', 'RocTxDrop', 'RocRxDuring', 'RocDiscovery', 'RocRxAny', 'RocRxAnyChan', 'RocRxAwdlAny', 'RxPhy2', 'RxHome', 'RocPhyHolds', 'RocPhyCancels', 'Phy2Switches', 'OwnSent', 'OwnOk', 'OwnFail', 'OwnRecovers', 'DataTx', 'DataRx']
+COUNTERS = ['RocSetups', 'RocTeardowns', 'RocAdds', 'RocAddErr', 'RocStarted', 'RocEnded', 'RocFailed', 'RocStale', 'RocRemoves', 'RocTxSent', 'RocTxOk', 'RocTxFail', 'RocTxDrop', 'RocRxDuring', 'RocDiscovery', 'RocRxAny', 'RocRxAnyChan', 'RocRxAwdlAny', 'RxPhy2', 'RxHome', 'RocPhyHolds', 'RocPhyCancels', 'Phy2Switches', 'RocTxOkUcast', 'RocTxFailUcast', 'RocTxOkMcast', 'RocTxFailMcast', 'RocTxFailIn', 'RocTxFailOut', 'RocTxOkHere', 'RocTxOkAway', 'RocTxFailHere', 'RocTxFailAway', 'RocTxFailUnknown', 'RocTxFailTries', 'RocTxOkTries', 'RocLateN', 'RocLateSumMs', 'RocOnN', 'RocOnSumMs', 'OwnSent', 'OwnOk', 'OwnFail', 'OwnRecovers', 'DataTx', 'DataRx']
 def run(*a, timeout=60):
     return subprocess.run(a, capture_output=True, text=True, timeout=timeout)
 
@@ -21,6 +21,9 @@ def props(text=None):
     out = {k: int(m[1]) for k in KEYS if (m := re.search(rf'"ItlwmAwdl{k}" = (\d+)', text))}
     m = re.search(r'"ItlwmFwErrors" = (\d+)', text)
     out['FwErrors'] = int(m[1]) if m else 0
+    # 1.1.91: AUX failures by status: short limit, long limit, drain, lifetime, dest PS, FIFO flushed, aborted, other.
+    m = re.search(r'"ItlwmAwdlRocTxStatus" = <([0-9a-f]{64})>', text)
+    out['TxStatus'] = [int.from_bytes(bytes.fromhex(m[1])[4 * i:4 * i + 4], 'little') for i in range(8)] if m else [0] * 8
     for k in ['ItlwmFwErrorId', 'ItlwmFwErrorCmd', 'ItlwmFwErrorData1']:
         m = re.search(rf'"{k}" = (\d+)', text)
         out[k] = int(m[1]) if m else None
@@ -112,6 +115,9 @@ def phase(name, seconds, lines):
     rate = (b1 - b0) / seconds / 1e6
     d = {k: z.get(k, 0) - a.get(k, 0) for k in COUNTERS}
     d = {k: v for k, v in d.items() if v}
+    st = [y - x for x, y in zip(a.get('TxStatus', [0] * 8), z.get('TxStatus', [0] * 8))]
+    late = d.get('RocLateSumMs', 0) / d['RocLateN'] if d.get('RocLateN') else None
+    on = d.get('RocOnSumMs', 0) / d['RocOnN'] if d.get('RocOnN') else None
     line = (f"{name}: 隔空投送 {rate:.2f} MB/s；{family_peers(seconds + 5)}；路由器 {summary(res.get('gw', '')) if gw else '没有网关'}；"
             f"手机 {summary(res.get('peer', '')) if peer else '没有对端'}（awdl0 对端 {len(found)} 个）；时间表 {own_sequence(text)}；"
             f"ROC 模式 {z.get('RocMode')} 队列 {z.get('RocQid')} 建立错误 {z.get('RocSetupErr')}@{z.get('RocSetupStage')} 信道 {z.get('RocChan')}；变化 {d}；"
@@ -120,6 +126,8 @@ def phase(name, seconds, lines):
             f"路由器数据队列 {z.get('ItlwmMldDataQueues')} 聚合队列错误 {z.get('ItlwmAwdlOwnErr')}；"
             f"AP 端口标志 {z.get('ItlwmApPortValid')} 加密网络 {z.get('ItlwmApRsnOn')}；"
             f"链路信道 {z.get('Phy2Chan')} 换信道错误 {z.get('Phy2Err')}；"
+            f"失败原因 重试上限 {st[0]}+{st[1]} 排空 {st[2]} 超时 {st[3]} 对方省电 {st[4]} 清队列 {st[5]} 中止 {st[6]} 其他 {st[7]}；"
+            f"ROC 平均晚开始 {f'{late:.1f}' if late is not None else '?'} ms 最晚 {(z.get('RocLateMaxUs') or 0) / 1000:.1f} ms 平均驻留 {f'{on:.1f}' if on is not None else '?'} ms；"
             f"最后一条 PHY 命令 信道 {z.get('ItlwmPhyChannel')} 宽度 {z.get('ItlwmPhyWidth')} 位置 {z.get('ItlwmPhyCtrlPos')}；出错停用 {z.get('ItlwmAwdlPhy2FaultHolds')}")
     if fault_at is not None or z.get('FwErrors', 0) > FW0[0]:
         line += (f"；固件报错 第 {fault_at} 秒 错误 0x{(z.get('ItlwmFwErrorId') or 0):08X} 命令 0x{(z.get('ItlwmFwErrorCmd') or 0):06X} "
