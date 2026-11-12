@@ -23,7 +23,7 @@
 
 | 驱动 | 版本 | 来源 |
 |---|---|---|
-| `AirportItlwm.kext` | 1.1.89 | `outputs/BE201-WiFi/` |
+| `AirportItlwm.kext` | 1.1.90 | `outputs/BE201-WiFi/` |
 | `BlueToolFixup.kext` | 2.7.12 | `outputs/BE201-WiFi/`，或 `build/bluetooth/bluetoolfixup/` |
 | `IntelBTPatcher.kext` | 2.5.10 | `outputs/BE201-WiFi/`，或 `build/bluetooth/intelbtpatcher/` |
 | `BE201BluetoothFirmware.kext` | 2.5.3 | `build/bluetooth/firmware/` |
