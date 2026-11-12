@@ -1,4 +1,4 @@
 {
-  "version": "1.1.89",
-  "comment": "ROC test: no ROC during a link PHY move; fault snapshot; ROC tool moves the link before mode 4. Defaults as 1.1.88; ROC off"
+  "version": "1.1.90",
+  "comment": "ROC test: second PHY context 20 MHz (no AP width off its channel); a fault during a link move holds it. Defaults as 1.1.88; ROC off"
 }

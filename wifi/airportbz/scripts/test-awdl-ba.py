@@ -245,7 +245,11 @@ int main(){
   /* 1.1.89 fault snapshots */
   struct iwx_awdl_roc f={}; assert(iwx_awdl_fault_roc(&f)==0);
   f.pending=1;f.active=1;f.sta_added=1;f.activity=2;f.mode=4;f.chan=149; assert(iwx_awdl_fault_roc(&f)==(7u|0x20u|0x400u|(149u<<16)));
-  assert(iwx_awdl_fault_phy2(1,149,0)==(1u|(149u<<8))&&iwx_awdl_fault_phy2(0,0,149)==(149u<<16)&&iwx_awdl_fault_phy2(0,0,0)==0);}
+  assert(iwx_awdl_fault_phy2(1,149,0)==(1u|(149u<<8))&&iwx_awdl_fault_phy2(0,0,149)==(149u<<16)&&iwx_awdl_fault_phy2(0,0,0)==0);
+  /* 1.1.90 fault hold */
+  uint8_t hold=0; assert(iwx_awdl_phy2_after_fault(&hold,1)==1&&!hold);
+  hold=1; assert(iwx_awdl_phy2_after_fault(&hold,1)==0&&hold&&iwx_awdl_phy2_after_fault(&hold,149)==0);
+  assert(iwx_awdl_phy2_after_fault(&hold,0)==0&&!hold&&iwx_awdl_phy2_after_fault(&hold,1)==1);}
  puts("awdl block ack checks passed");return 0;}
 '''
 with tempfile.TemporaryDirectory() as d:
@@ -508,6 +512,19 @@ ne=cpp[cpp.index('iwx_nic_error(struct iwx_softc *sc)\n{'):]; ne=ne[:ne.index('\
 assert ne.index('iwx_awdl_fault_roc(&sc->sc_awdl_probe.roc)') < ne.index('++sc->sc_fw_errors;') and 'setProperty("ItlwmAwdlFaultRoc"' in ne and 'setProperty("ItlwmAwdlFaultPhy2"' in ne
 for k in ['ItlwmAwdlRocPhyHolds','ItlwmAwdlRocPhyCancels']:
     assert f'setProperty("{k}"' in cpp, k
+# 1.1.90: a second PHY context is 20 MHz; only the AP's own channel takes the AP's width and control position.
+gw=cpp[cpp.index('iwx_get_channel_width(struct ieee80211com *ic, struct ieee80211_channel *c)\n{'):]; gw=gw[:gw.index('\n}\n')]
+assert gw.index('ic->ic_state < IEEE80211_S_ASSOC') < gw.index('!iwx_phy_takes_ap_width(ieee80211_chan2ieee(ic, c), ieee80211_chan2ieee(ic, ic->ic_bss->ni_chan))') < gw.index('switch (ic->ic_bss->ni_chw)'), 'width from the AP only on its channel'
+assert 'static inline bool iwx_phy_takes_ap_width(int chan, int ap_chan)\n{\n    return chan == ap_chan;\n}' in cpp
+cp=cpp[cpp.index('iwx_get_ctrl_pos(struct ieee80211com *ic, struct ieee80211_channel *c)\n{'):]; cp=cp[:cp.index('\n}\n')]
+assert 'iwx_get_channel_width(ic, c) == IWX_PHY_VHT_CHANNEL_MODE20' in cp.split('\n')[2], 'ctrl pos follows the width rule'
+for f in ['iwx_phy_ctxt_cmd_v3(', 'iwx_phy_ctxt_cmd_uhb(']:
+    b=cpp[cpp.index(f):]; b=b[:b.index('\n}\n')]
+    assert 'cmd.ci.width = iwx_get_channel_width(ic, chan);' in b and 'cmd.ci.ctrl_pos = iwx_get_ctrl_pos(ic, chan);' in b, f
+ra=cpp[cpp.index('void ItlIwx::setAwdlRadioTest('):]; ra=ra[:ra.index('if (phy2 == 1) {')]
+assert ra.index('if (c->solo) {') < ra.index('phy2 = iwx_awdl_phy2_after_fault(&c->phy2_fault_hold, phy2);'), 'the hold applies before any move'
+assert ne.index('if (sc->sc_awdl_probe.ctx.phy2_moving) {\n        sc->sc_awdl_probe.ctx.phy2_fault_hold = 1;') < ne.index('++sc->sc_fw_errors;')
+assert 'phy2_fault_hold' not in cpp[cpp.index('sc->sc_awdl_probe.ctx.phy2_chan = sc->sc_awdl_probe.ctx.phy2_want = 0;'):][:300], 'a restart keeps the hold'
 # The ROC tool: the link moves with ROC off before mode 4, and the first new firmware error switches both off.
 tool=(ROOT.parent/'kit/roc_test.py').read_text()
 m4=tool.index("setv(ROC, 4 + 16 * activity)")

@@ -258,6 +258,9 @@ struct iwx_awdl_ctx {
     uint8_t te_want, link_no_phy;
     /* A move of link 1 between PHY contexts is queued or running: no ROC starts meanwhile (1.1.89). */
     uint8_t phy2_moving;
+    /* 1.1.90: a firmware fault came during a move; the second channel stays off until the switch reads 0. */
+    uint8_t phy2_fault_hold;
+    uint32_t phy2_fault_holds;
     uint32_t te_removed, own_released;
     /* The own queue follows where data goes; with aggregation it is a TID 0 queue the firmware aggregates. */
     uint8_t own_tid, own_agg_want, own_agg;
@@ -333,6 +336,13 @@ static inline uint32_t iwx_awdl_fault_roc(const struct iwx_awdl_roc *r)
 {
     return (r->pending ? 1u : 0u) | (r->active ? 2u : 0u) | (r->sta_added ? 4u : 0u) |
            (r->activity & 15u) << 4 | (r->mode & 15u) << 8 | uint32_t(r->chan) << 16;
+}
+/* 1.1.90: the switch as the tick uses it. A hold set by a fault during a move gives 0 until the switch reads 0. */
+static inline uint32_t iwx_awdl_phy2_after_fault(uint8_t *hold, uint32_t phy2)
+{
+    if (!phy2)
+        *hold = 0;
+    return *hold ? 0u : phy2;
 }
 /* Link 1: bit 0 a move queued or running, bits 8-15 the wanted channel, 16-23 the channel it is on (0 the AP's). */
 static inline uint32_t iwx_awdl_fault_phy2(uint8_t moving, uint32_t want, uint32_t chan)

@@ -5367,6 +5367,8 @@ void ItlIwx::setAwdlRadioTest(bool hold, uint32_t phy2, uint32_t te, bool amsdu)
         p->tx.amsdu = amsdu;
         return;
     }
+    /* A fault during a move holds the second channel until the switch is turned off (1.1.90). */
+    phy2 = iwx_awdl_phy2_after_fault(&c->phy2_fault_hold, phy2);
     if (now_us >= c->te_end_us && conf < IWX_SESSION_PROTECT_CONF_MAX_ID)
         c->te_conf = uint8_t(conf);
     /*
@@ -9708,6 +9710,12 @@ iwx_binding_cmd(struct iwx_softc *sc, struct iwx_node *in, uint32_t action)
     return err;
 }
 
+/* A PHY context takes the AP's width and control position only on the AP's own channel (1.1.90). */
+static inline bool iwx_phy_takes_ap_width(int chan, int ap_chan)
+{
+    return chan == ap_chan;
+}
+
 static uint8_t
 iwx_get_channel_width(struct ieee80211com *ic, struct ieee80211_channel *c)
 {
@@ -9715,6 +9723,15 @@ iwx_get_channel_width(struct ieee80211com *ic, struct ieee80211_channel *c)
     if (ic->ic_bss == NULL || ic->ic_state < IEEE80211_S_ASSOC) {
         return ret;
     }
+    /*
+     * The AP's width and control position describe the AP's channel only (1.1.90). A second PHY context on another
+     * channel took them too: link 1 on 149 beside an 80 MHz AP on 153 went out as 80 MHz with the control channel
+     * 1 below the centre, a block centred on 151 that does not exist, and the firmware asserted (0x200008FE, data
+     * 145 = that block's lowest channel) at PHY_CONTEXT_CMD, 2026-11-12 07:47 and 08:27, ROC off the second time.
+     * Without an AP (solo) the same context was 20 MHz and worked.
+     */
+    if (c != NULL && !iwx_phy_takes_ap_width(ieee80211_chan2ieee(ic, c), ieee80211_chan2ieee(ic, ic->ic_bss->ni_chan)))
+        return ret;
     switch (ic->ic_bss->ni_chw) {
         case IEEE80211_CHAN_WIDTH_20_NOHT:
         case IEEE80211_CHAN_WIDTH_20:
@@ -16529,6 +16546,15 @@ iwx_nic_error(struct iwx_softc *sc)
     sc->sc_awdl_probe.tx.fault_phy2 = iwx_awdl_fault_phy2(sc->sc_awdl_probe.ctx.phy2_moving,
         sc->sc_awdl_probe.ctx.phy2_want, sc->sc_awdl_probe.ctx.phy2_chan);
     sc->sc_pcitag->setProperty("ItlwmAwdlFaultRoc", sc->sc_awdl_probe.tx.fault_roc, 32);
+    /*
+     * 08:27: the restart re-armed AWDL and moved the link again into the same assert before the ROC tool's next poll.
+     * A fault during a move now keeps the link off the second channel until the switch is set to 0 (1.1.90).
+     */
+    if (sc->sc_awdl_probe.ctx.phy2_moving) {
+        sc->sc_awdl_probe.ctx.phy2_fault_hold = 1;
+        ++sc->sc_awdl_probe.ctx.phy2_fault_holds;
+        sc->sc_pcitag->setProperty("ItlwmAwdlPhy2FaultHolds", sc->sc_awdl_probe.ctx.phy2_fault_holds, 32);
+    }
     sc->sc_pcitag->setProperty("ItlwmAwdlFaultPhy2", sc->sc_awdl_probe.tx.fault_phy2, 32);
 #endif
     ++sc->sc_fw_errors;

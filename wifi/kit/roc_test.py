@@ -1,4 +1,4 @@
-"""1.1.75 and later (1.1.89: baseline, mode 1 with P2P_TXRX, the AWDL link moved to 149 with ROC off, then mode 4 on that
+"""1.1.75 and later (1.1.90: also the last PHY command's channel and width; 1.1.89: baseline, mode 1 with P2P_TXRX, the AWDL link moved to 149 with ROC off, then mode 4 on that
 link for 90 s; the first firmware error switches everything off at once): remain-on-channel (ROC) test beside a router link, phase by phase. The firmware gets an ROC for each run of
 the AWDL sequence's other 5 GHz channel, through an AUX station, as Intel's Linux driver sends off-channel frames.
 Results are saved after every phase, and each phase asks whether the phone sees this Mac and the transfer moves.
@@ -25,7 +25,7 @@ def props(text=None):
         m = re.search(rf'"{k}" = (\d+)', text)
         out[k] = int(m[1]) if m else None
     # 1.1.82: which readiness condition an ROC still waits for, and the DMA pool (the 1.1.81 leak ended in ENOMEM).
-    for k in ['ItlwmAwdlRocBlocked', 'ItlwmDmaUsedKiB', 'ItlwmDmaFailures', 'ItlwmDmaRetiredKiB', 'ItlwmMldDataQueues', 'ItlwmAwdlOwnErr', 'ItlwmApPortValid', 'ItlwmApRsnOn']:
+    for k in ['ItlwmPhyChannel', 'ItlwmPhyWidth', 'ItlwmPhyCtrlPos', 'ItlwmAwdlPhy2FaultHolds', 'ItlwmAwdlRocBlocked', 'ItlwmDmaUsedKiB', 'ItlwmDmaFailures', 'ItlwmDmaRetiredKiB', 'ItlwmMldDataQueues', 'ItlwmAwdlOwnErr', 'ItlwmApPortValid', 'ItlwmApRsnOn']:
         m = re.search(rf'"{k}" = (\d+)', text)
         out[k] = int(m[1]) if m else None
     return out
@@ -119,7 +119,8 @@ def phase(name, seconds, lines):
             f"DMA 已用 {z.get('ItlwmDmaUsedKiB')} KiB 失败 {z.get('ItlwmDmaFailures')} 搁置 {z.get('ItlwmDmaRetiredKiB')} KiB；"
             f"路由器数据队列 {z.get('ItlwmMldDataQueues')} 聚合队列错误 {z.get('ItlwmAwdlOwnErr')}；"
             f"AP 端口标志 {z.get('ItlwmApPortValid')} 加密网络 {z.get('ItlwmApRsnOn')}；"
-            f"链路信道 {z.get('Phy2Chan')} 换信道错误 {z.get('Phy2Err')}")
+            f"链路信道 {z.get('Phy2Chan')} 换信道错误 {z.get('Phy2Err')}；"
+            f"最后一条 PHY 命令 信道 {z.get('ItlwmPhyChannel')} 宽度 {z.get('ItlwmPhyWidth')} 位置 {z.get('ItlwmPhyCtrlPos')}；出错停用 {z.get('ItlwmAwdlPhy2FaultHolds')}")
     if fault_at is not None or z.get('FwErrors', 0) > FW0[0]:
         line += (f"；固件报错 第 {fault_at} 秒 错误 0x{(z.get('ItlwmFwErrorId') or 0):08X} 命令 0x{(z.get('ItlwmFwErrorCmd') or 0):06X} "
                  f"数据 {z.get('ItlwmFwErrorData1')} 当时 ROC 0x{(z.get('FaultRoc') or 0):06X} 链路 0x{(z.get('FaultPhy2') or 0):06X}")
