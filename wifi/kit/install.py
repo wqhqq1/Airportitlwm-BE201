@@ -22,7 +22,8 @@ GUID = '7C436110-AB2A-4BBB-A880-FE41995C9F82'
 KIT = json.loads((HERE/'kit.json').read_text())
 VER = KIT['version']
 # The verified build. Any macOS 15.2 or later Sequoia installs; AWDL is on by default only on this build.
-VERIFIED_BUILD = '24G824'
+# Builds whose IO80211Family layouts AWDL was checked against (ItlAwdlLayoutVerified in the driver).
+VERIFIED_BUILDS = ('24G824', '24H241')
 # Boot arguments that 1.1.88 / 2.7.12 / 2.5.10 no longer need: the drivers behave as if they were set.
 DEFAULT_ARGS = ['-btlfxa2dpcheck', '-be201identity', '-be201leadv', '-be201addrpause', '-be201lebaseline',
                 '-be201nativeaddr', '-be201btprobe', '-be201rparoute',
@@ -230,7 +231,7 @@ def main():
         f.chmod(0o600)
         validation[name] = validate(f)
     validate(cfg)
-    note = '' if build == VERIFIED_BUILD else f' AWDL stays off by default on {build} (verified on {VERIFIED_BUILD}).'
+    note = '' if build in VERIFIED_BUILDS else f" AWDL stays off by default on {build} (verified on {', '.join(VERIFIED_BUILDS)})."
     watch_note = '' if watch_state() else ' Apple Watch unlock needs: python3 install.py --watch-unlock (as your user).'
     if mode == '--check':
         print(f"PASS: macOS {product} ({build}); signed {', '.join(p['name']+' '+p['d']['version'] for p in plan)}; "

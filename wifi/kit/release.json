@@ -1,4 +1,4 @@
 {
-  "version": "1.1.92",
-  "comment": "ROC test mode 4: unicast AWDL frames wait in the host until an ROC runs with time left. Defaults as 1.1.88; ROC off"
+  "version": "1.1.93",
+  "comment": "AWDL on by default on 24H241 (macOS 15.8.3) too, its IO80211Family layouts checked equal to 24G824; ROC test mode 4 host hold as 1.1.92; ROC off"
 }

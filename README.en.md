@@ -2,7 +2,7 @@
 
 # BE201 Hackintosh wireless drivers: Wi-Fi and Bluetooth
 
-Drivers for the Intel BE201 (Wi-Fi PCI 8086:7740, Bluetooth USB 8087:0037) on macOS Sequoia: 15.2 or later, verified on 15.7.8 (24G824).
+Drivers for the Intel BE201 (Wi-Fi PCI 8086:7740, Bluetooth USB 8087:0037) on macOS Sequoia: 15.2 or later, verified on 15.7.8 (24G824) and 15.8.3 (24H241).
 
 - **Wi-Fi:** the goal is native AWDL and Continuity (AirDrop, Universal Control, Handoff and so on). The scope ends at ax/80 MHz: no be, 160 MHz, 6 GHz or MLO.
 - **Bluetooth:** firmware loading and BE201 patches in BlueToolFixup and IntelBTPatcher, including the Apple Music fix and recent-address routing.
@@ -46,7 +46,7 @@ All results below were measured on this machine: macOS 15.7.8 24G824, Wi-Fi driv
 | Ranging for Apple Watch unlock | The driver has no FTM ranging, so ranging can only be skipped |
 | iPhone Mirroring | Fails in sharingd's authentication step. Most likely because there is no T2 chip, not Wi-Fi, but that is not proven |
 | Sequoia 15.0, 15.1 and older systems | The Wi-Fi driver needs the IO80211 interface introduced in 15.2 |
-| AWDL and the Bluetooth patches on Sequoia builds other than 24G824 | AWDL relies on private layouts read from 24G824, so it is off by default; it can be forced on, untested. The Bluetooth patches find no matching code there and do nothing, while Bluetooth itself still works |
+| AWDL on Sequoia builds other than 24G824 and 24H241; the Bluetooth patches on builds other than 24G824 | AWDL relies on private layouts read from 24G824. 24H241 was checked and matches; on other builds AWDL is off by default and can be forced on, untested. The Bluetooth patches find no matching code on other builds and do nothing, while Bluetooth itself still works; on 24H241 only the device-name patch matches |
 
 ## Layout
 

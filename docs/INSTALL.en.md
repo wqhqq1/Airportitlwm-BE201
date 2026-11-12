@@ -8,8 +8,13 @@ How to add the BE201 Wi-Fi and Bluetooth drivers to an OpenCore EFI, with the in
 
 - **System:** macOS Sequoia 15.2 or later, x86_64.
   - The Wi-Fi driver refuses Darwin below 24.2: 15.0 and 15.1 have a different IO80211 interface.
-  - **AWDL (AirDrop, Universal Control and so on):** on by default only on 15.7.8 (24G824). AWDL uses private IO80211Family layouts that were read from that build. On any other build, AWDL is off by default. You can force it with `be201_awdl_vif=1 be201_awdl_auto=1`, at your own risk.
+  - **AWDL (AirDrop, Universal Control and so on):** on by default on 15.7.8 (24G824) and 15.8.3 (24H241).
+    - AWDL uses private IO80211Family layouts that were read from 24G824.
+    - 24H241 was checked against them function by function, along with every vtable and object size, and matches.
+    - On any other build, AWDL is off by default. You can force it with `be201_awdl_vif=1 be201_awdl_auto=1`, at your own risk.
+    - After a system update, `research/awdl/abi-diff/run.sh` repeats the check.
   - **Bluetooth patches:** they match the exact code of 24G824's Bluetooth daemon. On other builds they find no match and change nothing, and Bluetooth itself still works.
+    - On 24H241 only the device-name patch still matches. The A2DP clock fix, the LE patches and the recent-address routing do not, so they are inactive.
 - **Hardware:**
   - Wi-Fi: Intel BE201, PCI `8086:7740`.
   - Bluetooth: Intel BE201, USB `8087:0037`.
@@ -23,7 +28,7 @@ Built drivers are not kept in the repository. Build them as the [README](../READ
 
 | Driver | Version | Where |
 |---|---|---|
-| `AirportItlwm.kext` | 1.1.92 | `outputs/BE201-WiFi/` |
+| `AirportItlwm.kext` | 1.1.93 | `outputs/BE201-WiFi/` |
 | `BlueToolFixup.kext` | 2.7.12 | `outputs/BE201-WiFi/` or `build/bluetooth/bluetoolfixup/` |
 | `IntelBTPatcher.kext` | 2.5.10 | `outputs/BE201-WiFi/` or `build/bluetooth/intelbtpatcher/` |
 | `BE201BluetoothFirmware.kext` | 2.5.3 | `build/bluetooth/firmware/` |
@@ -186,7 +191,7 @@ kmutil showloaded --list-only | grep -E 'AirportItlwm|BlueToolFixup|IntelBTPatch
 
 - All five drivers should be loaded, at the versions above.
 - System Information → Bluetooth shows the chip as Intel BE201.
-- On 24G824, `ifconfig awdl0` shows the AWDL interface.
+- On 24G824 and 24H241, `ifconfig awdl0` shows the AWDL interface.
 - `ioreg -l | grep ItlwmAwdlLayoutVerified` shows `Yes` when the running kernel is the verified one, which is why AWDL is on by default.
 
 If the Wi-Fi driver did not load, read the newest `opencore-*.txt` on the EFI root first. A RELEASE OpenCore writes no log: switch to the DEBUG build for a while and set `Misc/Debug/Target` to `67`.

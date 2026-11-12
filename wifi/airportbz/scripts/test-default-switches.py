@@ -45,6 +45,12 @@ int main() {
     args["be201_awdl_vif"] = 1; args["be201_awdl_auto"] = 1;
     assert(ItlAwdlFlag("be201_awdl_vif") && ItlAwdlFlag("be201_awdl_auto"));
     version = "root:xnu-11417.140.69.711.4"; args.clear(); assert(!ItlAwdlLayoutVerified());
+    /* 1.1.93: 24H241 (macOS 15.8.3) is verified too */
+    version = "Darwin Kernel Version 24.6.0: Sun Oct 11 23:36:58 PDT 2026; root:xnu-11417.140.69.713.47~2/RELEASE_X86_64";
+    assert(ItlAwdlLayoutVerified() && ItlAwdlFlag("be201_awdl_vif") && ItlAwdlFlag("be201_awdl_auto"));
+    args["be201_awdl_vif"] = 0; assert(!ItlAwdlFlag("be201_awdl_vif") && ItlAwdlFlag("be201_awdl_auto")); args.clear();
+    version = "root:xnu-11417.140.69.713.47~3/RELEASE_X86_64"; assert(!ItlAwdlLayoutVerified());
+    version = "root:xnu-11417.140.69.713.4"; assert(!ItlAwdlLayoutVerified());
     puts("helpers ok");
 }
 '''
@@ -116,5 +122,5 @@ with tempfile.TemporaryDirectory() as td:
     (p/'b.cpp').write_text(bt_test)
     subprocess.run(['clang++', '-std=c++17', '-O1', str(p/'b.cpp'), '-o', str(p/'b')], check=True)
     subprocess.run([str(p/'b')], check=True)
-print('PASS: default-on Wi-Fi switches (=0 off; AWDL default only on the verified 24G824 kernel), ROC/phy2/llw0 stay off, '
+print('PASS: default-on Wi-Fi switches (=0 off; AWDL default only on verified kernels (24G824, 24H241)), ROC/phy2/llw0 stay off, '
       'Bluetooth switches default on with -be201btstock, experimental Bluetooth switches still opt-in.')

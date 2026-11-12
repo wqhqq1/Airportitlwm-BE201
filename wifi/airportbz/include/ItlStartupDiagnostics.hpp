@@ -14,19 +14,30 @@ inline bool ItlDiagnosticFlag(const char *name)
 }
 
 /*
- * The kernel this driver's AWDL code was verified against: macOS 15.7.8 (24G824). The AWDL path uses private
- * IO80211Family layouts (ivars, vtable slots, event numbers) read from that build, so on any other kernel it stays
- * off unless the boot arguments ask for it.
+ * The kernels this driver's AWDL code was verified against. The AWDL path uses private IO80211Family layouts (ivars,
+ * vtable slots, object sizes, event numbers) read from 24G824, so on any other kernel it stays off unless the boot
+ * arguments ask for it.
+ * - macOS 15.7.8 (24G824): where the layouts were read.
+ * - macOS 15.8.3 (24H241), 1.1.93: IO80211Family has a new UUID, but against 24G824 all 418 vtables and all 166
+ *   static initializers (object sizes) are equal; of 14706 functions, 333 differ only in source line numbers passed to
+ *   logging and the others are NAN, allocation-site tags and three AWDL bound checks (reportDataPathEvents,
+ *   IO80211AWDLPeer::updateAwdlChanSeq, tlvCheckBounds) with the same member offsets. IOSkywalkFamily,
+ *   IONetworkingFamily and corecapture keep their UUIDs; all 1116 imports resolve (research/awdl/abi-diff).
  */
 inline bool ItlAwdlLayoutVerified()
 {
-    static const char want[] = "xnu-11417.140.69.711.44~1/RELEASE_X86_64";
-    for (const char *p = version; *p; p++) {
-        size_t i = 0;
-        while (want[i] && p[i] == want[i])
-            i++;
-        if (!want[i])
-            return true;
+    static const char *const verified[] = {
+        "xnu-11417.140.69.711.44~1/RELEASE_X86_64", /* 24G824 */
+        "xnu-11417.140.69.713.47~2/RELEASE_X86_64", /* 24H241 */
+    };
+    for (const char *want : verified) {
+        for (const char *p = version; *p; p++) {
+            size_t i = 0;
+            while (want[i] && p[i] == want[i])
+                i++;
+            if (!want[i])
+                return true;
+        }
     }
     return false;
 }
@@ -40,7 +51,7 @@ inline bool ItlDefaultOnFlag(const char *name, bool fallback = true)
     return fallback;
 }
 
-// be201_awdl_vif and be201_awdl_auto: on by default on the verified kernel; elsewhere only with =1.
+// be201_awdl_vif and be201_awdl_auto: on by default on a verified kernel; elsewhere only with =1.
 inline bool ItlAwdlFlag(const char *name)
 {
     return ItlDefaultOnFlag(name, ItlAwdlLayoutVerified());

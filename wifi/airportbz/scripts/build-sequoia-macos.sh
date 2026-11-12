@@ -4,7 +4,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SDK=${MAC_KERNEL_SDK:?Set MAC_KERNEL_SDK to the MacKernelSDK directory}
 TOOLCHAIN=${DARWIN_TOOLCHAIN:-/Library/Developer/CommandLineTools/usr/bin}
 OUT=${BUILD_OUTPUT:-$ROOT/build}
-VERSION=${BE201_BUILD_VERSION:-1.1.92}
+VERSION=${BE201_BUILD_VERSION:-1.1.93}
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 2
 /bin/sh "$ROOT/scripts/prepare-mackernelsdk.sh" "$SDK"
 mkdir -p "$OUT/objects"

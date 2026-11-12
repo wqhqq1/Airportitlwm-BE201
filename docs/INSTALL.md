@@ -8,8 +8,13 @@
 
 - **系统：** macOS Sequoia 15.2 及以后的版本，x86_64。
   - Wi-Fi 驱动会拒绝在 Darwin 24.2 以下运行：15.0 和 15.1 的 IO80211 接口不一样。
-  - **AWDL（隔空投送、通用控制等）：** 只在 15.7.8（24G824）上默认开启。AWDL 用到了 IO80211Family 的私有结构，这些结构是从 24G824 读出来的。在其他版本上，AWDL 默认关闭，需要手动加 `be201_awdl_vif=1 be201_awdl_auto=1` 才会打开，风险自负。
-  - **蓝牙补丁：** 按 24G824 里系统蓝牙进程的确切代码匹配。在其他版本上找不到匹配的代码，就什么也不改。蓝牙本身照常工作。
+  - **AWDL（隔空投送、通用控制等）：** 在 15.7.8（24G824）和 15.8.3（24H241）上默认开启。
+    - AWDL 用到了 IO80211Family 的私有结构，这些结构是从 24G824 读出来的。
+    - 24H241 已逐个函数、逐个虚函数表和对象大小核对过，和 24G824 一致。
+    - 在其他版本上，AWDL 默认关闭，需要手动加 `be201_awdl_vif=1 be201_awdl_auto=1` 才会打开，风险自负。
+    - 系统更新后可以用 `research/awdl/abi-diff/run.sh` 重新核对。
+  - **蓝牙补丁：** 按 24G824 里系统蓝牙进程的确切代码匹配。在其他版本上找不到匹配的代码，就什么也不改，蓝牙本身照常工作。
+    - 在 24H241 上，只有设备名补丁还能匹配上。A2DP 时钟修正、LE 补丁和近期地址路由都匹配不上，所以没有生效。
 - **硬件：**
   - Wi-Fi：Intel BE201，PCI `8086:7740`。
   - 蓝牙：Intel BE201，USB `8087:0037`。
@@ -23,7 +28,7 @@
 
 | 驱动 | 版本 | 来源 |
 |---|---|---|
-| `AirportItlwm.kext` | 1.1.92 | `outputs/BE201-WiFi/` |
+| `AirportItlwm.kext` | 1.1.93 | `outputs/BE201-WiFi/` |
 | `BlueToolFixup.kext` | 2.7.12 | `outputs/BE201-WiFi/`，或 `build/bluetooth/bluetoolfixup/` |
 | `IntelBTPatcher.kext` | 2.5.10 | `outputs/BE201-WiFi/`，或 `build/bluetooth/intelbtpatcher/` |
 | `BE201BluetoothFirmware.kext` | 2.5.3 | `build/bluetooth/firmware/` |
@@ -186,7 +191,7 @@ kmutil showloaded --list-only | grep -E 'AirportItlwm|BlueToolFixup|IntelBTPatch
 
 - 应该看到五个驱动都已加载，版本和上表一致。
 - 在“系统信息 → 蓝牙”里，芯片显示为 Intel BE201。
-- 在 24G824 上，`ifconfig awdl0` 能看到 AWDL 接口。
+- 在 24G824 和 24H241 上，`ifconfig awdl0` 能看到 AWDL 接口。
 - `ioreg -l | grep ItlwmAwdlLayoutVerified` 显示 `Yes`，表示当前内核是已验证的版本，所以 AWDL 默认开启。
 
 如果 Wi-Fi 驱动没有加载，先看 EFI 根目录最新的 `opencore-*.txt`。注意：RELEASE 版 OpenCore 不会写这个日志，需要临时换成 DEBUG 版并把 `Misc/Debug/Target` 设为 `67`。
