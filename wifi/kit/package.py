@@ -19,8 +19,8 @@ BTREL = json.loads((BASE/'bluetooth/release.json').read_text())
 BT = ['bluetoolfixup', 'intelbtpatcher']
 VER = REL['version']
 TOOLS = ['audit_entry.py', 'install.py', 'collect.py', 'capture.py', 'conv.py', 'tv3.py', 'view.py', 'tlc_trace.py',
-         'join_trace.py', 'vif_report.py', 'record.py', 'stall_history.py', 'roc_test.py',
-         '卡顿记录.command', '开始ROC实验.command', 'Apple Watch跳过测距.command', '开始抓包.command', '开始记录.command', '采集手机日志.command', '采集重启结果.command',
+         'join_trace.py', 'vif_report.py', 'record.py', 'stall_history.py', 'roc_test.py', 'presence_ab.py',
+         '卡顿记录.command', '开始ROC实验.command', '对端可见性对比.command', '完整ROC实验.command', '开启跨信道隔空投送.command', '关闭跨信道隔空投送.command', 'Apple Watch跳过测距.command', '开始抓包.command', '开始记录.command', '采集手机日志.command', '采集重启结果.command',
          '使用与回退.md']
 # Bluetooth and the OpenCore binary stay as they are; the installer checks them too.
 INFO_NOTE = 'AWDL starts by itself with be201_awdl_auto; own queue with aggregation, solo AWDL and UMI on by default; llw0, second channel and ROC are RAM test switches'

@@ -353,6 +353,8 @@ struct iwx_tx_data {
     uint8_t awdl_roc; /* Sent on the remain-on-channel AUX queue (1.1.75 test). */
     uint8_t awdl_phy2q; /* Sent on the AWDL station's queue on link 1 while it sits on the second channel. */
     uint8_t awdl_umi_peer[6];
+    /* 1.1.98: an AUX unicast frame dropped at an ROC's end goes back to the hold: header length, count, and the mark. */
+    uint8_t awdl_hdrlen, awdl_rq, awdl_requeue;
 #endif
 };
 
@@ -714,9 +716,14 @@ struct iwx_softc {
     struct task        awdl_ba_task;
     struct task        awdl_ownq_task;
     struct task        awdl_phy2_task;
+    struct task        awdl_pause_task;
     struct task        awdl_solo_task;
     struct task        awdl_roc_task;
     struct task        awdl_roc_flush_task;
+    struct task        awdl_roc_chain_task;
+    struct task        awdl_roc_peer_task;
+    CTimeout          *awdl_roc_kick_to; /* 1.2.3: the ROC millisecond timer (iwx_awdl_roc_kick) */
+    CTimeout          *awdl_roc_pre_to;  /* 1.2.4: the early ROC before a 149 slot (iwx_awdl_roc_pre) */
     struct task        awdl_umi_task;
     bool sc_awdl_native_requested;
     struct iwx_awdl_probe sc_awdl_probe;

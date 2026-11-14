@@ -11,6 +11,8 @@
 #include <sys/sockio.h>
 #include <net/if.h>
 #include <IOKit/skywalk/IOSkywalkPacketQueue.h>
+
+static bool be201StampRx(IOSkywalkPacket *packet);
 #define super IO80211AWDLProtocol
 OSDefineMetaClassAndStructors(AirportItlwmAWDLInterface, IO80211AWDLProtocol)
 
@@ -342,12 +344,14 @@ UInt32 AirportItlwmAWDLInterface::transmit(IOSkywalkPacket *const *packets, UInt
             size_t lengths[IWX_AWDL_AMSDU_MAX_FRAMES];
             unsigned run = 0;
             size_t bytes = 26;
+            /* 1.2.6: the driver's limit for now, shorter through the ROC AUX station. */
+            const size_t amsduMax = controller->awdlAmsduMaxBytes();
             while (run < IWX_AWDL_AMSDU_MAX_FRAMES && taken + run < count) {
                 IOSkywalkPacket *next = packets[taken + run];
                 const size_t length = be201PacketLength(next);
                 const uint8_t *data = be201PacketBase(next) + be201PacketOffset(next);
                 bytes = ((bytes - 26 + 3) & ~size_t(3)) + 26 + 16 + length;
-                if (length < 14 || length > 1514 || bytes > IWX_AWDL_AMSDU_MAX_BYTES || memcmp(data, eth, 6))
+                if (length < 14 || length > 1514 || bytes > amsduMax || bytes > IWX_AWDL_AMSDU_MAX_BYTES || memcmp(data, eth, 6))
                     break;
                 eths[run] = data;
                 lengths[run] = length;
@@ -361,6 +365,7 @@ UInt32 AirportItlwmAWDLInterface::transmit(IOSkywalkPacket *const *packets, UInt
                 }
                 if (grouped == kIOReturnSuccess) {
                     dataTx += run;
+                    ucastTx += run;
                     taken += run - 1;
                     continue;
                 }
@@ -372,9 +377,11 @@ UInt32 AirportItlwmAWDLInterface::transmit(IOSkywalkPacket *const *packets, UInt
             txWaiting = true;
             break;
         }
-        if (sent == kIOReturnSuccess)
+        if (sent == kIOReturnSuccess) {
             ++dataTx;
-        else
+            if (!(eth[0] & 1))
+                ++ucastTx;
+        } else
             ++dataTxDropped;
     }
     if (taken)
@@ -436,6 +443,7 @@ void AirportItlwmAWDLInterface::inputDataFrame(const uint8_t *frame, size_t leng
         setProperty("ItlwmAwdlDataRxDropped", ++dataRxDropped, 32);
         return;
     }
+    ++*(be201StampRx(packet) ? &rxStamped : &rxUnstamped);
     const IOReturn enqueued = be201RxCompEnqueue(queues[3], &packet, 1, 0);
     if (enqueued != kIOReturnSuccess) {
         be201PoolDeallocate(pool, packet);
@@ -443,10 +451,32 @@ void AirportItlwmAWDLInterface::inputDataFrame(const uint8_t *frame, size_t leng
         setProperty("ItlwmAwdlDataRxDropped", ++dataRxDropped, 32);
         return;
     }
+    if (!(rxEthernet[0] & 1))
+        ++ucastRx;
     if (++dataRx <= 64 || !(dataRx & 63)) {
         setProperty("ItlwmAwdlDataRx", dataRx, 32);
+        setProperty("ItlwmAwdlRxStamped", rxStamped, 32);
+        setProperty("ItlwmAwdlRxUnstamped", rxUnstamped, 32);
         setProperty("ItlwmAwdlDataRxRetry", dataRxRetry, 32);
     }
+}
+
+/*
+ * 1.2.18: a received packet carries the time it arrived. The pool is one network pool for both directions and this
+ * path never set the timestamp, so a received packet kept the one from its buffer's last use, often a send tens or
+ * hundreds of ms earlier. QUIC read that as the ACK's arrival: every AirDrop connection summary on 2026-11-14 had
+ * "rtt: 0.000s" on one channel, and sending to the iPad across channels logged 119 "quic_time_delta start time is
+ * after end time" in 3 minutes (median 25 ms, at most 166 ms) against 1 for the iPhone at 1.4 MB/s. An RTT measured
+ * short makes QUIC declare packets lost that are only late, retransmit and cut its window: 0.2 MB/s, 544 lost.
+ */
+static bool be201StampRx(IOSkywalkPacket *packet)
+{
+    /* 1.2.23: 0x100000 leaves the timestamp alone, as before 1.2.18 (presence A/B). */
+    if (AirportItlwm::awdlRocWanted() & IWX_AWDL_ROC_F_NO_STAMP)
+        return false;
+    if (!reinterpret_cast<const OSMetaClassBase *>(packet)->metaCast("IOSkywalkNetworkPacket"))
+        return false;
+    return be201NetPacketSetTimestamp(packet, mach_absolute_time()) == kIOReturnSuccess;
 }
 
 // Native enableDatapath enables its completion queues and transmit queue, requests a dequeue, and
@@ -493,13 +523,35 @@ extern "C" int be201UpdateInterfaceDataStats(void *self, void *stats)
  */
 void AirportItlwmAWDLInterface::reportDataStats()
 {
-    if (!dataActive || !started || !registered)
+    if (!dataActive || !started || !registered) {
+        pauseWant = false;
         return;
-    const uint32_t tx = dataTx - statsTxMark, rx = dataRx - statsRxMark;
-    if (!tx && !rx)
+    }
+    uint32_t tx = dataTx - statsTxMark;
+    const uint32_t rx = dataRx - statsRxMark;
+    /*
+     * 1.2.17: while a unicast flow runs both ways, each report counts at least 8 packets, so a slow start does not
+     * drop the family to Idle and Low Power and leave the peer two 149 slots a second to answer in (iwx_awdl_dmhold_pad).
+     */
+    uint64_t now;
+    clock_get_uptime(&now);
+    absolutetime_to_nanoseconds(now, &now);
+    const uint32_t pad = iwx_awdl_dmhold_pad(&dmHold, now / 1000, ucastTx - ucastTxMark, ucastRx - ucastRxMark, tx, rx);
+    /* 1.2.24: file data, either way, wants the whole radio (iwx_awdl_pause_trig_step). */
+    pauseWant = iwx_awdl_pause_trig_step(&pauseTrig, now / 1000, (ucastTx - ucastTxMark) + (ucastRx - ucastRxMark));
+    ucastTxMark = ucastTx;
+    ucastRxMark = ucastRx;
+    if (pad && !((dmHold.padded_reports - 1) & 63)) {
+        setProperty("ItlwmAwdlDataHoldFlows", dmHold.flows, 32);
+        setProperty("ItlwmAwdlDataHoldReports", dmHold.padded_reports, 32);
+        setProperty("ItlwmAwdlDataHoldPkts", dmHold.padded_pkts, 32);
+        setProperty("ItlwmAwdlDataHoldBulk", dmHold.bulk_holds, 32);
+    }
+    if (!tx && !rx && !pad)
         return;
     statsTxMark = dataTx;
     statsRxMark = dataRx;
+    tx += pad;
     memset(statsBuf, 0, sizeof(statsBuf));
     memcpy(statsBuf + 0x08, &tx, sizeof(tx));
     memcpy(statsBuf + 0x18, &rx, sizeof(rx));
@@ -664,12 +716,18 @@ void AirportItlwmAWDLInterface::awTimerFired(OSObject *owner, IOTimerEventSource
             if (c5 >= 36 && c5 <= 177)
                 next5 = c5;
         }
+        // 1.1.96: the whole sequence too, for the slots ROCs cover and what the sync frames announce.
+        uint8_t fam[16];
+        for (unsigned i = 0; i < 16; ++i)
+            fam[i] = self->awChannels[i] <= 255 ? uint8_t(self->awChannels[i]) : 0;
+        awdlController->setAWDLSequence(fam, slot);
         awdlController->setAWDLSlot(chan, run | (next5 << 8), seq5);
         bool holdTest = false, amsduTest = false;
         uint32_t phy2Test = 0, teTest = 0;
         AirportItlwm::awdlRadioTest(&holdTest, &phy2Test, &teTest, &amsduTest);
         awdlController->setAWDLRadioTest(holdTest, phy2Test, teTest, amsduTest);
         awdlController->setAWDLRoc(AirportItlwm::awdlRocWanted());
+        awdlController->setAWDLPause(self->pauseWant && AirportItlwm::awdlPauseWanted());
     }
     uint64_t now;
     clock_get_uptime(&now);
@@ -1250,6 +1308,7 @@ void AirportItlwmLowLatencyInterface::inputEthernet(const uint8_t *eth, size_t n
     }
     memcpy(be201PacketBase(packet) + be201PacketOffset(packet), eth, n);
     if (be201PacketSetLength(packet, static_cast<UInt32>(n)) != kIOReturnSuccess ||
+        (++*(be201StampRx(packet) ? &rxStamped : &rxUnstamped), false) ||
         be201RxCompEnqueue(queues[3], &packet, 1, 0) != kIOReturnSuccess) {
         be201PoolDeallocate(pool, packet);
         ++dataRxDropped;

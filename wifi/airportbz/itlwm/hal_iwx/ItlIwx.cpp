@@ -5155,6 +5155,16 @@ IOReturn ItlIwx::iwx_awdl_data_gate(struct iwx_softc *sc, const uint8_t *eth)
             return kIOReturnBusy;
         }
     }
+    /* 1.1.99: the ROC hold is high: the family keeps the packet until the flush has sent it down (iwx_awdl_roc_wake). */
+    if (iwx_awdl_roc_hold_busy(p->roc.mode, p->roc.sta_added && p->roc.qid > 0, p->roc.hold_n)) {
+        ++p->roc.hold_stalls;
+        p->roc.hold_stall_wait = 1;
+        if (!p->tx.data_stalled) {
+            p->tx.data_stalled = 1;
+            ++p->tx.data_stalls;
+        }
+        return kIOReturnBusy;
+    }
     /* Room comes back with a completion: the caller keeps the packet and waits, TCP sees no loss. */
     const int dataQid = p->ctx.own_active ? p->ctx.own_qid : (solo ? p->ctx.phy2_qid : sc->first_data_qid);
     if ((sc->sc_flags & IWX_FLAG_TXFLUSH) || !sc->qfullmsk.empty() ||
@@ -5209,8 +5219,15 @@ IOReturn ItlIwx::sendAwdlData(const uint8_t *eth, size_t length)
         return kIOReturnNoMemory;
     }
     iwx_awdl_note_dest(p, eth);
+    {
+        uint64_t ns = 0;
+        absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+        iwx_awdl_note_dest_tx(p, eth, ns / 1000); /* 1.2.15 */
+    }
     iwx_awdl_note_bytes(p, eth, length);
-    const bool qos = p->ctx.own_active && p->ctx.own_agg && !memcmp(eth, p->ctx.own_peer, 6);
+    /* 1.2.5: plain data while mode 4 sends through the AUX station (iwx_awdl_data_qos). */
+    const bool qos = iwx_awdl_data_qos(p->ctx.own_active, p->ctx.own_agg, !memcmp(eth, p->ctx.own_peer, 6),
+                                       iwx_awdl_roc_mode(p->roc.mode) >= 4 && p->roc.sta_added && p->roc.qid > 0);
     const size_t n = qos ? iwx_awdl_ether_to_qos(p, eth, length, static_cast<uint8_t *>(mbuf_data(m)), mbuf_maxlen(m))
                          : iwx_awdl_ether_to_data(p, eth, length, static_cast<uint8_t *>(mbuf_data(m)), mbuf_maxlen(m));
     if (!n) {
@@ -5221,9 +5238,20 @@ IOReturn ItlIwx::sendAwdlData(const uint8_t *eth, size_t length)
     return iwx_awdl_data_enqueue(sc, m, n);
 }
 
+/* 1.2.6: whether mode 4 sends through the AUX station right now. */
+static inline bool iwx_awdl_roc_aux_on(const struct iwx_awdl_probe *p)
+{
+    return iwx_awdl_roc_mode(p->roc.mode) >= 4 && p->roc.sta_added && p->roc.qid > 0;
+}
+
 bool ItlIwx::awdlAmsduReady(const uint8_t *eth)
 {
-    return iwx_awdl_amsdu_ready(&com.sc_awdl_probe, eth);
+    return iwx_awdl_amsdu_ready_on(&com.sc_awdl_probe, eth, iwx_awdl_roc_aux_on(&com.sc_awdl_probe));
+}
+
+size_t ItlIwx::awdlAmsduMaxBytes()
+{
+    return iwx_awdl_roc_aux_on(&com.sc_awdl_probe) ? IWX_AWDL_ROC_AMSDU_MAX_BYTES : IWX_AWDL_AMSDU_MAX_BYTES;
 }
 
 IOReturn ItlIwx::sendAwdlAmsdu(const uint8_t *const *eths, const size_t *lengths, unsigned count)
@@ -5231,12 +5259,16 @@ IOReturn ItlIwx::sendAwdlAmsdu(const uint8_t *const *eths, const size_t *lengths
     if (!getMainWorkLoop()->inGate()) return kIOReturnNotPermitted;
     auto sc = &com;
     auto p = &sc->sc_awdl_probe;
-    if (!count || !iwx_awdl_amsdu_ready(p, eths[0]))
+    if (!count || !iwx_awdl_amsdu_ready_on(p, eths[0], iwx_awdl_roc_aux_on(p)))
         return kIOReturnUnsupported;
     const IOReturn gate = iwx_awdl_data_gate(sc, eths[0]);
     if (gate != kIOReturnSuccess)
         return gate;
-    const size_t n = iwx_awdl_amsdu_build(p, eths, lengths, count, p->tx.amsdu_buf, sizeof(p->tx.amsdu_buf));
+    /* 1.2.6: through the AUX station on IWX_AWDL_ROC_AMSDU_TID, away from the own queue's TID 0 block ack. */
+    const bool aux = iwx_awdl_roc_aux_on(p);
+    const size_t n = iwx_awdl_amsdu_build(p, eths, lengths, count, p->tx.amsdu_buf,
+                                          aux ? size_t(IWX_AWDL_ROC_AMSDU_MAX_BYTES) : sizeof(p->tx.amsdu_buf),
+                                          aux ? uint8_t(IWX_AWDL_ROC_AMSDU_TID) : uint8_t(0));
     if (!n)
         return kIOReturnUnsupported;
     unsigned int chunks = 16;
@@ -5267,6 +5299,17 @@ static bool iwx_awdl_solo_idle(struct iwx_softc *sc)
 }
 
 /* This Mac's own schedule at each slot start, from the AW timer under the gate, just before the radio switches. */
+/* 1.1.96: the family's whole sequence and the slot running now, from the AW timer just before setAwdlSlot. */
+void ItlIwx::setAwdlSequence(const uint8_t *chans, uint32_t slot)
+{
+    if (!getMainWorkLoop()->inGate() || !chans)
+        return;
+    auto r = &com.sc_awdl_probe.roc;
+    memcpy(r->fam, chans, sizeof(r->fam));
+    r->slot_idx = uint8_t(slot % 16);
+    r->fam_valid = 1;
+}
+
 void ItlIwx::setAwdlSlot(uint32_t chan, uint32_t run, uint32_t seq5)
 {
     auto c = &com.sc_awdl_probe.ctx;
@@ -5280,6 +5323,104 @@ void ItlIwx::setAwdlSlot(uint32_t chan, uint32_t run, uint32_t seq5)
     c->slot_next5 = uint8_t((run >> 8) & 0xff);
     c->seq_chan5 = uint16_t(seq5 & 0xffff);
     c->slot_us = now / 1000;
+    /* 1.1.96: what ROCs may take, which slots they cover, and whether the sync frames say only those. */
+    {
+        auto ic = &com.sc_ic;
+        auto r = &com.sc_awdl_probe.roc;
+        const bool bss = ic->ic_bss && ic->ic_bss->ni_chan;
+        const uint32_t ap = bss ? uint32_t(ieee80211_chan2ieee(ic, ic->ic_bss->ni_chan)) : 0;
+        const uint8_t other = uint8_t(iwx_awdl_roc_other5(c->seq_chan5, ap));
+        r->cap_tu = iwx_awdl_roc_cap(bss ? uint32_t(ic->ic_bss->ni_intval) : 0, bss ? uint32_t(ic->ic_bss->ni_dtimperiod) : 0,
+                                     iwx_awdl_roc_no_clamp(r->want));
+        if (r->fam_valid) {
+            /* 1.2.9: in mode 4, the family's 149 slots and the phone's (iwx_awdl_seq_union), run by run as before. */
+            uint8_t seq[16];
+            memcpy(seq, r->fam, sizeof(seq));
+            bool phoneOnly = false;
+            r->gate_us = 0;
+            if (iwx_awdl_roc_mode(r->want) >= 4 && !(r->want & IWX_AWDL_ROC_F_NO_UNION) && other) {
+                struct iwx_awdl_peer_window w;
+                if (iwx_awdl_peer_run(&com.sc_awdl_probe, other, 16, now / 1000, &w) >= 0) {
+                    const uint32_t k = iwx_awdl_peer_k(w.cur, w.wait_us, w.slot_us, r->slot_idx);
+                    /* 1.2.16: a widened family sequence is an intent too (browse, connection, transfer). */
+                    if (iwx_awdl_seq_count(r->fam, other) >= IWX_AWDL_FAM_WIDE)
+                        com.sc_awdl_probe.sync.intent_us = now / 1000;
+                    const uint8_t *useq = iwx_awdl_union_seq(&com.sc_awdl_probe, now / 1000, other,
+                                                             (r->want & IWX_AWDL_ROC_F_DPEER_ALL) != 0, /* 1.2.15 */
+                                                             (r->want & IWX_AWDL_ROC_F_SEQ2S) ? IWX_AWDL_DEST_SEQ_OLD_US :
+                                                                                              IWX_AWDL_DEST_SEQ_US);
+                    if (useq)
+                        ++r->dest_ticks;
+                    r->union_slots += iwx_awdl_seq_union(r->fam, useq, k, other, seq);
+                    /* 1.2.19: what the sparse-peer gate needs this slot: the peers' offset and the channel. */
+                    r->gate_k = uint8_t(k);
+                    r->gate_chan = other;
+                    r->gate_us = now / 1000;
+                    phoneOnly = r->fam[r->slot_idx] != other && seq[r->slot_idx] == other;
+                }
+            }
+            iwx_awdl_roc_cover(seq, other, iwx_awdl_roc_run_max(r->want), r->cover, iwx_awdl_roc_gap(r->want));
+            r->cov_left = uint8_t(iwx_awdl_roc_cover_left(r->cover, r->slot_idx));
+            r->cov_end_us = now / 1000 + uint64_t(r->cov_left) * IWX_AWDL_ROC_SLOT_US;
+            if (phoneOnly && r->cov_left)
+                ++r->union_ticks;
+        }
+        /*
+         * 1.2.1: mode 4 follows the phone's own sequence and boundaries when its sync frames give them: the ROC ends
+         * when the phone's run ends, and the slots announced are the phone's, in this Mac's slot numbering.
+         */
+        r->peer_timed = 0;
+        if (iwx_awdl_roc_mode(r->want) >= 4 && (r->want & IWX_AWDL_ROC_F_PHONE) && other) {
+            struct iwx_awdl_peer_window w;
+            const int found = iwx_awdl_peer_run(&com.sc_awdl_probe, other, iwx_awdl_roc_run_max(r->want), now / 1000, &w);
+            if (found >= 0) {
+                const auto s = &com.sc_awdl_probe.sync;
+                uint8_t pc[16];
+                iwx_awdl_roc_cover(s->seq, other, iwx_awdl_roc_run_max(r->want), pc);
+                const uint32_t k = iwx_awdl_peer_k(w.cur, w.wait_us, w.slot_us, r->slot_idx);
+                for (unsigned j = 0; j < 16; ++j)
+                    r->cover[j] = pc[(j + k) % 16];
+                r->peer_k = uint8_t(k);
+                r->peer_lag_us = iwx_awdl_peer_lag(w.wait_us, w.slot_us);
+                ++r->peer_lag_n;
+                r->peer_lag_abs_ms += uint32_t((r->peer_lag_us < 0 ? -r->peer_lag_us : r->peer_lag_us) / 1000);
+                r->peer_timed = 1;
+                r->peer_start_us = w.start_us;
+                if (found > 0) {
+                    r->cov_left = uint8_t(w.slots);
+                    r->cov_end_us = w.end_us;
+                    ++r->peer_ticks;
+                } else {
+                    r->cov_left = 0;
+                    r->cov_end_us = now / 1000;
+                    ++r->peer_idle_ticks;
+                }
+            }
+        }
+        /* 1.2.19: frames that waited for a sparse peer's slot go as soon as it starts. */
+        if (r->gate_us && r->active && r->hold_n && !(r->want & IWX_AWDL_ROC_F_NO_SLOT_FLUSH))
+            iwx_awdl_roc_flush(&com);
+        /* Covered time, whichever timing set it (1.2.1: after the phone's run replaced the family's). */
+        if ((r->fam_valid || r->peer_timed) && r->cov_left && iwx_awdl_roc_mode(r->want))
+            r->cov_sum_ms += IWX_AWDL_ROC_SLOT_US / 1000;
+        r->announce_on = uint8_t((r->fam_valid || r->peer_timed) && iwx_awdl_roc_mode(r->want) >= 4 && r->sta_added &&
+                                 other && iwx_awdl_roc_covers(r->cover));
+        /* 1.2.4: this slot is not on 149 and the next one starts a 149 run: be there IWX_AWDL_ROC_PRE_LEAD_US early. */
+        if (com.awdl_roc_pre_to && r->fam_valid && !r->peer_timed && iwx_awdl_roc_mode(r->want) >= 4 &&
+            !(r->want & IWX_AWDL_ROC_F_NO_PRE) && other && !r->cov_left && r->sta_added && r->qid > 0 &&
+            !r->pending && !r->active && !r->pre_armed) {
+            const uint32_t next = iwx_awdl_roc_cover_left(r->cover, (r->slot_idx + 1u) % 16u);
+            if (next) {
+                const uint32_t runMax = iwx_awdl_roc_run_max(r->want);
+                r->pre_slots = uint8_t(next < runMax ? next : runMax);
+                r->pre_chan = other;
+                r->pre_boundary_us = now / 1000 + IWX_AWDL_ROC_SLOT_US;
+                r->pre_armed = 1;
+                ++r->pre_arms;
+                timeout_add_msec(&com.awdl_roc_pre_to, int((IWX_AWDL_ROC_SLOT_US - IWX_AWDL_ROC_PRE_LEAD_US) / 1000));
+            }
+        }
+    }
     /* Idle long enough with no infrastructure network: start the context on its own (1.1.66). */
     {
         auto sc = &com;
@@ -5369,6 +5510,9 @@ void ItlIwx::setAwdlRadioTest(bool hold, uint32_t phy2, uint32_t te, bool amsdu)
     }
     /* A fault during a move holds the second channel until the switch is turned off (1.1.90). */
     phy2 = iwx_awdl_phy2_after_fault(&c->phy2_fault_hold, phy2);
+    /* 1.2.24: the pause mode brings link 1 back to the router's PHY first. */
+    if (p->pause.phy2_hold)
+        phy2 = 0;
     if (now_us >= c->te_end_us && conf < IWX_SESSION_PROTECT_CONF_MAX_ID)
         c->te_conf = uint8_t(conf);
     /*
@@ -5491,13 +5635,23 @@ void ItlIwx::iwx_awdl_phy2_move(struct iwx_softc *sc)
      * started and not ended and the own queue still allocated; which of the two it was is not known.
      */
     if (c->phy2_chan) {
+        c->phy2_step = IWX_AWDL_MOVE_TE;
         struct iwx_session_prot_cmd cmd;
         iwx_awdl_fill_te(&cmd, IWX_FW_CTXT_ACTION_REMOVE, 0, c->te_conf);
         err = that->iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_SESSION_PROTECTION_CMD, IWX_MAC_CONF_GROUP, 0), 0, sizeof(cmd), &cmd);
         if (generation != sc->sc_generation)
             return;
         ++c->te_removed;
-        if (c->own_qid > 0 && iwx_awdl_te_keeps_own(c->te_want) && c->own_active) {
+    }
+    /*
+     * The own queue goes (or, in mode 5, is emptied) on every move, onto the second channel too (1.1.94). Before, only
+     * a move off it did; 12:20 moved onto 149 with an aggregated queue from an AirDrop and the firmware asserted.
+     */
+    if (c->own_qid > 0) {
+        c->phy2_step = IWX_AWDL_MOVE_OWN;
+        if (!c->phy2_chan)
+            ++c->phy2_own_quiesces;
+        if (iwx_awdl_te_keeps_own(c->te_want) && c->own_active) {
             /*
              * Mode 5: keep the queue across the move and drop only what waits in it. Mode 4 released it at every
              * move, twice a second, and the 1 s retry never caught up: 55 sent, 8 done, data fell back to the AP's
@@ -5510,7 +5664,7 @@ void ItlIwx::iwx_awdl_phy2_move(struct iwx_softc *sc)
                 return;
             sc->sc_flags &= ~IWX_FLAG_TXFLUSH;
             ++c->own_kept_moves;
-        } else if (c->own_qid > 0) {
+        } else {
             err = that->iwx_awdl_own_release(sc) ?: err;
             if (generation != sc->sc_generation)
                 return;
@@ -5519,6 +5673,7 @@ void ItlIwx::iwx_awdl_phy2_move(struct iwx_softc *sc)
     {
         auto r = &p->roc;
         if (r->pending || r->active) {
+            c->phy2_step = IWX_AWDL_MOVE_ROC;
             struct iwx_roc_req cmd;
             memset(&cmd, 0, sizeof(cmd));
             cmd.action = htole32(IWX_FW_CTXT_ACTION_REMOVE);
@@ -5530,16 +5685,26 @@ void ItlIwx::iwx_awdl_phy2_move(struct iwx_softc *sc)
                 return;
         }
     }
+    /* Rate control that fits both PHYs before the link leaves the AP's (1.1.94). */
+    if (iwx_awdl_move_tlc_narrow(want, c->phy2_chan) && p->peer_tlc) {
+        c->phy2_step = IWX_AWDL_MOVE_TLC_NARROW;
+        err = that->iwx_awdl_peers_tlc(sc, IEEE80211_CHAN_WIDTH_20) ?: err;
+        if (generation != sc->sc_generation)
+            return;
+    }
+    c->phy2_step = IWX_AWDL_MOVE_INACTIVE;
     err = that->iwx_awdl_ctx_link_cmd(sc, in, IWX_FW_CTXT_ACTION_MODIFY, IWX_LINK_CONTEXT_MODIFY_ACTIVE, 0) ?: err;
     if (generation != sc->sc_generation)
         return;
     /* Off the old context first. 1.1.42 went straight to active on the new one and the firmware asserted. */
+    c->phy2_step = IWX_AWDL_MOVE_NO_PHY;
     c->link_no_phy = 1;
     err = that->iwx_awdl_ctx_link_cmd(sc, in, IWX_FW_CTXT_ACTION_MODIFY, 0, 0) ?: err;
     c->link_no_phy = 0;
     if (generation != sc->sc_generation)
         return;
     if (!err && channel) {
+        c->phy2_step = IWX_AWDL_MOVE_PHY;
         err = that->iwx_phy_ctxt_update(sc, &sc->sc_phyctxt[1], channel, chains, chains, 0);
         if (generation != sc->sc_generation)
             return;
@@ -5547,14 +5712,24 @@ void ItlIwx::iwx_awdl_phy2_move(struct iwx_softc *sc)
     if (!err)
         c->phy2_chan = want;
     /* Mask 0 with the context, then active: the order that first activates this link. */
+    c->phy2_step = IWX_AWDL_MOVE_WITH_PHY;
     err = that->iwx_awdl_ctx_link_cmd(sc, in, IWX_FW_CTXT_ACTION_MODIFY, 0, 0) ?: err;
     if (generation != sc->sc_generation)
         return;
+    /* Home again: the AP's width once the link has the AP's PHY, before it is active, as Linux updates TLC. */
+    if (!err && iwx_awdl_move_tlc_widen(want, c->phy2_chan) && p->peer_tlc) {
+        c->phy2_step = IWX_AWDL_MOVE_TLC_WIDEN;
+        err = that->iwx_awdl_peers_tlc(sc, ic->ic_bss->ni_chw);
+        if (generation != sc->sc_generation)
+            return;
+    }
     /* Back to a working link even after an error. */
+    c->phy2_step = IWX_AWDL_MOVE_ACTIVE;
     const int active = that->iwx_awdl_ctx_link_cmd(sc, in, IWX_FW_CTXT_ACTION_MODIFY,
         IWX_LINK_CONTEXT_MODIFY_ACTIVE | IWX_LINK_CONTEXT_MODIFY_RATES_INFO, 1);
     if (generation != sc->sc_generation)
         return;
+    c->phy2_step = IWX_AWDL_MOVE_NONE;
     err = err ?: active;
     if (err) {
         c->phy2_err = uint32_t(err < 0 ? -err : err);
@@ -5733,8 +5908,9 @@ void ItlIwx::iwx_awdl_ownq_task(void *arg)
     }
     auto p = &sc->sc_awdl_probe;
     auto c = &p->ctx;
+    /* Not during a move of link 1 (1.1.94): its sleeps let this task run between the move's commands. */
     if (!c->own_want || c->own_active || c->own_held || c->stage != IWX_AWDL_CTX_ASSOC || !p->peer_added ||
-        p->tx.tripped || (sc->sc_flags & (IWX_FLAG_SHUTDOWN | IWX_FLAG_HW_ERR)))
+        p->tx.tripped || c->phy2_moving || (sc->sc_flags & (IWX_FLAG_SHUTDOWN | IWX_FLAG_HW_ERR)))
         return;
     /* The station data goes to; before any data, the peer that set up block ack, as in 1.1.41. */
     int index = c->own_target >= 0 && uint32_t(c->own_target) < p->peer_added ? c->own_target :
@@ -6131,6 +6307,10 @@ iwx_awdl_probe_publish(struct iwx_softc *sc)
     nub->setProperty("ItlwmAwdlPhy2Chan", p->ctx.phy2_chan, 32);
     nub->setProperty("ItlwmAwdlPhy2Err", p->ctx.phy2_err, 32);
     nub->setProperty("ItlwmAwdlPhy2Switches", p->ctx.phy2_switches, 32);
+    nub->setProperty("ItlwmAwdlPhy2TlcRefreshes", p->ctx.phy2_tlc_refreshes, 32);
+    nub->setProperty("ItlwmAwdlPhy2TlcErr", p->ctx.phy2_tlc_err, 32);
+    nub->setProperty("ItlwmAwdlPhy2OwnQuiesces", p->ctx.phy2_own_quiesces, 32);
+    nub->setProperty("ItlwmAwdlPeerTlc", p->peer_tlc, 32);
     nub->setProperty("ItlwmAwdlRxPhy2", p->ctx.rx_phy2, 32);
     nub->setProperty("ItlwmAwdlRxHome", p->ctx.rx_home, 32);
     {
@@ -6418,6 +6598,212 @@ void ItlIwx::setAwdlRoc(uint32_t value)
     sc->sc_awdl_probe.roc.want = value;
 }
 
+/* 1.2.25: the AWDL channel the router's PHY sits on during a pause (one adapter per kext), 0 otherwise. */
+static uint8_t iwx_pause_wide_chan;
+
+/*
+ * Pause mode (1.2.24): the state machine, stepped from the AW tick under the gate. The firmware commands run in
+ * iwx_awdl_pause_task. See docs/wifi/BE201-AWDL-PAUSE-DESIGN.md.
+ */
+void ItlIwx::iwx_awdl_pause_publish(struct iwx_softc *sc)
+{
+    const auto s = &sc->sc_awdl_probe.pause;
+    const struct { const char *key; uint32_t value; } e[] = {
+        {"ItlwmAwdlPauseState", s->state}, {"ItlwmAwdlPauseEnters", s->enters}, {"ItlwmAwdlPauseExits", s->exits},
+        {"ItlwmAwdlPauseAborts", s->aborts}, {"ItlwmAwdlPauseDrops", s->drops}, {"ItlwmAwdlPauseNulls", s->nulls},
+        {"ItlwmAwdlPauseNullErr", s->null_err}, {"ItlwmAwdlPauseErr", s->err}, {"ItlwmAwdlPauseLastMs", s->last_ms},
+        {"ItlwmAwdlPauseMaxMs", s->max_ms}, {"ItlwmAwdlPauseChan", s->chan}, {"ItlwmAwdlPauseBmissIgnored", s->ignored_bmiss},
+        {"ItlwmAwdlPauseSkips", s->skips},
+    };
+    for (const auto &x : e)
+        sc->sc_pcitag->setProperty(x.key, x.value, 32);
+}
+
+/* A null data frame to the router, power save on (it holds our frames) or off (it sends them now). */
+int ItlIwx::iwx_awdl_pause_null(struct iwx_softc *sc, bool pm)
+{
+    struct ieee80211com *ic = &sc->sc_ic;
+    auto s = &sc->sc_awdl_probe.pause;
+    struct ieee80211_node *ni = ic->ic_bss;
+    mbuf_t m = NULL;
+    if (!ni || mbuf_gethdr(MBUF_DONTWAIT, MT_DATA, &m) || !m) {
+        ++s->null_err;
+        return ENOMEM;
+    }
+    auto wh = static_cast<struct ieee80211_frame *>(mbuf_data(m));
+    memset(wh, 0, sizeof(*wh));
+    wh->i_fc[0] = IEEE80211_FC0_VERSION_0 | IEEE80211_FC0_TYPE_DATA | IEEE80211_FC0_SUBTYPE_NODATA;
+    wh->i_fc[1] = IEEE80211_FC1_DIR_TODS | (pm ? IEEE80211_FC1_PWR_MGT : 0);
+    IEEE80211_ADDR_COPY(wh->i_addr1, ni->ni_bssid);
+    IEEE80211_ADDR_COPY(wh->i_addr2, ic->ic_myaddr);
+    IEEE80211_ADDR_COPY(wh->i_addr3, ni->ni_bssid);
+    mbuf_setlen(m, sizeof(*wh));
+    if (iwx_awdl_data_enqueue(sc, m, sizeof(*wh)) != kIOReturnSuccess) {
+        ++s->null_err;
+        return EBUSY;
+    }
+    ++s->nulls;
+    return 0;
+}
+
+void ItlIwx::setAwdlPause(bool want)
+{
+    auto sc = &com;
+    if (!getMainWorkLoop()->inGate())
+        return;
+    struct ieee80211com *ic = &sc->sc_ic;
+    auto p = &sc->sc_awdl_probe;
+    auto s = &p->pause;
+    auto c = &p->ctx;
+    auto r = &p->roc;
+    uint64_t now = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+    const uint64_t now_us = now / 1000;
+    const bool run = ic->ic_state == IEEE80211_S_RUN && ic->ic_bss && ic->ic_bss->ni_chan &&
+        !(sc->sc_flags & (IWX_FLAG_SHUTDOWN | IWX_FLAG_HW_ERR));
+    s->want = want;
+    const uint8_t before = s->state;
+    switch (s->state) {
+    case IWX_AWDL_PAUSE_OFF:
+        /* Only with link 1 on its own second channel: the router is elsewhere. */
+        if (want && run && !iwx_awdl_pause_width_ok(ic->ic_bss->ni_chw)) {
+            if (!s->skips++ || !(s->skips & 63))
+                iwx_awdl_pause_publish(sc);
+        } else if (want && run && c->stage == IWX_AWDL_CTX_ASSOC && !p->tx.tripped && !c->solo && c->phy2_chan >= 36 &&
+            c->phy2_chan <= 177 && IEEE80211_IS_CHAN_5GHZ(ic->ic_bss->ni_chan) &&
+            IEEE80211_IS_CHAN_5GHZ(&ic->ic_channels[c->phy2_chan])) {
+            s->chan = c->phy2_chan;
+            s->phy2_hold = 1;
+            s->state = IWX_AWDL_PAUSE_MOVING;
+            s->state_us = now_us;
+        }
+        break;
+    case IWX_AWDL_PAUSE_MOVING:
+        if (!want || !run) {
+            s->phy2_hold = 0;
+            s->state = IWX_AWDL_PAUSE_OFF;
+        } else if (!c->phy2_chan && !c->phy2_moving && !r->sta_added && !r->pending && !r->active) {
+            s->state = IWX_AWDL_PAUSE_TUNING;
+            iwx_add_task(sc, systq, &sc->awdl_pause_task);
+        } else if (now_us - s->state_us >= IWX_AWDL_PAUSE_STEP_US) {
+            ++s->aborts;
+            s->phy2_hold = 0;
+            s->state = IWX_AWDL_PAUSE_OFF;
+        }
+        break;
+    case IWX_AWDL_PAUSE_ON:
+        if (!want || !run) {
+            s->state = IWX_AWDL_PAUSE_LEAVING;
+            iwx_add_task(sc, systq, &sc->awdl_pause_task);
+        }
+        break;
+    case IWX_AWDL_PAUSE_RETURNING:
+        if (c->phy2_chan || now_us - s->state_us >= IWX_AWDL_PAUSE_STEP_US)
+            s->state = IWX_AWDL_PAUSE_OFF;
+        break;
+    default:
+        break;
+    }
+    if (s->state != before)
+        iwx_awdl_pause_publish(sc);
+}
+
+void ItlIwx::iwx_awdl_pause_task(void *arg)
+{
+    auto sc = static_cast<iwx_softc *>(arg);
+    auto that = container_of(sc, ItlIwx, com);
+    if (!that->getMainWorkLoop()->inGate()) {
+        that->getMainCommandGate()->runAction(
+            [](OSObject *, void *arg0, void *, void *, void *) -> IOReturn {
+                iwx_awdl_pause_task(arg0); return kIOReturnSuccess;
+            }, arg);
+        return;
+    }
+    that->iwx_awdl_pause_run(sc);
+}
+
+void ItlIwx::iwx_awdl_pause_run(struct iwx_softc *sc)
+{
+    struct ieee80211com *ic = &sc->sc_ic;
+    auto p = &sc->sc_awdl_probe;
+    auto s = &p->pause;
+    auto in = reinterpret_cast<iwx_node *>(ic->ic_bss);
+    const int generation = sc->sc_generation;
+    const uint8_t chains = iwx_mimo_enabled(sc) ? 2 : 1;
+    uint64_t now = 0;
+    if (!in || !in->in_phyctxt || in->in_phyctxt != &sc->sc_phyctxt[0] || ic->ic_state != IEEE80211_S_RUN) {
+        s->tuned = 0;
+        s->phy2_hold = 0;
+        s->state = IWX_AWDL_PAUSE_OFF;
+        ++s->aborts;
+        iwx_awdl_pause_publish(sc);
+        return;
+    }
+    if (s->state == IWX_AWDL_PAUSE_TUNING) {
+        /* 1. The router keeps our frames while we are away. */
+        iwx_awdl_pause_null(sc, true);
+        for (int i = 0; i < 3; ++i) { /* about 30 ms for it to leave, in gate slices */
+            uint32_t budget = IWX_GATE_SLICE_MS;
+            iwx_gate_sleep(sc, &s->tuned, &budget, IWX_GATE_WAIT_NOTIF);
+            if (generation != sc->sc_generation)
+                return;
+        }
+        /*
+         * 2. The router's context to the AWDL channel at the router's own width (iwx_pause_wide_chan): the router's
+         * and the peers' rate control (widened to the router's width when link 1 came home) stay as they are.
+         */
+        s->tuned = 1;
+        iwx_pause_wide_chan = s->chan;
+        int err = iwx_phy_ctxt_update(sc, &sc->sc_phyctxt[0], &ic->ic_channels[s->chan], chains, chains, 0);
+        if (generation != sc->sc_generation)
+            return;
+        absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+        if (err) {
+            s->err = uint32_t(err < 0 ? -err : err);
+            ++s->aborts;
+            /* Back home at once; give up this pause. */
+            iwx_pause_wide_chan = 0;
+            iwx_phy_ctxt_update(sc, &sc->sc_phyctxt[0], in->in_ni.ni_chan, chains, chains, 0);
+            if (generation != sc->sc_generation)
+                return;
+            s->tuned = 0;
+            iwx_awdl_pause_null(sc, false);
+            s->phy2_hold = 0;
+            s->state = IWX_AWDL_PAUSE_RETURNING;
+            s->state_us = now / 1000;
+        } else {
+            ++s->enters;
+            s->on_us = now / 1000;
+            s->state = IWX_AWDL_PAUSE_ON;
+        }
+        iwx_awdl_pause_publish(sc);
+        return;
+    }
+    if (s->state == IWX_AWDL_PAUSE_LEAVING) {
+        /* 1. The router's context home again, at the router's width. */
+        int err = iwx_phy_ctxt_update(sc, &sc->sc_phyctxt[0], in->in_ni.ni_chan, chains, chains, 0);
+        if (generation != sc->sc_generation)
+            return;
+        s->tuned = 0;
+        iwx_pause_wide_chan = 0;
+        /* 2. The frames the router held. */
+        iwx_awdl_pause_null(sc, false);
+        if (err)
+            s->err = uint32_t(err < 0 ? -err : err);
+        absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+        const uint64_t ms = (now / 1000 - s->on_us) / 1000;
+        s->last_ms = ms > 0xffffffffULL ? 0xffffffffU : uint32_t(ms);
+        if (s->last_ms > s->max_ms)
+            s->max_ms = s->last_ms;
+        ++s->exits;
+        /* 3. Link 1 back to its second channel (setAwdlRadioTest), ROC builds again by itself. */
+        s->phy2_hold = 0;
+        s->state = IWX_AWDL_PAUSE_RETURNING;
+        s->state_us = now / 1000;
+        iwx_awdl_pause_publish(sc);
+    }
+}
+
 /*
  * What an ROC still waits for, one bit per condition; 0 when ready. 2026-11-10 18:45 the ROC test saw RocSetups 0
  * in every phase and nothing told which condition was missing (1.1.82: ItlwmAwdlRocBlocked).
@@ -6449,6 +6835,16 @@ static uint32_t iwx_awdl_roc_blocked(struct iwx_softc *sc)
         b |= 1u << 9;
     if (sc->sc_flags & IWX_FLAG_TXFLUSH)
         b |= 1u << 10;
+    /* 1.2.15: mode 4 only once link 1 is on its second channel (the tool's order, now also at boot). */
+    if (iwx_awdl_roc_mode(p->roc.want) >= 4 && !p->ctx.phy2_chan)
+        b |= 1u << 11;
+    /* 1.2.15: the boot default stays off while the AP is on 2.4 GHz. */
+    if ((p->roc.want & IWX_AWDL_ROC_F_AUTO) && ic->ic_bss && ic->ic_bss->ni_chan &&
+        IEEE80211_IS_CHAN_2GHZ(ic->ic_bss->ni_chan))
+        b |= 1u << 12;
+    /* 1.2.24: no ROC while the pause mode has (or takes) the whole radio. */
+    if (p->pause.state != IWX_AWDL_PAUSE_OFF)
+        b |= 1u << 13;
     return b;
 }
 
@@ -6475,7 +6871,7 @@ void ItlIwx::iwx_awdl_roc_task(void *arg)
      * task did nothing in that case, so after mode 1 the test's modes 2 and 3 sent no ROC at all (2026-11-11 15:40).
      */
     if (r->sta_added && (!wanted || iwx_awdl_roc_mode(r->want) != r->mode ||
-                         iwx_awdl_roc_activity(r->want) != r->activity)) {
+                         iwx_awdl_roc_activity(r->want) != r->activity || iwx_awdl_roc_tid(r->want) != r->tid)) {
         const int generation = sc->sc_generation;
         that->iwx_awdl_roc_remove(sc);
         if (generation != sc->sc_generation)
@@ -6494,6 +6890,7 @@ void ItlIwx::iwx_awdl_roc_setup(struct iwx_softc *sc)
     ++r->setups;
     r->mode = iwx_awdl_roc_mode(r->want);
     r->activity = iwx_awdl_roc_activity(r->want);
+    r->tid = iwx_awdl_roc_tid(r->want); /* 1.2.11 */
     struct iwx_aux_sta_cmd cmd;
     memset(&cmd, 0, sizeof(cmd));
     cmd.sta_id = htole32(IWX_AWDL_ROC_STA_ID);
@@ -6509,7 +6906,7 @@ void ItlIwx::iwx_awdl_roc_setup(struct iwx_softc *sc)
     {
         int q = -EIO;
         if (iwx_nic_lock(sc)) {
-            q = iwx_tvqm_enable_txq(sc, IWX_AWDL_ROC_TID, 0, IWX_DEFAULT_QUEUE_SIZE, IWX_AWDL_ROC_STA_ID);
+            q = iwx_tvqm_enable_txq(sc, r->tid, 0, IWX_DEFAULT_QUEUE_SIZE, IWX_AWDL_ROC_STA_ID);
             iwx_nic_unlock(sc);
         }
         if (generation != sc->sc_generation)
@@ -6521,6 +6918,14 @@ void ItlIwx::iwx_awdl_roc_setup(struct iwx_softc *sc)
         r->qid = q;
     }
     r->setup_stage = 3;
+    /* 1.2.8: each AUX station starts at the rate that worked. */
+    r->rate_step = IWX_AWDL_ROC_RATE_START;
+    r->rate_ok = r->rate_fail = 0;
+    /* 1.2.3: the ROC timer lives as long as the AUX station. */
+    if (!sc->awdl_roc_kick_to)
+        timeout_set(&sc->awdl_roc_kick_to, iwx_awdl_roc_kick, sc);
+    if (!sc->awdl_roc_pre_to)
+        timeout_set(&sc->awdl_roc_pre_to, iwx_awdl_roc_pre, sc);
     return;
 fail:
     r->setup_err = uint32_t(err < 0 ? -err : err);
@@ -6533,6 +6938,7 @@ void ItlIwx::iwx_awdl_roc_remove(struct iwx_softc *sc)
 {
     auto r = &sc->sc_awdl_probe.roc;
     const int generation = sc->sc_generation;
+    r->announce_on = 0;
     iwx_awdl_roc_hold_clear(sc);
     if (r->pending || r->active) {
         struct iwx_roc_req cmd;
@@ -6541,6 +6947,11 @@ void ItlIwx::iwx_awdl_roc_remove(struct iwx_softc *sc)
         cmd.activity = htole32(r->activity);
         r->pending = r->active = 0;
         ++r->removes;
+        {
+            uint64_t ns = 0;
+            absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+            r->last_end_us = ns / 1000; /* 1.1.97: the next ADD waits IWX_AWDL_ROC_READD_US after a REMOVE too. */
+        }
         iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_ROC_CMD, IWX_MAC_CONF_GROUP, 0), 0, sizeof(cmd), &cmd);
         if (generation != sc->sc_generation)
             return;
@@ -6556,12 +6967,24 @@ void ItlIwx::iwx_awdl_roc_remove(struct iwx_softc *sc)
         if (generation != sc->sc_generation)
             return;
         sc->sc_flags &= ~IWX_FLAG_TXFLUSH;
-        iwx_mld_disable_txq(sc, IWX_AWDL_ROC_STA_ID, IWX_AWDL_ROC_TID);
+        iwx_mld_disable_txq(sc, IWX_AWDL_ROC_STA_ID, r->tid);
         if (generation != sc->sc_generation)
             return;
         iwx_reset_tx_ring(sc, &sc->txq[q]);
     }
     r->sta_added = 0;
+    r->kick_armed = 0;
+    if (sc->awdl_roc_kick_to) {
+        timeout_del(&sc->awdl_roc_kick_to);
+        timeout_free(&sc->awdl_roc_kick_to);
+        sc->awdl_roc_kick_to = NULL;
+    }
+    sc->sc_awdl_probe.roc.pre_armed = 0;
+    if (sc->awdl_roc_pre_to) {
+        timeout_del(&sc->awdl_roc_pre_to);
+        timeout_free(&sc->awdl_roc_pre_to);
+        sc->awdl_roc_pre_to = NULL;
+    }
     struct iwx_sta_remove_cmd cmd = { .sta_id = htole32(IWX_AWDL_ROC_STA_ID) };
     iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_STA_REMOVE_CMD, IWX_MAC_CONF_GROUP, 0), 0, sizeof(cmd), &cmd);
 }
@@ -6584,8 +7007,10 @@ void ItlIwx::iwx_awdl_roc_tick(struct iwx_softc *sc, uint64_t now_us)
         r->blocked_pub = r->blocked;
         sc->sc_pcitag->setProperty("ItlwmAwdlRocBlocked", r->blocked, 32);
     }
+    /* 1.2.12: a new queue TID rebuilds too. 1.2.11 compared it only in the task, which this tick never ran for it. */
     if ((wanted && ready && !r->sta_added) || (r->sta_added && (!wanted || !ready ||
-        iwx_awdl_roc_mode(r->want) != r->mode || iwx_awdl_roc_activity(r->want) != r->activity))) {
+        iwx_awdl_roc_mode(r->want) != r->mode || iwx_awdl_roc_activity(r->want) != r->activity ||
+        iwx_awdl_roc_tid(r->want) != r->tid))) {
         if (now_us - r->setup_us >= IWX_AWDL_ROC_SETUP_US) {
             r->setup_us = now_us;
             iwx_add_task(sc, systq, &sc->awdl_roc_task);
@@ -6601,6 +7026,7 @@ void ItlIwx::iwx_awdl_roc_tick(struct iwx_softc *sc, uint64_t now_us)
         cmd.activity = htole32(r->activity);
         r->pending = r->active = 0;
         ++r->stale;
+        r->last_end_us = now_us;
         iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_ROC_CMD, IWX_MAC_CONF_GROUP, 0), IWX_CMD_ASYNC, sizeof(cmd), &cmd);
         return;
     }
@@ -6610,12 +7036,30 @@ void ItlIwx::iwx_awdl_roc_tick(struct iwx_softc *sc, uint64_t now_us)
         ++r->phy_holds;
         return;
     }
+    /* 1.1.97: never straight after an end; the chain task covers the rest of a slot. */
+    if (iwx_awdl_roc_readd_wait(now_us, r->last_end_us, IWX_AWDL_ROC_READD_US)) {
+        ++r->readd_waits;
+        return;
+    }
+    if (iwx_awdl_roc_bmiss_paused(now_us, r->bmiss_until_us)) {
+        ++r->bmiss_skips;
+        return;
+    }
     const uint32_t ap = uint32_t(ieee80211_chan2ieee(ic, ic->ic_bss->ni_chan));
     uint32_t chan = c->slot_chan;
     uint32_t duration = iwx_awdl_roc_duration(c->slot_run);
     uint32_t delay = IWX_AWDL_ROC_DELAY_TU;
     /* Nothing heard: listen one long ROC on the other 5 GHz channel, to hear the phone and take its AW timing. */
     const uint32_t other = iwx_awdl_roc_other5(c->seq_chan5, ap);
+    /*
+     * 1.1.96: with the family's sequence known, any covered slot with no ROC running gets one for the covered time
+     * left, so a ROC that ended early is picked up at the next slot even when the chain did not add one.
+     */
+    if (r->fam_valid || r->peer_timed) {
+        chan = other;
+        duration = r->cov_left && iwx_awdl_roc_chain_due(now_us, r->cov_end_us, IWX_AWDL_ROC_CHAIN_MIN_US) ?
+            uint32_t((r->cov_end_us - now_us) / IWX_AWDL_TU_US) : 0;
+    }
     const bool disc = other && iwx_awdl_roc_disc_due(r, now_us);
     if (disc) {
         chan = other;
@@ -6624,6 +7068,19 @@ void ItlIwx::iwx_awdl_roc_tick(struct iwx_softc *sc, uint64_t now_us)
     }
     if (!duration || chan < 36 || chan > 177 || chan == ap)
         return;
+    if (!disc && r->cap_tu && duration > r->cap_tu)
+        duration = r->cap_tu;
+    r->last_add_src = disc ? 3 : 1;
+    iwx_awdl_roc_add(sc, chan, duration, delay, disc, now_us);
+}
+
+/* One ROC ADD on chan (1.1.96: shared by the slot tick and the chain; an 80 MHz ROC when the switch asks). */
+int ItlIwx::iwx_awdl_roc_add(struct iwx_softc *sc, uint32_t chan, uint32_t duration, uint32_t delay, bool disc,
+                             uint64_t now_us)
+{
+    auto p = &sc->sc_awdl_probe;
+    auto r = &p->roc;
+    const bool wide = !disc && (r->want & IWX_AWDL_ROC_F_80MHZ);
     struct iwx_roc_req cmd;
     memset(&cmd, 0, sizeof(cmd));
     cmd.action = htole32(IWX_FW_CTXT_ACTION_ADD);
@@ -6631,29 +7088,197 @@ void ItlIwx::iwx_awdl_roc_tick(struct iwx_softc *sc, uint64_t now_us)
     cmd.sta_id = htole32(IWX_AWDL_ROC_STA_ID);
     cmd.channel_info.channel = htole32(chan);
     cmd.channel_info.band = IWX_PHY_BAND_5;
-    cmd.channel_info.width = IWX_PHY_VHT_CHANNEL_MODE20;
-    cmd.channel_info.ctrl_pos = IWX_PHY_VHT_CTRL_POS_1_BELOW;
+    cmd.channel_info.width = wide ? IWX_PHY_VHT_CHANNEL_MODE80 : IWX_PHY_VHT_CHANNEL_MODE20;
+    cmd.channel_info.ctrl_pos = wide ? iwx_awdl_ctrl_pos80(chan) : IWX_PHY_VHT_CTRL_POS_1_BELOW;
     memcpy(cmd.node_addr, p->tx.self, 6);
     cmd.max_delay = htole32(delay);
     cmd.duration = htole32(duration);
-    if (iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_ROC_CMD, IWX_MAC_CONF_GROUP, 0), IWX_CMD_ASYNC, sizeof(cmd), &cmd)) {
+    const int err = iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_ROC_CMD, IWX_MAC_CONF_GROUP, 0), IWX_CMD_ASYNC, sizeof(cmd), &cmd);
+    if (err) {
         ++r->add_err;
-        return;
+        return err;
     }
     r->pending = 1;
     r->chan = uint8_t(chan);
     r->sent_us = now_us;
+    /* 1.1.97: how soon after the last end this ADD went, for the fault snapshot and the shortest seen. */
+    r->last_add_after_us = r->last_end_us && now_us >= r->last_end_us && now_us - r->last_end_us < 1000000 ?
+        uint32_t(now_us - r->last_end_us) : 1000000u;
+    if (r->last_add_after_us < 1000000u && (!r->readd_min_us || r->last_add_after_us < r->readd_min_us))
+        r->readd_min_us = r->last_add_after_us ? r->last_add_after_us : 1;
     r->dur_tu = duration;
+    r->req_sum_ms += duration * IWX_AWDL_TU_US / 1000;
     ++r->adds;
+    if (wide)
+        ++r->wide_adds;
     r->disc_pending = disc;
     if (disc) {
         r->disc_us = now_us;
         ++r->disc;
     }
+    return 0;
+}
+
+/*
+ * 1.1.96: the next ROC as soon as one ends, while the run's covered time lasts. From the end notification, which
+ * cannot send; the same readiness rules as the tick, and never while a move of link 1 is queued or running.
+ */
+void ItlIwx::iwx_awdl_roc_chain_task(void *arg)
+{
+    auto sc = static_cast<iwx_softc *>(arg);
+    auto that = container_of(sc, ItlIwx, com);
+    if (!that->getMainWorkLoop()->inGate()) {
+        /*
+         * 1.1.97: wait out IWX_AWDL_ROC_READD_US on the task thread, outside the gate, before the ADD. The time is
+         * re-read in the gate and the ADD is skipped if it is still too soon.
+         */
+        uint64_t ns = 0;
+        absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+        const uint32_t wait = iwx_awdl_roc_readd_wait(ns / 1000, sc->sc_awdl_probe.roc.last_end_us,
+                                                      IWX_AWDL_ROC_READD_US);
+        if (wait)
+            IOSleep((wait + 999) / 1000 + 1);
+        that->getMainCommandGate()->runAction(
+            [](OSObject *, void *arg0, void *, void *, void *) -> IOReturn {
+                iwx_awdl_roc_chain_task(arg0); return kIOReturnSuccess;
+            }, arg);
+        return;
+    }
+    auto ic = &sc->sc_ic;
+    auto p = &sc->sc_awdl_probe;
+    auto r = &p->roc;
+    auto c = &p->ctx;
+    uint64_t now = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+    const uint64_t now_us = now / 1000;
+    if (r->pending || !r->sta_added || r->qid <= 0 || r->setup_failed || !iwx_awdl_roc_mode(r->want) ||
+        iwx_awdl_roc_mode(r->want) != r->mode || iwx_awdl_roc_activity(r->want) != r->activity ||
+        !iwx_awdl_roc_ready(sc) || c->phy2_moving || !r->fam_valid || !ic->ic_bss || !ic->ic_bss->ni_chan ||
+        !iwx_awdl_roc_chain_due(now_us, r->cov_end_us, IWX_AWDL_ROC_CHAIN_MIN_US) ||
+        iwx_awdl_roc_readd_wait(now_us, r->last_end_us, IWX_AWDL_ROC_READD_US) ||
+        iwx_awdl_roc_bmiss_paused(now_us, r->bmiss_until_us)) {
+        ++r->chain_skips;
+        return;
+    }
+    const uint32_t ap = uint32_t(ieee80211_chan2ieee(ic, ic->ic_bss->ni_chan));
+    const uint32_t chan = iwx_awdl_roc_other5(c->seq_chan5, ap);
+    uint32_t duration = uint32_t((r->cov_end_us - now_us) / IWX_AWDL_TU_US);
+    if (r->cap_tu && duration > r->cap_tu)
+        duration = r->cap_tu;
+    if (!duration || chan < 36 || chan > 177 || chan == ap) {
+        ++r->chain_skips;
+        return;
+    }
+    r->last_add_src = 2;
+    if (!that->iwx_awdl_roc_add(sc, chan, duration, IWX_AWDL_ROC_DELAY_TU, false, now_us))
+        ++r->chain_adds;
+}
+
+/*
+ * 1.2.4: the early ROC, on the work loop: IWX_AWDL_ROC_PRE_LEAD_US before the next slot, which starts a 149 run, an ROC
+ * to the end of that run, under the same rules as the tick (no ROC pending, guards, readiness).
+ */
+void ItlIwx::iwx_awdl_roc_pre(void *arg)
+{
+    auto sc = static_cast<iwx_softc *>(arg);
+    auto that = container_of(sc, ItlIwx, com);
+    auto r = &sc->sc_awdl_probe.roc;
+    if (!r->pre_armed)
+        return;
+    r->pre_armed = 0;
+    uint64_t ns = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+    const uint64_t now_us = ns / 1000;
+    if (r->pending || r->active || !r->sta_added || r->qid <= 0 || r->setup_failed || iwx_awdl_roc_mode(r->want) < 4 ||
+        iwx_awdl_roc_mode(r->want) != r->mode || iwx_awdl_roc_activity(r->want) != r->activity ||
+        !iwx_awdl_roc_ready(sc) || sc->sc_awdl_probe.ctx.phy2_moving || now_us >= r->pre_boundary_us ||
+        iwx_awdl_roc_readd_wait(now_us, r->last_end_us, IWX_AWDL_ROC_READD_US) ||
+        iwx_awdl_roc_bmiss_paused(now_us, r->bmiss_until_us)) {
+        ++r->pre_skips;
+        return;
+    }
+    const uint64_t end_us = r->pre_boundary_us + uint64_t(r->pre_slots) * IWX_AWDL_ROC_SLOT_US;
+    uint32_t duration = uint32_t((end_us - now_us) / IWX_AWDL_TU_US);
+    if (r->cap_tu && duration > r->cap_tu)
+        duration = r->cap_tu;
+    r->last_add_src = 4;
+    if (!that->iwx_awdl_roc_add(sc, r->pre_chan, duration, IWX_AWDL_ROC_DELAY_TU, false, now_us)) {
+        ++r->pre_adds;
+        r->aw_start_us = r->pre_boundary_us;
+        r->cov_end_us = end_us;
+    }
+}
+
+/*
+ * 1.2.3: the ROC's millisecond timer, on the work loop: the delayed release after a start, and a doorbell for the AUX
+ * ring while the ROC runs (iwx_awdl_roc_kick_due). It re-arms itself until the ROC ends.
+ */
+void ItlIwx::iwx_awdl_roc_kick(void *arg)
+{
+    auto sc = static_cast<iwx_softc *>(arg);
+    auto that = container_of(sc, ItlIwx, com);
+    auto r = &sc->sc_awdl_probe.roc;
+    if (!r->kick_armed || !r->active || !r->sta_added || r->qid <= 0 ||
+        (sc->sc_flags & (IWX_FLAG_SHUTDOWN | IWX_FLAG_HW_ERR | IWX_FLAG_TXFLUSH))) {
+        r->kick_armed = 0;
+        return;
+    }
+    ++r->kick_ticks;
+    uint64_t now = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+    if (r->hold_n && !r->flushing && now / 1000 >= r->release_at_us) {
+        const uint32_t before = r->released;
+        that->iwx_awdl_roc_flush(sc);
+        if (r->released != before)
+            ++r->kick_releases;
+    }
+    struct iwx_tx_ring *ring = &sc->txq[r->qid];
+    if (iwx_awdl_roc_kick_due(uint32_t(ring->queued), uint32_t(ring->tail), r->kick_tail, r->active)) {
+        IWX_WRITE(sc, IWX_HBUS_TARG_WRPTR, ring->qid << 16 | ring->cur);
+        ++r->kicks;
+    }
+    r->kick_tail = uint32_t(ring->tail);
+    timeout_add_msec(&sc->awdl_roc_kick_to, IWX_AWDL_ROC_KICK_MS);
+}
+
+/* 1.2.1: an ROC is on 149 before the phone's run: sleep on the task thread until it starts, then flush in the gate. */
+void ItlIwx::iwx_awdl_roc_peer_task(void *arg)
+{
+    auto sc = static_cast<iwx_softc *>(arg);
+    auto that = container_of(sc, ItlIwx, com);
+    if (!that->getMainWorkLoop()->inGate()) {
+        uint64_t ns = 0;
+        absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+        const uint64_t start = sc->sc_awdl_probe.roc.peer_start_us;
+        if (start > ns / 1000) {
+            const uint64_t wait = start - ns / 1000;
+            IOSleep(uint32_t((wait < IWX_AWDL_ROC_PEER_WAIT_MAX_US ? wait : IWX_AWDL_ROC_PEER_WAIT_MAX_US) / 1000 + 1));
+        }
+        that->getMainCommandGate()->runAction(
+            [](OSObject *, void *arg0, void *, void *, void *) -> IOReturn {
+                iwx_awdl_roc_peer_task(arg0); return kIOReturnSuccess;
+            }, arg);
+        return;
+    }
+    auto r = &sc->sc_awdl_probe.roc;
+    if (r->hold_n && r->active && !r->flushing) {
+        ++r->flush_direct;
+        that->iwx_awdl_roc_flush(sc);
+    }
 }
 
 void ItlIwx::iwx_awdl_roc_publish(struct iwx_softc *sc)
 {
+    /* 1.2.1: the phone's (reference peer's) sequence, for the test tool to set beside the family's. */
+    if (sc->sc_awdl_probe.sync.seq_valid)
+        sc->sc_pcitag->setProperty("ItlwmAwdlRefSeq", (void *)sc->sc_awdl_probe.sync.seq, sizeof(sc->sc_awdl_probe.sync.seq));
+    /* 1.2.13: the data peer's own sequence, and how often it was heard. */
+    if (sc->sc_awdl_probe.sync.dest_seq_valid)
+        sc->sc_pcitag->setProperty("ItlwmAwdlDestSeq", (void *)sc->sc_awdl_probe.sync.dest_seq, sizeof(sc->sc_awdl_probe.sync.dest_seq));
+    sc->sc_pcitag->setProperty("ItlwmAwdlDestSeqUpdates", sc->sc_awdl_probe.sync.dest_updates, 32);
+    /* 1.2.14: which peer unicast data goes to, so the tool can tell the iPad's phases from the iPhone's. */
+    if (sc->sc_awdl_probe.tx.last_dest_valid)
+        sc->sc_pcitag->setProperty("ItlwmAwdlDestPeer", (void *)sc->sc_awdl_probe.tx.last_dest, 6);
     auto r = &sc->sc_awdl_probe.roc;
     auto nub = sc->sc_pcitag;
     nub->setProperty("ItlwmAwdlRocMode", r->sta_added ? r->mode | (r->activity << 4) : 0, 32);
@@ -6684,6 +7309,7 @@ void ItlIwx::iwx_awdl_roc_publish(struct iwx_softc *sc)
     /* 1.1.91: why AUX frames fail, and when ROCs really ran. */
     const struct { const char *key; uint32_t value; } txs[] = {
         {"ItlwmAwdlRocTxOkUcast", r->txs.ok_ucast}, {"ItlwmAwdlRocTxFailUcast", r->txs.fail_ucast},
+        {"ItlwmAwdlRocTxOkUcastData", r->txs.ok_ucast_data}, {"ItlwmAwdlRocTxFailUcastData", r->txs.fail_ucast_data},
         {"ItlwmAwdlRocTxOkMcast", r->txs.ok_mcast}, {"ItlwmAwdlRocTxFailMcast", r->txs.fail_mcast},
         {"ItlwmAwdlRocTxFailIn", r->txs.fail_in}, {"ItlwmAwdlRocTxFailOut", r->txs.fail_out},
         {"ItlwmAwdlRocTxOkHere", r->txs.ok_here}, {"ItlwmAwdlRocTxOkAway", r->txs.ok_away},
@@ -6692,6 +7318,37 @@ void ItlIwx::iwx_awdl_roc_publish(struct iwx_softc *sc)
         {"ItlwmAwdlRocTxFailTries", r->txs.fail_tries}, {"ItlwmAwdlRocTxOkTries", r->txs.ok_tries},
         {"ItlwmAwdlRocLateN", r->late_n}, {"ItlwmAwdlRocLateSumMs", r->late_sum_ms}, {"ItlwmAwdlRocLateMaxUs", r->late_max_us},
         {"ItlwmAwdlRocOnN", r->on_n}, {"ItlwmAwdlRocOnSumMs", r->on_sum_ms},
+        /* 1.1.96: covered time, requests, chain, the gap between chained ROCs, dwell against request, caps. */
+        {"ItlwmAwdlRocCovSumMs", r->cov_sum_ms}, {"ItlwmAwdlRocReqSumMs", r->req_sum_ms},
+        {"ItlwmAwdlRocChainAdds", r->chain_adds}, {"ItlwmAwdlRocChainSkips", r->chain_skips},
+        {"ItlwmAwdlRocChainGapN", r->chain_gap_n}, {"ItlwmAwdlRocChainGapSumMs", r->chain_gap_sum_ms},
+        {"ItlwmAwdlRocWideAdds", r->wide_adds}, {"ItlwmAwdlRocCapTu", r->cap_tu}, {"ItlwmAwdlRocAnnounce", r->announce_on},
+        {"ItlwmAwdlRocDwell25", r->dwell_hist[0]}, {"ItlwmAwdlRocDwell50", r->dwell_hist[1]},
+        {"ItlwmAwdlRocDwell75", r->dwell_hist[2]}, {"ItlwmAwdlRocDwellFull", r->dwell_hist[3]},
+        {"ItlwmAwdlRocReaddWaits", r->readd_waits}, {"ItlwmAwdlRocReaddMinUs", r->readd_min_us},
+        {"ItlwmAwdlRocRequeued", r->requeued}, {"ItlwmAwdlRocRequeueDrop", r->requeue_drop},
+        {"ItlwmAwdlRocRequeuedIn", r->requeued_in},
+        {"ItlwmAwdlRocHoldOrder", r->hold_order}, {"ItlwmAwdlRocHoldRing", r->hold_ring},
+        {"ItlwmAwdlRocHoldStalls", r->hold_stalls}, {"ItlwmAwdlRocHoldKicks", r->hold_kicks},
+        {"ItlwmAwdlRocHoldPeak", r->hold_peak},
+        {"ItlwmAwdlRocFlushDirect", r->flush_direct}, {"ItlwmAwdlRocAirN", r->air_n},
+        {"ItlwmAwdlRocAirMs", uint32_t(((uint64_t(r->air_us_hi) << 32) | r->air_us_lo) / 1000)},
+        {"ItlwmAwdlRocLastRate", r->last_rate}, {"ItlwmAwdlRocSentPerRocMax", r->sent_per_roc_max},
+        {"ItlwmAwdlRocPeerTicks", r->peer_ticks}, {"ItlwmAwdlRocPeerIdleTicks", r->peer_idle_ticks},
+        {"ItlwmAwdlRocPeerK", r->peer_k}, {"ItlwmAwdlRocPeerLagN", r->peer_lag_n},
+        {"ItlwmAwdlRocPeerLagAbsMs", r->peer_lag_abs_ms}, {"ItlwmAwdlRocPeerLagUs", uint32_t(r->peer_lag_us + 1000000)},
+        {"ItlwmAwdlRocPeerWaits", r->peer_waits},
+        {"ItlwmAwdlRocFlushStopRing", r->flush_stop_ring}, {"ItlwmAwdlRocFlushStopRule", r->flush_stop_rule},
+        {"ItlwmAwdlRocOffAux", r->off_aux}, {"ItlwmAwdlRocFailPauses", r->fail_pauses},
+        {"ItlwmAwdlRocTid", r->tid}, {"ItlwmAwdlRocAmsduStuck", r->amsdu_stuck}, {"ItlwmAwdlRocDestTicks", r->dest_ticks},
+        {"ItlwmAwdlRocRateStep", uint32_t(r->rate_step + 10)}, {"ItlwmAwdlRocRateUps", r->rate_ups},
+        {"ItlwmAwdlRocRateDowns", r->rate_downs},
+        {"ItlwmAwdlRocUnionTicks", r->union_ticks}, {"ItlwmAwdlRocUnionSlots", r->union_slots},
+        {"ItlwmAwdlRocGateTicks", r->gate_ticks}, {"ItlwmAwdlRocGateWaits", r->gate_waits},
+        {"ItlwmAwdlRocPreArms", r->pre_arms}, {"ItlwmAwdlRocPreAdds", r->pre_adds}, {"ItlwmAwdlRocPreSkips", r->pre_skips},
+        {"ItlwmAwdlRocPreOnTime", r->pre_on_time}, {"ItlwmAwdlRocPreLate", r->pre_late},
+        {"ItlwmAwdlRocKicks", r->kicks}, {"ItlwmAwdlRocKickTicks", r->kick_ticks}, {"ItlwmAwdlRocKickReleases", r->kick_releases},
+        {"ItlwmAwdlRocBmissPauses", r->bmiss_pauses}, {"ItlwmAwdlRocBmissSkips", r->bmiss_skips}, {"ItlwmAwdlRocBmissLast", r->bmiss_last},
     };
     for (const auto &e : txs)
         nub->setProperty(e.key, e.value, 32);
@@ -6702,6 +7359,54 @@ void ItlIwx::iwx_awdl_roc_publish(struct iwx_softc *sc)
     };
     for (const auto &e : hold)
         nub->setProperty(e.key, e.value, 32);
+}
+
+/*
+ * 1.1.98: before a requeued frame leaves the ring, put back the 802.11 header iwx_tx trimmed into the TX command. The
+ * trim left that room in front of the first mbuf; without it, or on an older TX command layout, the frame is freed.
+ */
+void ItlIwx::iwx_awdl_roc_requeue_prep(struct iwx_softc *sc, struct iwx_tx_ring *ring, int idx)
+{
+    struct iwx_tx_data *txd = &ring->data[idx];
+    const uint32_t hdrlen = txd->awdl_hdrlen;
+    auto r = &sc->sc_awdl_probe.roc;
+    if (sc->sc_device_family < IWX_DEVICE_FAMILY_AX210 || !txd->m || hdrlen < sizeof(struct ieee80211_frame) ||
+        hdrlen > 40 || mbuf_leadingspace(txd->m) < hdrlen) {
+        txd->awdl_requeue = 0;
+        ++r->requeue_drop;
+        return;
+    }
+    const uint8_t *wh = reinterpret_cast<const uint8_t *>(ring->cmd[idx].data) + sizeof(struct iwx_tx_cmd_gen3);
+    mbuf_t m = txd->m;
+    if (mbuf_prepend(&m, hdrlen, MBUF_DONTWAIT) || m != txd->m) {
+        /* Not expected with the room checked; keep the ring's mbuf whatever happened and free it as usual. */
+        if (m && m != txd->m)
+            txd->m = m;
+        txd->awdl_requeue = 0;
+        ++r->requeue_drop;
+        return;
+    }
+    memcpy(mbuf_data(m), wh, hdrlen);
+}
+
+/* 1.1.98: from iwx_txd_done, the frame and its node reference go to the hold's tail instead of being freed. */
+bool ItlIwx::iwx_awdl_roc_requeue_take(struct iwx_softc *sc, struct iwx_tx_data *txd)
+{
+    auto r = &sc->sc_awdl_probe.roc;
+    if (r->mode < 4 || !r->sta_added || r->qid <= 0 || r->hold_n >= IWX_AWDL_ROC_HOLD_MAX ||
+        (sc->sc_flags & (IWX_FLAG_SHUTDOWN | IWX_FLAG_HW_ERR | IWX_FLAG_TXFLUSH))) {
+        ++r->requeue_drop;
+        return false;
+    }
+    uint64_t now = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+    /* 1.1.99: in front of newer frames, after the ones this ROC's end already gave back, so TCP sees them in order. */
+    iwx_awdl_roc_hold_insert(r, r->rq_batch, txd->m, &txd->in->in_ni, now / 1000, uint8_t(txd->awdl_rq + 1));
+    ++r->rq_batch;
+    ++r->requeued;
+    if (txd->awdl_requeue == 2)
+        ++r->requeued_in;
+    return true;
 }
 
 /* The oldest held frame: freed with its node reference when drop, otherwise handed back through the out arguments. */
@@ -6733,6 +7438,8 @@ void ItlIwx::iwx_awdl_roc_hold_clear(struct iwx_softc *sc)
         iwx_awdl_roc_hold_pop(sc, true);
         ++r->hold_freed;
     }
+    r->rq_batch = 0;
+    iwx_awdl_roc_wake(sc);
 }
 
 /* Under the gate, at an ROC's start and at each slot tick: send held frames while the ROC has time left. */
@@ -6747,6 +7454,16 @@ void ItlIwx::iwx_awdl_roc_flush_task(void *arg)
             }, arg);
         return;
     }
+    that->iwx_awdl_roc_flush(sc);
+}
+
+/*
+ * 1.2.0: the flush itself, under the gate. Also called straight from a completion on the AUX ring and from the ROC
+ * start: at 23:17 an ROC with frames waiting sent about one frame per ms, refilled through the task queue.
+ */
+void ItlIwx::iwx_awdl_roc_flush(struct iwx_softc *sc)
+{
+    auto that = this;
     auto r = &sc->sc_awdl_probe.roc;
     while (r->hold_n) {
         uint64_t now = 0;
@@ -6756,12 +7473,29 @@ void ItlIwx::iwx_awdl_roc_flush_task(void *arg)
             ++r->hold_expired;
             continue;
         }
-        if (!r->sta_added || r->qid <= 0 || (sc->sc_flags & (IWX_FLAG_SHUTDOWN | IWX_FLAG_HW_ERR | IWX_FLAG_TXFLUSH)) ||
-            iwx_awdl_roc_hold(r->mode, r->active, r->started_us, r->dur_tu, now / 1000) ||
-            sc->txq[r->qid].queued >= IWX_AWDL_TX_MAX_QUEUED)
+        if (!r->sta_added || r->qid <= 0 || (sc->sc_flags & (IWX_FLAG_SHUTDOWN | IWX_FLAG_HW_ERR | IWX_FLAG_TXFLUSH)))
             break;
+        if (iwx_awdl_roc_hold(r->mode, r->active, r->started_us, r->dur_tu, now / 1000) ||
+            iwx_awdl_roc_peer_wait(r, now / 1000) || (r->active && now / 1000 < r->release_at_us)) {
+            ++r->flush_stop_rule;
+            break;
+        }
+        /* 1.2.19: a unicast frame to sparse peers waits for a slot where one of them is on 149. */
+        {
+            mbuf_t hm = static_cast<mbuf_t>(r->hold_m[r->hold_head]);
+            const uint8_t *a1 = hm && mbuf_len(hm) >= 10 ? static_cast<const uint8_t *>(mbuf_data(hm)) + 4 : nullptr;
+            if (iwx_awdl_roc_gate_check(&sc->sc_awdl_probe, a1, now / 1000)) {
+                ++r->gate_waits;
+                break;
+            }
+        }
+        if (sc->txq[r->qid].queued >= iwx_awdl_roc_ring_cap(r->active)) {
+            ++r->flush_stop_ring;
+            break;
+        }
         mbuf_t m = NULL;
         struct ieee80211_node *ni = NULL;
+        r->flush_rq = r->hold_rq[r->hold_head];
         that->iwx_awdl_roc_hold_pop(sc, false, &m, &ni);
         r->flushing = 1;
         const int err = that->iwx_tx(sc, m, ni, EDCA_AC_BE);
@@ -6771,6 +7505,21 @@ void ItlIwx::iwx_awdl_roc_flush_task(void *arg)
         else
             ++r->released;
     }
+    that->iwx_awdl_roc_wake(sc);
+}
+
+/* 1.1.99: the family's queue waited on a high hold (iwx_awdl_data_gate); wake it once the hold is low again. */
+void ItlIwx::iwx_awdl_roc_wake(struct iwx_softc *sc)
+{
+    auto p = &sc->sc_awdl_probe;
+    if (!p->roc.hold_stall_wait || p->roc.hold_n > IWX_AWDL_ROC_HOLD_LOW)
+        return;
+    p->roc.hold_stall_wait = 0;
+    ++p->roc.hold_kicks;
+    p->tx.data_stalled = 0;
+    ++p->tx.data_kicks;
+    if (auto *controller = OSDynamicCast(AirportItlwm, getController()))
+        controller->awdlTxRoom();
 }
 
 /*
@@ -6928,6 +7677,7 @@ iwx_awdl_ctx_remove(struct iwx_softc *sc)
         }
         const uint32_t peers = p->peer_added;
         p->peer_added = p->peer_count = 0;
+        p->peer_tlc = 0;
         p->peer_replace = 0;
         p->cache_add_wait = p->cache_del_wait = 0;
         for (uint32_t i = peers; i-- > 0;) {
@@ -7047,6 +7797,7 @@ void ItlIwx::iwx_awdl_peer_task(void *arg)
         const int generation = sc->sc_generation;
         const uint8_t sta = uint8_t(IWX_AWDL_PEER_STA_FIRST + v);
         auto c = &p->ctx;
+        p->peer_tlc = uint8_t(p->peer_tlc & ~(1u << v));
         if (c->own_qid > 0 && c->own_sta == sta) {
             that->iwx_awdl_own_release(sc);
             if (generation != sc->sc_generation)
@@ -9401,11 +10152,38 @@ iwx_rx_tx_cmd_single(struct iwx_softc *sc, struct iwx_rx_packet *pkt,
         iwx_awdl_roc_note_tx(&sc->sc_awdl_probe.roc, txd->awdl_kind != 1, status == IWX_TX_STATUS_SUCCESS,
             static_cast<uint32_t>(status), tx_resp->failure_frame, sc->sc_awdl_probe.roc.active,
             iwx_awdl_peer_slot_chan(&sc->sc_awdl_probe, now / 1000));
+        /* 1.2.8: the AUX path's own rate step; ROC-end failures do not count. */
+        if (txd->awdl_kind != 1)
+            iwx_awdl_roc_rate_note(&sc->sc_awdl_probe.roc, status == IWX_TX_STATUS_SUCCESS, sc->sc_awdl_probe.roc.active,
+                                   (sc->sc_awdl_probe.roc.want & IWX_AWDL_ROC_F_80MHZ) ? IWX_AWDL_RATE_TOP_STEP : -1);
+        /*
+         * 1.1.98: dropped at the ROC's end, not refused by the phone: back to the hold (iwx_awdl_roc_requeue_prep).
+         * 1.2.17: missed by the peer while the ROC ran: one more turn too (2 marks it, for RocRequeuedIn).
+         */
+        if (txd->awdl_kind == 2 && txd->m && txd->in &&
+            iwx_awdl_roc_requeue_ok(sc->sc_awdl_probe.roc.mode, sc->sc_awdl_probe.roc.active,
+                                    status == IWX_TX_STATUS_SUCCESS, tx_resp->failure_frame, txd->awdl_rq))
+            txd->awdl_requeue = sc->sc_awdl_probe.roc.active ? 2 : 1;
+        /* 1.1.95: whether the AUX station sends data at all, or only management frames as in Linux P2P. */
+        if (txd->awdl_kind != 1 && txd->type == IEEE80211_FC0_TYPE_DATA)
+            ++*(status == IWX_TX_STATUS_SUCCESS ? &sc->sc_awdl_probe.roc.txs.ok_ucast_data :
+                &sc->sc_awdl_probe.roc.txs.fail_ucast_data);
+        /* 1.2.0: air time and rate of AUX unicast data, to tell a slow radio from a slow refill. */
+        if (txd->awdl_kind != 1 && txd->type == IEEE80211_FC0_TYPE_DATA && status == IWX_TX_STATUS_SUCCESS) {
+            auto r = &sc->sc_awdl_probe.roc;
+            ++r->air_n;
+            const uint32_t lo = r->air_us_lo + le16toh(tx_resp->wireless_media_time);
+            if (lo < r->air_us_lo)
+                ++r->air_us_hi;
+            r->air_us_lo = lo;
+            r->last_rate = le32toh(tx_resp->initial_rate);
+        }
+        /* 1.1.96: a completion frees ring room. 1.2.0: the caller refills it at once (iwx_awdl_roc_flush). */
     }
     if (txd->awdl_kind) {
         iwx_awdl_tx_note_presence(sc);
         iwx_awdl_tx_note_done(&sc->sc_awdl_probe, txd->awdl_kind != 1, status == IWX_TX_STATUS_SUCCESS,
-                              static_cast<uint32_t>(status), tx_resp->failure_frame);
+                              static_cast<uint32_t>(status), tx_resp->failure_frame, !txd->awdl_roc);
         if (txd->awdl_kind == 3) {
             if (status == IWX_TX_STATUS_SUCCESS) ++sc->sc_awdl_probe.ctx.own_ok;
             else ++sc->sc_awdl_probe.ctx.own_fail;
@@ -9465,6 +10243,16 @@ iwx_txd_done(struct iwx_softc *sc, struct iwx_tx_data *txd)
     //    bus_dmamap_sync(sc->sc_dmat, txd->map, 0, txd->map->dm_mapsize,
     //        BUS_DMASYNC_POSTWRITE);
     //    bus_dmamap_unload(sc->sc_dmat, txd->map);
+#ifdef AIRPORT_WCL
+    if (txd->awdl_requeue && iwx_awdl_roc_requeue_take(sc, txd)) {
+        txd->m = NULL;
+        txd->in = NULL;
+        txd->wcl_rsn_kind = txd->wcl_rsn_cookie = 0;
+        txd->awdl_kind = txd->awdl_phy2q = txd->awdl_roc = txd->awdl_umi = txd->awdl_requeue = 0;
+        return;
+    }
+    txd->awdl_requeue = 0;
+#endif
     mbuf_freem(txd->m);
     txd->m = NULL;
 #ifdef AIRPORT_WCL
@@ -9707,9 +10495,21 @@ iwx_rx_tx_cmd(struct iwx_softc *sc, struct iwx_rx_packet *pkt,
         }
         txd = &ring->data[(idx + ring->ring_count - 1) % ring->ring_count];
         iwx_rx_tx_cmd_single(sc, pkt, txd);
+#ifdef AIRPORT_WCL
+        if (txd->awdl_requeue)
+            iwx_awdl_roc_requeue_prep(sc, ring, (idx + ring->ring_count - 1) % ring->ring_count);
+#endif
         DPRINTFN(3, ("%s tid=%d ssn=%d idx=%d\n", __FUNCTION__, tid, ssn, idx));
         iwx_ampdu_txq_advance(sc, ring, idx);
         iwx_clear_oactive(sc, ring);
+#ifdef AIRPORT_WCL
+        /* 1.2.0: the AUX ring has room again: refill it now, in the gate, not through the task queue. */
+        if (qid == sc->sc_awdl_probe.roc.qid && sc->sc_awdl_probe.roc.qid > 0 && sc->sc_awdl_probe.roc.hold_n &&
+            !sc->sc_awdl_probe.roc.flushing) {
+            ++sc->sc_awdl_probe.roc.flush_direct;
+            iwx_awdl_roc_flush(sc);
+        }
+#endif
     }
 }
 
@@ -9728,12 +10528,30 @@ iwx_rx_bmiss(struct iwx_softc *sc, struct iwx_rx_packet *pkt,
     /* The AWDL context has no AP: its beacons say nothing about the real one. */
     if (sc->sc_awdl_probe.ctx.mode && le32toh(mbn->mac_id) == IWX_AWDL_MAC_ID)
         return;
+    /* 1.2.24: the router's PHY is on the AWDL channel on purpose; its beacons come back with it. */
+    if (sc->sc_awdl_probe.pause.tuned) {
+        ++sc->sc_awdl_probe.pause.ignored_bmiss;
+        return;
+    }
 #endif
     
     //    bus_dmamap_sync(sc->sc_dmat, data->map, sizeof(*pkt),
     //        sizeof(*mbn), BUS_DMASYNC_POSTREAD);
     
     missed = le32toh(mbn->consec_missed_beacons_since_last_rx);
+#ifdef AIRPORT_WCL
+    /* 1.2.3: the AP link is losing beacons beyond what one ROC costs: no new ROC for a while. */
+    {
+        auto r = &sc->sc_awdl_probe.roc;
+        r->bmiss_last = missed;
+        if (missed >= IWX_AWDL_ROC_BMISS_MAX && r->sta_added) {
+            uint64_t ns = 0;
+            absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+            r->bmiss_until_us = ns / 1000 + IWX_AWDL_ROC_BMISS_PAUSE_US;
+            ++r->bmiss_pauses;
+        }
+    }
+#endif
     if (missed > ic->ic_bmissthres && ic->ic_mgt_timer == 0) {
         if (ic->ic_if.if_flags & IFF_DEBUG) {
             XYLog("%s: receiving no beacons from %s; checking if "
@@ -9830,7 +10648,9 @@ iwx_get_channel_width(struct ieee80211com *ic, struct ieee80211_channel *c)
      * 145 = that block's lowest channel) at PHY_CONTEXT_CMD, 2026-11-12 07:47 and 08:27, ROC off the second time.
      * Without an AP (solo) the same context was 20 MHz and worked.
      */
-    if (c != NULL && !iwx_phy_takes_ap_width(ieee80211_chan2ieee(ic, c), ieee80211_chan2ieee(ic, ic->ic_bss->ni_chan)))
+    const bool pauseWide = c != NULL && iwx_pause_wide_chan && ieee80211_chan2ieee(ic, c) == iwx_pause_wide_chan;
+    if (c != NULL && !pauseWide &&
+        !iwx_phy_takes_ap_width(ieee80211_chan2ieee(ic, c), ieee80211_chan2ieee(ic, ic->ic_bss->ni_chan)))
         return ret;
     switch (ic->ic_bss->ni_chw) {
         case IEEE80211_CHAN_WIDTH_20_NOHT:
@@ -9853,6 +10673,13 @@ iwx_get_ctrl_pos(struct ieee80211com *ic, struct ieee80211_channel *c)
 {
     if (ic->ic_bss == NULL || ic->ic_state < IEEE80211_S_ASSOC || iwx_get_channel_width(ic, c) == IWX_PHY_VHT_CHANNEL_MODE20)
         return IWX_PHY_VHT_CTRL_POS_1_BELOW;
+    /* 1.2.25: a paused router's PHY on the AWDL channel: that channel's own block, not the router's centre. */
+    if (c != NULL && iwx_pause_wide_chan && ieee80211_chan2ieee(ic, c) == iwx_pause_wide_chan) {
+        const uint32_t ch = ieee80211_chan2ieee(ic, c);
+        if (iwx_get_channel_width(ic, c) == IWX_PHY_VHT_CHANNEL_MODE80)
+            return iwx_awdl_ctrl_pos80(ch);
+        return iwx_awdl_lower40(ch) ? IWX_PHY_VHT_CTRL_POS_1_BELOW : IWX_PHY_VHT_CTRL_POS_1_ABOVE;
+    }
 
     signed int offset = ic->ic_bss->ni_chan->ic_freq - ic->ic_bss->ni_chan->ic_center_freq1;
     switch (offset) {
@@ -10528,10 +11355,14 @@ iwx_tx_fill_cmd(struct iwx_softc *sc, struct iwx_node *in,
         !memcmp(wh->i_addr3, iwx_awdl_bssid, 6)) {
         const uint8_t version = iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_TX_CMD);
         const uint8_t valid = iwx_fw_valid_tx_ant(sc);
-        int32_t rate = iwx_awdl_data_rate(sc->sc_awdl_probe.tx.rate_step);
-        /* This link shares the AP's PHY context, so no wider than that. */
-        if (rate >= 0 && (rate & IWX_AWDL_RATE_80MHZ) &&
-            ni->ni_chw != IEEE80211_CHAN_WIDTH_80 && ni->ni_chw != IEEE80211_CHAN_WIDTH_160)
+        /* 1.2.8: AUX frames at the AUX path's own step. */
+        int32_t rate = iwx_awdl_data_rate(awdlRoc ? sc->sc_awdl_probe.roc.rate_step : sc->sc_awdl_probe.tx.rate_step);
+        /* No wider than the PHY the frame leaves on: the AP's, or 20 MHz for an ROC and for link 1 on 149 (1.1.95). */
+        /* 1.1.96: an ROC frame leaves at the ROC's width, 80 MHz only with that probe switched on. */
+        const bool roc80 = awdlRoc && (sc->sc_awdl_probe.roc.want & IWX_AWDL_ROC_F_80MHZ);
+        if (!iwx_awdl_rate_fits(rate, awdlRoc ? roc80 :
+                                ni->ni_chw == IEEE80211_CHAN_WIDTH_80 || ni->ni_chw == IEEE80211_CHAN_WIDTH_160,
+                                false, !awdlRoc && sc->sc_awdl_probe.ctx.phy2_chan != 0))
             rate = iwx_awdl_data_rate(-1);
         if (rate >= 0 && (rate & IWX_RATE_MCS_NSS_MSK) && (valid & 3) != 3)
             rate &= ~IWX_RATE_MCS_NSS_MSK;
@@ -10729,6 +11560,12 @@ iwx_tx(struct iwx_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)
         }
         qid = sc->sc_awdl_probe.ctx.qid;
     }
+    /* 1.2.24: internet paused, the router's PHY is on the AWDL channel. */
+    if (iwx_awdl_pause_drops(&sc->sc_awdl_probe.pause, awdlKind != 0, type == IEEE80211_FC0_TYPE_DATA)) {
+        ++sc->sc_awdl_probe.pause.drops;
+        mbuf_freem(m);
+        return ENOBUFS;
+    }
     bool awdlPhy2q = false;
     {
         /* Mode 6: while link 1 is on the second channel, its AWDL frames leave there, not on the AP's queue. */
@@ -10754,8 +11591,14 @@ iwx_tx(struct iwx_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)
             /* 1.1.92, mode 4: a unicast frame waits in the host for an ROC with time left (iwx_awdl_roc_hold). */
             uint64_t holdNow = 0;
             absolutetime_to_nanoseconds(mach_absolute_time(), &holdNow);
-            if (awdlKind == 2 && !r->flushing &&
-                iwx_awdl_roc_hold(r->mode, r->active, r->started_us, r->dur_tu, holdNow / 1000)) {
+            bool awdlGate = false;
+            const uint32_t why = awdlKind == 2 && !r->flushing ?
+                iwx_awdl_roc_hold_why(iwx_awdl_roc_hold(r->mode, r->active, r->started_us, r->dur_tu, holdNow / 1000) ||
+                                      iwx_awdl_roc_peer_wait(r, holdNow / 1000) ||
+                                      /* 1.2.19: outside a sparse peer's slot (iwx_awdl_roc_gate_wait). */
+                                      (awdlGate = iwx_awdl_roc_gate_check(&sc->sc_awdl_probe, wh->i_addr1, holdNow / 1000)),
+                                      r->mode, r->hold_n, sc->txq[r->qid].queued >= iwx_awdl_roc_ring_cap(r->active)) : 0;
+            if (why) {
                 if (r->hold_n == IWX_AWDL_ROC_HOLD_MAX) {
                     iwx_awdl_roc_hold_pop(sc, true);
                     ++r->hold_full;
@@ -10764,11 +11607,23 @@ iwx_tx(struct iwx_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)
                 r->hold_m[slot] = m;
                 r->hold_ni[slot] = ni;
                 r->hold_us[slot] = holdNow / 1000;
+                r->hold_rq[slot] = 0;
                 ++r->hold_n;
                 ++r->held;
+                if (awdlGate)
+                    ++r->gate_ticks; /* 1.2.19: held by the sparse-peer gate */
+                if (r->hold_n > r->hold_peak)
+                    r->hold_peak = r->hold_n;
+                /* 1.1.99: behind held frames or a full ring, inside an ROC: the flush sends it as room comes. */
+                if (why == 2)
+                    ++r->hold_order;
+                else if (why == 3)
+                    ++r->hold_ring;
+                if (why != 1)
+                    iwx_add_task(sc, systq, &sc->awdl_roc_flush_task);
                 return 0;
             }
-            if (sc->txq[r->qid].queued >= IWX_AWDL_TX_MAX_QUEUED) {
+            if (sc->txq[r->qid].queued >= iwx_awdl_roc_ring_cap(r->active) + (awdlKind == 1 ? IWX_AWDL_ROC_MCAST_EXTRA : 0)) {
                 ++r->tx_drop;
                 mbuf_freem(m);
                 return ENOBUFS;
@@ -10780,6 +11635,7 @@ iwx_tx(struct iwx_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)
             qid = r->qid;
             awdlRoc = true;
             ++r->tx_sent;
+            ++r->sent_this_roc;
         }
     }
     /* Only the A-MSDU path builds QoS AWDL data. It stays on this queue, away from the AP's block ack. */
@@ -10805,7 +11661,8 @@ iwx_tx(struct iwx_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)
 
     /* Put QoS frames on the data queue which maps to their TID. */
 #ifdef AIRPORT_WCL
-    if (ieee80211_has_qos(wh) && awdlKind != 4 && awdlKind != 3) {
+    /* 1.2.5: never a frame already routed to the AUX station: it would leave on the router's channel. */
+    if (ieee80211_has_qos(wh) && awdlKind != 4 && awdlKind != 3 && !awdlRoc) {
 #else
     if (ieee80211_has_qos(wh)) {
 #endif
@@ -10855,6 +11712,11 @@ iwx_tx(struct iwx_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)
         }
     }
 
+#ifdef AIRPORT_WCL
+    /* 1.2.5: an AUX frame that something moved to another queue after all (should stay 0). */
+    if (awdlRoc && qid != sc->sc_awdl_probe.roc.qid)
+        ++sc->sc_awdl_probe.roc.off_aux;
+#endif
 #ifdef AIRPORT_VTD
     if (dmaDetaching || qid < 0 || qid >= nitems(sc->txq)) {
         mbuf_freem(m);
@@ -10989,6 +11851,9 @@ iwx_tx(struct iwx_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)
     data->awdl_phy2q = awdlPhy2q;
     data->awdl_roc = awdlRoc;
     data->awdl_umi = 0;
+    data->awdl_hdrlen = uint8_t(hdrlen);
+    data->awdl_rq = awdlRoc && sc->sc_awdl_probe.roc.flushing ? sc->sc_awdl_probe.roc.flush_rq : 0;
+    data->awdl_requeue = 0;
     if (awdlKind == 2 && type == IEEE80211_FC0_TYPE_MGT && sc->sc_awdl_probe.umi_seq_valid &&
         !memcmp(wh->i_addr1, sc->sc_awdl_probe.umi_seq_peer, 6) &&
         le16toh(*reinterpret_cast<const uint16_t *>(wh->i_seq)) == sc->sc_awdl_probe.umi_seq) {
@@ -13566,10 +14431,24 @@ iwx_awdl_peer_agg(struct iwx_softc *sc, uint32_t index)
         c->own_agg_err = uint32_t(err < 0 ? -err : err);
         return err;
     }
-    if (iwx_lookup_cmd_ver(sc, IWX_DATA_PATH_GROUP, IWX_TLC_MNG_CONFIG_CMD) != 4) {
-        c->own_tlc_err = 0xffff;
+    /* 1.1.94: 20 MHz as soon as a move onto the second channel is wanted, so a build during the move fits both PHYs. */
+    err = iwx_awdl_peer_tlc(sc, index, (c->phy2_chan || c->phy2_want) ? IEEE80211_CHAN_WIDTH_20 : ni->ni_chw);
+    if (err && err != ECANCELED)
+        c->own_tlc_err = err == ENOTSUP ? 0xffff : uint32_t(err < 0 ? -err : err);
+    return err;
+}
+
+/* Firmware rate control for AWDL peer station index at a channel width; marks it in peer_tlc (1.1.94). */
+int ItlIwx::
+iwx_awdl_peer_tlc(struct iwx_softc *sc, uint32_t index, uint8_t width)
+{
+    auto p = &sc->sc_awdl_probe;
+    if (index >= p->peer_added || index >= IWX_AWDL_PEER_STA_MAX)
+        return EINVAL;
+    if (iwx_lookup_cmd_ver(sc, IWX_DATA_PATH_GROUP, IWX_TLC_MNG_CONFIG_CMD) != 4)
         return ENOTSUP;
-    }
+    const int generation = sc->sc_generation;
+    const bool mimo = iwx_mimo_enabled(sc);
     struct iwx_tlc_config_cmd_v4 tlc;
     memset(&tlc, 0, sizeof(tlc));
     static const uint8_t ofdm[] = {12, 18, 24, 36, 48, 72, 96, 108};
@@ -13578,7 +14457,6 @@ iwx_awdl_peer_agg(struct iwx_softc *sc, uint32_t index)
         if (idx >= 0)
             tlc.non_ht_rates |= uint16_t(1 << idx);
     }
-    const uint8_t width = c->phy2_chan ? IEEE80211_CHAN_WIDTH_20 : ni->ni_chw;
     uint16_t mcs = (1 << (IWX_TLC_MNG_HT_RATE_MCS9 + 1)) - 1;
     if (width == IEEE80211_CHAN_WIDTH_20)
         mcs &= ~(1 << IWX_TLC_MNG_HT_RATE_MCS9);
@@ -13591,11 +14469,35 @@ iwx_awdl_peer_agg(struct iwx_softc *sc, uint32_t index)
     tlc.chains = iwx_rs_fw_set_active_chains(iwx_fw_valid_tx_ant(sc));
     tlc.flags = iwx_rs_fw_get_config_flags(sc);
     tlc.sgi_ch_width_supp = (1 << IWX_TLC_MNG_CH_WIDTH_20MHZ) | (1 << IWX_TLC_MNG_CH_WIDTH_40MHZ) | (1 << IWX_TLC_MNG_CH_WIDTH_80MHZ);
-    err = iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_TLC_MNG_CONFIG_CMD, IWX_DATA_PATH_GROUP, 0), 0, sizeof(tlc), &tlc);
+    const int err = iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_TLC_MNG_CONFIG_CMD, IWX_DATA_PATH_GROUP, 0), 0, sizeof(tlc), &tlc);
     if (generation != sc->sc_generation)
         return ECANCELED;
-    if (err)
-        c->own_tlc_err = uint32_t(err < 0 ? -err : err);
+    if (!err)
+        p->peer_tlc = uint8_t(p->peer_tlc | (1u << index));
+    return err;
+}
+
+/* Every peer station with a TLC config, at a new width, during a move of link 1 (1.1.94). */
+int ItlIwx::
+iwx_awdl_peers_tlc(struct iwx_softc *sc, uint8_t width)
+{
+    auto p = &sc->sc_awdl_probe;
+    auto c = &p->ctx;
+    const int generation = sc->sc_generation;
+    int err = 0;
+    for (uint32_t i = 0; i < p->peer_added && i < IWX_AWDL_PEER_STA_MAX; ++i) {
+        if (!(p->peer_tlc & (1u << i)))
+            continue;
+        const int e = iwx_awdl_peer_tlc(sc, i, width);
+        if (generation != sc->sc_generation)
+            return ECANCELED;
+        if (e) {
+            c->phy2_tlc_err = uint32_t(e < 0 ? -e : e);
+            err = err ?: e;
+        } else {
+            ++c->phy2_tlc_refreshes;
+        }
+    }
     return err;
 }
 #endif
@@ -16100,6 +17002,21 @@ iwx_stop(struct _ifnet *ifp)
     iwx_del_task(sc, systq, &sc->awdl_solo_task);
     iwx_del_task(sc, systq, &sc->awdl_roc_task);
     iwx_del_task(sc, systq, &sc->awdl_roc_flush_task);
+    iwx_del_task(sc, systq, &sc->awdl_roc_chain_task);
+    iwx_del_task(sc, systq, &sc->awdl_roc_peer_task);
+    /* 1.2.3: the ROC timer goes with a stop; the next AUX station makes a new one. */
+    sc->sc_awdl_probe.roc.kick_armed = 0;
+    if (sc->awdl_roc_kick_to) {
+        timeout_del(&sc->awdl_roc_kick_to);
+        timeout_free(&sc->awdl_roc_kick_to);
+        sc->awdl_roc_kick_to = NULL;
+    }
+    sc->sc_awdl_probe.roc.pre_armed = 0;
+    if (sc->awdl_roc_pre_to) {
+        timeout_del(&sc->awdl_roc_pre_to);
+        timeout_free(&sc->awdl_roc_pre_to);
+        sc->awdl_roc_pre_to = NULL;
+    }
     sc->sc_mld_authorized_epoch = sc->sc_mld_authorized_done_epoch = 0;
 #endif
     iwx_del_task(sc, systq, &sc->mac_ctxt_task);
@@ -16149,6 +17066,7 @@ iwx_stop(struct _ifnet *ifp)
     sc->sc_awdl_probe.ctx.phy2_qid = -1;
     sc->sc_awdl_probe.ctx.solo = 0;
     sc->sc_awdl_probe.peer_added = sc->sc_awdl_probe.peer_count = 0;
+    sc->sc_awdl_probe.peer_tlc = 0;
     sc->sc_awdl_probe.peer_replace = 0;
     sc->sc_awdl_probe.cache_add_wait = sc->sc_awdl_probe.cache_del_wait = 0;
     sc->sc_awdl_probe.ctx.own_qid = -1;
@@ -16157,6 +17075,11 @@ iwx_stop(struct _ifnet *ifp)
     sc->sc_awdl_probe.ctx.own_fix_done = 0;
     sc->sc_awdl_probe.ctx.phy2_chan = sc->sc_awdl_probe.ctx.phy2_want = 0;
     sc->sc_awdl_probe.ctx.phy2_moving = 0;
+    sc->sc_awdl_probe.ctx.phy2_step = 0;
+    /* 1.2.24: the firmware lost the PHY contexts too; association sets them up again. */
+    sc->sc_awdl_probe.pause.state = IWX_AWDL_PAUSE_OFF;
+    sc->sc_awdl_probe.pause.tuned = sc->sc_awdl_probe.pause.phy2_hold = 0;
+    iwx_pause_wide_chan = 0;
     sc->sc_awdl_probe.ba_pending_valid = 0;
     memset(sc->sc_awdl_probe.ba, 0, sizeof(sc->sc_awdl_probe.ba));
     sc->sc_awdl_probe.tx.data_stalled = 0;
@@ -16666,6 +17589,15 @@ iwx_nic_error(struct iwx_softc *sc)
     sc->sc_awdl_probe.tx.fault_phy2 = iwx_awdl_fault_phy2(sc->sc_awdl_probe.ctx.phy2_moving,
         sc->sc_awdl_probe.ctx.phy2_want, sc->sc_awdl_probe.ctx.phy2_chan);
     sc->sc_pcitag->setProperty("ItlwmAwdlFaultRoc", sc->sc_awdl_probe.tx.fault_roc, 32);
+    /* 1.1.97: the last ROC ADD before the fault: time after the previous end, and source | duration << 8. */
+    sc->sc_pcitag->setProperty("ItlwmAwdlFaultRocAfterUs", sc->sc_awdl_probe.roc.last_add_after_us, 32);
+    sc->sc_pcitag->setProperty("ItlwmAwdlFaultRocAdd", uint32_t(sc->sc_awdl_probe.roc.last_add_src) |
+        (sc->sc_awdl_probe.roc.dur_tu & 0xffffu) << 8, 32);
+    /* 1.1.94: which step of a move, and the own queue, peer stations and TLC configs link 1 had. */
+    sc->sc_awdl_probe.tx.fault_link = iwx_awdl_fault_link(sc->sc_awdl_probe.ctx.phy2_step,
+        sc->sc_awdl_probe.ctx.own_qid > 0, sc->sc_awdl_probe.ctx.own_agg, sc->sc_awdl_probe.peer_added,
+        sc->sc_awdl_probe.peer_tlc);
+    sc->sc_pcitag->setProperty("ItlwmAwdlFaultLink", sc->sc_awdl_probe.tx.fault_link, 32);
     /*
      * 08:27: the restart re-armed AWDL and moved the link again into the same assert before the ROC tool's next poll.
      * A fault during a move now keeps the link off the second channel until the switch is set to 0 (1.1.90).
@@ -17145,16 +18077,73 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data,
                     ++r->failed;
                     r->pending = r->active = 0;
                     r->started_us = 0;
+                    r->last_end_us = now / 1000; /* 1.1.97: a failed ROC holds the next ADD back too. */
+                    /* 1.2.5: and pauses new ROCs for IWX_AWDL_ROC_FAIL_PAUSE_US (the firmware is busy elsewhere). */
+                    if (r->bmiss_until_us < now / 1000 + IWX_AWDL_ROC_FAIL_PAUSE_US)
+                        r->bmiss_until_us = now / 1000 + IWX_AWDL_ROC_FAIL_PAUSE_US;
+                    ++r->fail_pauses;
+                    r->kick_armed = 0;
                 } else if (le32toh(notif->started)) {
                     ++r->started;
                     r->active = 1;
+                    /* 1.1.96: how long the radio left 149 between a chained ROC's end and the next start. */
+                    if (r->last_end_us && r->sent_us >= r->last_end_us && now / 1000 - r->last_end_us < 200000) {
+                        ++r->chain_gap_n;
+                        r->chain_gap_sum_ms += uint32_t((now / 1000 - r->last_end_us) / 1000);
+                    }
                     iwx_awdl_roc_note_start(r, now / 1000);
-                    if (r->hold_n)
-                        iwx_add_task(sc, systq, &sc->awdl_roc_flush_task);
+                    r->rq_batch = 0;
+                    if (r->sent_this_roc > r->sent_per_roc_max)
+                        r->sent_per_roc_max = r->sent_this_roc;
+                    r->sent_this_roc = 0;
+                    /*
+                     * 1.2.3: held frames go IWX_AWDL_ROC_START_DELAY_US after the start (or when the phone's run
+                     * starts, 1.2.1), from the ROC timer, which then watches the AUX ring for the rest of the ROC.
+                     */
+                    /* 1.2.4: an early ROC holds its frames until just after the boundary it was early for. */
+                    if (r->aw_start_us) {
+                        ++*(now / 1000 <= r->aw_start_us ? &r->pre_on_time : &r->pre_late);
+                    }
+                    r->release_at_us = iwx_awdl_roc_release_at(now / 1000, r->aw_start_us);
+                    r->aw_start_us = 0;
+                    if (iwx_awdl_roc_peer_wait(r, now / 1000)) {
+                        ++r->peer_waits;
+                        if (r->peer_start_us > r->release_at_us)
+                            r->release_at_us = r->peer_start_us;
+                    }
+                    r->kick_tail = r->qid > 0 ? sc->txq[r->qid].tail : 0;
+                    if (sc->awdl_roc_kick_to) {
+                        r->kick_armed = 1;
+                        const uint64_t wait = r->release_at_us > now / 1000 ? r->release_at_us - now / 1000 : 0;
+                        timeout_add_msec(&sc->awdl_roc_kick_to, int(wait / 1000 + 1));
+                    } else if (r->hold_n && !r->flushing) {
+                        ++r->flush_direct;
+                        iwx_awdl_roc_flush(sc);
+                    }
                 } else {
                     ++r->ended;
                     r->pending = r->active = 0;
+                    r->kick_armed = 0;
+                    /* 1.2.11: A-MSDUs went and none came back during that ROC: stop them for this boot. */
+                    {
+                        auto x = &sc->sc_awdl_probe.tx;
+                        if (r->tid == IWX_AWDL_ROC_AMSDU_TID && !x->amsdu_gave_up &&
+                            iwx_awdl_amsdu_stuck(x->amsdu_sent, x->amsdu_ok + x->amsdu_fail, r->amsdu_sent_mark,
+                                                 r->amsdu_done_mark)) {
+                            x->amsdu_gave_up = 1;
+                            ++r->amsdu_stuck;
+                        }
+                        r->amsdu_sent_mark = x->amsdu_sent;
+                        r->amsdu_done_mark = x->amsdu_ok + x->amsdu_fail;
+                    }
+                    if (r->started_us && now / 1000 > r->started_us)
+                        iwx_awdl_roc_note_dwell(r, now / 1000 - r->started_us, r->dur_tu);
                     iwx_awdl_roc_note_end(r, now / 1000);
+                    r->last_end_us = now / 1000;
+                    /* 1.1.96: chain the next one while the run's covered time lasts. */
+                    if (r->fam_valid && iwx_awdl_roc_mode(r->want) &&
+                        iwx_awdl_roc_chain_due(now / 1000, r->cov_end_us, IWX_AWDL_ROC_CHAIN_MIN_US))
+                        iwx_add_task(sc, systq, &sc->awdl_roc_chain_task);
                 }
                 break;
             }
@@ -19492,9 +20481,12 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
     task_set(&sc->awdl_ba_task, iwx_awdl_ba_task, sc, "iwx_awdl_ba_task");
     task_set(&sc->awdl_ownq_task, iwx_awdl_ownq_task, sc, "iwx_awdl_ownq_task");
     task_set(&sc->awdl_phy2_task, iwx_awdl_phy2_task, sc, "iwx_awdl_phy2_task");
+    task_set(&sc->awdl_pause_task, iwx_awdl_pause_task, sc, "iwx_awdl_pause_task");
     task_set(&sc->awdl_solo_task, iwx_awdl_solo_task, sc, "iwx_awdl_solo_task");
     task_set(&sc->awdl_roc_task, iwx_awdl_roc_task, sc, "iwx_awdl_roc_task");
     task_set(&sc->awdl_roc_flush_task, iwx_awdl_roc_flush_task, sc, "iwx_awdl_roc_flush_task");
+    task_set(&sc->awdl_roc_chain_task, iwx_awdl_roc_chain_task, sc, "iwx_awdl_roc_chain_task");
+    task_set(&sc->awdl_roc_peer_task, iwx_awdl_roc_peer_task, sc, "iwx_awdl_roc_peer_task");
     ic->ic_wcl_port_authorized = iwx_wcl_port_authorized;
 #endif
     task_set(&sc->mac_ctxt_task, iwx_mac_ctxt_task, sc, "iwx_mac_ctxt_task");

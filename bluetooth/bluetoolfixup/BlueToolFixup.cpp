@@ -312,10 +312,7 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
             if (getKernelVersion() == KernelVersion::Sequoia) {
                 auto page = static_cast<unsigned char *>(const_cast<void *>(data));
                 if(shouldPatchBE201RPARoute) {
-                    uint64_t h=be201RPAPageHash(page,PAGE_SIZE),kind=0;
-                    if(h==kRPAScanOriginalHash||h==kRPAScanPatchedHash)kind=1;
-                    else if(h==kRPAFilterOriginalHash||h==kRPAFilterPatchedHash)kind=2;
-                    else if(h==kRPAPayloadOriginalHash||h==kRPAPayloadPatchedHash)kind=4;
+                    uint64_t h=be201RPAPageHash(page,PAGE_SIZE),kind=be201RPAKind(h);  // 2.7.13: every ported build
                     if(kind) {
                         __atomic_fetch_or(&rpaMatchingMask,kind,__ATOMIC_RELAXED);
                         if(validated_p && *validated_p && tainted_p && !*tainted_p && nx_p && !*nx_p) {
@@ -347,25 +344,25 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
                         else if(result>=128)observed(privacyAlreadyPatchedPages);
                     }
                 }
-                if(shouldPatchBE201AddressPause && be201Apply(page,PAGE_SIZE,kBE201AddressPauseOriginal,kBE201AddressPausePatched)) observed(addressPausePatchHits);
-                if(shouldPatchBE201LEBaseline && be201Apply(page,PAGE_SIZE,kBE201LEBaselineOriginal,kBE201LEBaselinePatched)) {
+                if(shouldPatchBE201AddressPause && be201ApplyMasked(page,PAGE_SIZE,kBE201AddressPauseOriginal,kBE201AddressPauseMask,kBE201AddressPausePatched)) observed(addressPausePatchHits);
+                if(shouldPatchBE201LEBaseline && be201ApplyMasked(page,PAGE_SIZE,kBE201LEBaselineOriginal,kBE201LEBaselineMask,kBE201LEBaselinePatched)) {
                     observed(baselinePatchHits);
                     SYSLOG(MODULE_SHORT,"[BE201LEBASE] native local EDL/2M capability predicates disabled; real events/status preserved");
                 }
-                if (shouldPatchBE201PeerAddress && be201Apply(page, PAGE_SIZE, kBE201PeerAddressOriginal, kBE201PeerAddressPatched)) {
-                    SYSLOG(MODULE_SHORT, "[BE201PEER] native connection filter list prefers observed peer address (24G824); trust unchanged");
+                if (shouldPatchBE201PeerAddress && be201ApplyMasked(page, PAGE_SIZE, kBE201PeerAddressOriginal, kBE201PeerAddressMask, kBE201PeerAddressPatched)) {
+                    SYSLOG(MODULE_SHORT, "[BE201PEER] native connection filter list prefers observed peer address; trust unchanged");
                     observed(peerPatchHits);
                 }
-                if (shouldPatchBE201LegacyAdv && be201Apply(page, PAGE_SIZE, kBE201LegacyAdvOriginal, kBE201LegacyAdvPatched)) {
-                    SYSLOG(MODULE_SHORT, "[BE201LE] selected native single-advertisement backend (24G824); HCI status unchanged");
+                if (shouldPatchBE201LegacyAdv && be201ApplyMasked(page, PAGE_SIZE, kBE201LegacyAdvOriginal, kBE201LegacyAdvMask, kBE201LegacyAdvPatched)) {
+                    SYSLOG(MODULE_SHORT, "[BE201LE] selected native single-advertisement backend; HCI status unchanged");
                     observed(legacyPatchHits);
                 }
                 if (shouldPatchBE201Name && be201Apply(page, PAGE_SIZE, kBE201NameOriginal, kBE201NamePatched)) {
                     SYSLOG(MODULE_SHORT, "[BE201] chipset display changed to Intel BE201; numeric identity unchanged");
                     observed(namePatchHits);
                 }
-                if (shouldPatchBE201Clock && be201Apply(page, PAGE_SIZE, kBE201ClockOriginal, kBE201ClockPatched)) {
-                    SYSLOG(MODULE_SHORT, "[a2dpcheck] applied exact 24G824 A2DP BT-clock gate");
+                if (shouldPatchBE201Clock && be201ApplyMasked(page, PAGE_SIZE, kBE201ClockOriginal, kBE201ClockMask, kBE201ClockPatched)) {
+                    SYSLOG(MODULE_SHORT, "[a2dpcheck] applied A2DP BT-clock gate (masked 24G824 context)");
                     observed(clockPatchHits);
                 }
             }
@@ -403,7 +400,7 @@ static void pluginStart() {
         shouldPatchBE201LegacyAdv = be201Switch("-be201leadv");
         shouldPatchBE201Name = be201Switch("-be201identity");
         shouldPatchBE201Clock = be201Switch("-btlfxa2dpcheck");
-        SYSLOG(MODULE_SHORT, "BE201 local build: identity=%d A2DP=%d legacyLE=%d (exact 24G824 context)", shouldPatchBE201Name, shouldPatchBE201Clock, shouldPatchBE201LegacyAdv);
+        SYSLOG(MODULE_SHORT, "BE201 local build: identity=%d A2DP=%d legacyLE=%d (masked 24G824 context)", shouldPatchBE201Name, shouldPatchBE201Clock, shouldPatchBE201LegacyAdv);
         if (getKernelVersion() >= KernelVersion::Sonoma) {
             shouldPatchBoardId = checkKernelArgument("-btlfxboardid");
         } else {

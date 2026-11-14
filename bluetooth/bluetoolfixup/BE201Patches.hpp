@@ -1,4 +1,5 @@
-// Local Sequoia 15.7.8 (24G824), x86_64-only compatibility patches.
+// Local Sequoia x86_64 compatibility patches. The byte sequences are the exact 24G824 (15.7.8) code; since 2.7.13
+// the code patches match through BE201PatchMasks.hpp (make_masks.py), so they follow bluetoothd across builds.
 // Clock gate mechanism: hexxyan, BrcmPatchRAM PR #38, GPL-2.0.
 // Expanded exact context avoids a second, unrelated match in this build.
 #pragma once
@@ -24,6 +25,25 @@ template <size_t N> static unsigned be201Apply(unsigned char *page, size_t lengt
     if (count == 1) memcpy(page+match, replacement, N);
     return count == 1 ? 1 : 0;
 }
+
+// 2.7.13: the same, with a mask. 0xff bytes must equal find; 0 bytes are rel32/disp32 that move between builds.
+// Exactly one match in the page or nothing changes; only the bytes the patch changes are written (they are always
+// exact bytes, make_masks.py checks), so the build's own call targets and displacements stay.
+template <size_t N> static unsigned be201ApplyMasked(unsigned char *page, size_t length,
+    const unsigned char (&find)[N], const unsigned char (&mask)[N], const unsigned char (&replacement)[N]) {
+    if (!page || length < N) return 0;
+    size_t match = 0; unsigned count = 0;
+    for (size_t i = 0; i <= length-N && count < 2; ++i) {
+        size_t k = 0;
+        while (k < N && (page[i+k] & mask[k]) == (find[k] & mask[k])) ++k;
+        if (k == N) { match = i; ++count; }
+    }
+    if (count != 1) return 0;
+    for (size_t k = 0; k < N; ++k)
+        if (replacement[k] != find[k] && mask[k] == 0xff) page[match+k] = replacement[k];
+    return 1;
+}
+#include "BE201PatchMasks.hpp"
 
 // Opt-in legacy single-advertisement backend, native 24G824 x86_64 caller only.
 // Clears the request for the unavailable vendor multi-advertisement backend.

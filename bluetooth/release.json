@@ -10,11 +10,11 @@
   "bluetoolfixup": {
     "bundle": "BlueToolFixup",
     "binary": "BlueToolFixup",
-    "version": "2.7.12",
-    "source_date_epoch": 1794398400,
-    "note": "Sequoia: BE201 switches on by default (A2DP clock, identity, single-advertisement LE, address pause, LE baseline, probe, recent RPA routing); -be201btstock turns them off",
-    "installed_sha256": "f38ebfec500b1338e601520e29cfd708164054fe5b493b990964f1429c147c0b",
-    "installed_version": "2.7.12"
+    "version": "2.7.13",
+    "source_date_epoch": 1794456824,
+    "note": "Sequoia 24G824 and 24H241: BE201 A2DP clock, identity, single-advertisement LE, address pause, LE baseline, probe and recent RPA routing; -be201btstock turns them off",
+    "installed_sha256": "e6ba5ccd25b3377f3e0f012803b2a33c321b0c0f363c95d09b8dd5311783e8c3",
+    "installed_version": "2.7.13"
   },
   "intelbtpatcher": {
     "bundle": "IntelBTPatcher",

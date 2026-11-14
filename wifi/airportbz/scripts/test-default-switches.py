@@ -1,7 +1,8 @@
 """1.1.88 / BlueToolFixup 2.7.12 / IntelBTPatcher 2.5.10: the switches this machine used are on without boot arguments.
 
 Wi-Fi: be201_awdl_vif, be201_awdl_auto (verified kernel only) and be201_tlc_diag default on, =0 turns them off.
-The ROC and second-channel test switches stay off. Bluetooth: eight switches default on, -be201btstock turns them off."""
+1.2.15: be201_awdl_xchan (cross-channel AirDrop: second channel automatic, ROC mode 4) is on too, =0 turns it off;
+the other test switches stay off. Bluetooth: eight switches default on, -be201btstock turns them off."""
 import re, subprocess, tempfile
 from pathlib import Path
 
@@ -77,6 +78,10 @@ auto = body(v2, 'void AirportItlwm::startAWDLAuto()')
 for var in ['be201AwdlRocValue', 'be201AwdlPhy2Value', 'be201AwdlPhy2TeValue', 'be201AwdlAmsduValue']:
     assert var not in auto, var
 assert re.search(r'static int be201AwdlRocValue;', v2), 'ROC switch starts at 0'
+reg = v2[v2.index('sysctl_register_oid(&sysctl__debug_be201_awdl_roc);'):]
+reg = reg[:reg.index('awdlArmRegistered = true;')]
+assert 'ItlAwdlFlag("be201_awdl_xchan")' in reg and 'be201AwdlRocValue, 0x390024' in reg and 'be201AwdlPhy2Value, 1' in reg, 'cross-channel on at boot, only after the switches exist (1.2.15)'
+assert allsrc.count('ItlAwdlFlag("be201_awdl_xchan")') == 1 and 'PE_parse_boot_argn("be201_awdl_xchan"' not in allsrc
 assert 'be201AwdlLlwValue, 0' in auto, 'llw0 stays off'
 assert 'pciNub->setProperty("ItlwmAwdlLayoutVerified", ItlAwdlLayoutVerified());' in v2
 

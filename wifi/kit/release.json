@@ -1,4 +1,4 @@
 {
-  "version": "1.1.93",
-  "comment": "AWDL on by default on 24H241 (macOS 15.8.3) too, its IO80211Family layouts checked equal to 24G824; ROC test mode 4 host hold as 1.1.92; ROC off"
+  "version": "1.2.25",
+  "comment": "AirDrop: ROC finds peers and asks with the router kept; once file data flows the router's PHY moves to the AWDL channel at the router's width (no rate control change) and internet pauses until 4 s after the transfer; routers wider than 80 MHz keep ROC; be201_awdl_pause=0 keeps ROC only"
 }

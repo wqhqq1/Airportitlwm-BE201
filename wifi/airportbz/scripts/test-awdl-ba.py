@@ -35,7 +35,7 @@ int main(){
  assert(!iwx_awdl_roc_takes(1,1,true)&&!iwx_awdl_roc_takes(1,2,false));
  assert(iwx_awdl_roc_takes(2,1,true)&&iwx_awdl_roc_takes(2,1,false)&&iwx_awdl_roc_takes(2,2,true)&&!iwx_awdl_roc_takes(2,2,false));
  assert(iwx_awdl_roc_takes(3,2,false)&&iwx_awdl_roc_takes(3,1,false)&&!iwx_awdl_roc_takes(3,0,false)&&!iwx_awdl_roc_takes(2,0,true));
- assert(iwx_awdl_roc_duration(0)==0&&iwx_awdl_roc_duration(1)==16&&iwx_awdl_roc_duration(3)==48&&iwx_awdl_roc_duration(16)==IWX_AWDL_ROC_MAX_TU);
+ assert(iwx_awdl_roc_duration(0)==0&&iwx_awdl_roc_duration(1)==64&&iwx_awdl_roc_duration(3)==192&&iwx_awdl_roc_duration(16)==IWX_AWDL_ROC_MAX_TU); /* 64 TU slots (1.1.96) */
  /* The request this phone really sent, from ItlwmAwdlNativeRxLastBad on 1.1.40, completed with a sequence. */
  V real={3,0,0x75,0x03,0x10,0x90,0xe2,0x80,0x12};
  struct iwx_awdl_ba_req r;
@@ -250,6 +250,169 @@ int main(){
   uint8_t hold=0; assert(iwx_awdl_phy2_after_fault(&hold,1)==1&&!hold);
   hold=1; assert(iwx_awdl_phy2_after_fault(&hold,1)==0&&hold&&iwx_awdl_phy2_after_fault(&hold,149)==0);
   assert(iwx_awdl_phy2_after_fault(&hold,0)==0&&!hold&&iwx_awdl_phy2_after_fault(&hold,1)==1);
+  /* 1.1.94: TLC narrowed before a move onto the second channel, widened after one home; the link fault snapshot. */
+  assert(iwx_awdl_move_tlc_narrow(149,0)&&!iwx_awdl_move_tlc_narrow(149,149)&&!iwx_awdl_move_tlc_narrow(0,149)&&!iwx_awdl_move_tlc_narrow(0,0));
+  assert(iwx_awdl_move_tlc_widen(0,0)&&!iwx_awdl_move_tlc_widen(0,149)&&!iwx_awdl_move_tlc_widen(149,0)&&!iwx_awdl_move_tlc_widen(149,149));
+  assert(iwx_awdl_fault_link(0,false,false,0,0)==0&&iwx_awdl_fault_link(IWX_AWDL_MOVE_WITH_PHY,true,true,2,3)==(8u|0x30u|(2u<<8)|(3u<<16)));
+  assert(IWX_AWDL_MOVE_ACTIVE==10&&iwx_awdl_fault_link(IWX_AWDL_MOVE_ACTIVE,false,false,0,0)==10);
+  /* 1.1.95: 80 MHz AWDL rates only on an 80 MHz PHY: never on an ROC or with link 1 on the 20 MHz context. */
+  { const int32_t r80=iwx_awdl_data_rate(-3), r20=iwx_awdl_data_rate(-1), ht=iwx_awdl_data_rate(0);
+    assert((r80&IWX_AWDL_RATE_80MHZ)&&!(r20&IWX_AWDL_RATE_80MHZ));
+    assert(iwx_awdl_rate_fits(r80,true,false,false)&&!iwx_awdl_rate_fits(r80,true,true,false)&&!iwx_awdl_rate_fits(r80,true,false,true)&&!iwx_awdl_rate_fits(r80,false,false,false));
+    assert(iwx_awdl_rate_fits(r20,false,true,true)&&iwx_awdl_rate_fits(ht,false,true,true)&&iwx_awdl_rate_fits(-1,false,true,true)); }
+  /* 1.1.96: coverage of 149 runs (4 slots each), covered slots left, the DTIM cap, the chain rule, dwell buckets, 80 MHz position. */
+  { const uint8_t fam[16]={149,149,149,149,149,149,153,153,6,149,149,149,149,149,153,153}; uint8_t cov[16];
+    iwx_awdl_roc_cover(fam,149,4,cov,2);
+    const uint8_t want[16]={149,149,149,149,0,0,0,0,0,149,149,149,149,0,0,0}; assert(!memcmp(cov,want,16)&&iwx_awdl_roc_covers(cov));
+    assert(iwx_awdl_roc_cover_left(cov,0)==4&&iwx_awdl_roc_cover_left(cov,2)==2&&iwx_awdl_roc_cover_left(cov,4)==0&&iwx_awdl_roc_cover_left(cov,9)==4);
+    uint8_t all[16]; memset(all,149,16); iwx_awdl_roc_cover(all,149,4,cov,2); assert(cov[0]==149&&cov[3]==149&&cov[4]==0&&cov[5]==0&&cov[6]==149&&cov[9]==149&&cov[10]==0&&cov[12]==149&&cov[15]==149); /* 1.2.10: pieces with AP gaps */ { uint8_t sq[16]; memset(sq,149,16); sq[8]=6; uint8_t g1[16], g2[16]; iwx_awdl_roc_cover(sq,149,7,g2); iwx_awdl_roc_cover(sq,149,7,g1,1); unsigned n1=0,n2=0; for (int k=0;k<16;++k) { n1+=g1[k]?1:0; n2+=g2[k]?1:0; } assert(n2==13&&n1==14); } /* 1.2.12: 7 on, 2 or 1 off */
+    iwx_awdl_roc_cover(fam,0,4,cov,2); assert(!iwx_awdl_roc_covers(cov)); iwx_awdl_roc_cover(fam,44,4,cov,2); assert(!iwx_awdl_roc_covers(cov));
+    const uint8_t wrap[16]={149,149,0,0,0,0,0,0,0,0,0,0,0,0,149,149}; iwx_awdl_roc_cover(wrap,149,3,cov,2); assert(cov[14]==149&&cov[15]==149&&cov[0]==149&&cov[1]==0);
+    assert(iwx_awdl_roc_cap(100,1,false)==80&&iwx_awdl_roc_cap(100,3,false)==256&&iwx_awdl_roc_cap(100,2,false)==180&&iwx_awdl_roc_cap(100,1,true)==IWX_AWDL_ROC_MAX_TU&&iwx_awdl_roc_cap(0,0,false)==IWX_AWDL_ROC_MAX_TU);
+    assert(iwx_awdl_roc_chain_due(1000,1000+IWX_AWDL_ROC_CHAIN_MIN_US+1,IWX_AWDL_ROC_CHAIN_MIN_US)&&!iwx_awdl_roc_chain_due(1000,1000+IWX_AWDL_ROC_CHAIN_MIN_US,IWX_AWDL_ROC_CHAIN_MIN_US)&&!iwx_awdl_roc_chain_due(5000,1000,1));
+    static struct iwx_awdl_roc dr; memset(&dr,0,sizeof(dr));
+    iwx_awdl_roc_note_dwell(&dr,10*1024,100); iwx_awdl_roc_note_dwell(&dr,40*1024,100); iwx_awdl_roc_note_dwell(&dr,60*1024,100); iwx_awdl_roc_note_dwell(&dr,90*1024,100); iwx_awdl_roc_note_dwell(&dr,5,0);
+    assert(dr.dwell_hist[0]==1&&dr.dwell_hist[1]==1&&dr.dwell_hist[2]==1&&dr.dwell_hist[3]==2);
+    assert(iwx_awdl_ctrl_pos80(149)==0x1&&iwx_awdl_ctrl_pos80(153)==0x0&&iwx_awdl_ctrl_pos80(157)==0x4&&iwx_awdl_ctrl_pos80(161)==0x5&&iwx_awdl_ctrl_pos80(36)==0x1&&iwx_awdl_ctrl_pos80(44)==0x4&&iwx_awdl_ctrl_pos80(116)==0x1);
+    assert(iwx_awdl_roc_ring_cap(true)==IWX_AWDL_ROC_TX_MAX_QUEUED&&iwx_awdl_roc_ring_cap(false)==IWX_AWDL_TX_MAX_QUEUED);
+    assert(IWX_AWDL_ROC_SLOT_TU==64&&IWX_AWDL_ROC_RUN_MAX_SLOTS==7&&IWX_AWDL_ROC_HOLD_MAX==256&&IWX_AWDL_ROC_HOLD_HIGH<IWX_AWDL_ROC_HOLD_MAX&&IWX_AWDL_ROC_HOLD_LOW<IWX_AWDL_ROC_HOLD_HIGH&&IWX_AWDL_ROC_TX_MAX_QUEUED==64&&IWX_AWDL_ROC_HOLD_US==1000000);
+    assert(iwx_awdl_roc_mode(0x121)==1&&iwx_awdl_roc_activity(0x121)==2&&iwx_awdl_roc_mode(0x324)==4); }
+  /* 1.1.98: only mode 4, only a failure after the ROC ended with almost no retries, at most IWX_AWDL_ROC_REQUEUE_MAX times. */
+  assert(iwx_awdl_roc_requeue_ok(4,false,false,0,0)&&iwx_awdl_roc_requeue_ok(4,false,false,2,2)&&!iwx_awdl_roc_requeue_ok(4,false,false,3,0));
+  /* 1.2.17: a failure while the ROC ran gets IWX_AWDL_ROC_REQUEUE_IN_MAX turns, whatever its retries. */
+  assert(iwx_awdl_roc_requeue_ok(4,true,false,15,0)&&iwx_awdl_roc_requeue_ok(4,true,false,15,IWX_AWDL_ROC_REQUEUE_IN_MAX-1)&&!iwx_awdl_roc_requeue_ok(4,true,false,0,IWX_AWDL_ROC_REQUEUE_IN_MAX)&&!iwx_awdl_roc_requeue_ok(4,true,true,0,0)&&!iwx_awdl_roc_requeue_ok(3,true,false,0,0));
+  /* 1.2.19 sparse-peer gate, per destination: waits only when enabled, unicast, its peer is sparse and away, state fresh. */
+  assert(iwx_awdl_roc_gate_wait(true,true,true,1000,1000+IWX_AWDL_ROC_GATE_STALE_US-1)&&!iwx_awdl_roc_gate_wait(true,true,true,1000,1000+IWX_AWDL_ROC_GATE_STALE_US));
+  assert(!iwx_awdl_roc_gate_wait(false,true,true,1000,1000)&&!iwx_awdl_roc_gate_wait(true,false,true,1000,1000)&&!iwx_awdl_roc_gate_wait(true,true,false,1000,1000)&&!iwx_awdl_roc_gate_wait(true,true,true,0,1000));
+  { static struct iwx_awdl_probe gp; memset(&gp,0,sizeof(gp));
+    const uint8_t phone[6]={0x5a,0xa4,0xb6,0x85,0xb5,0x1e}, ipad[6]={0x0a,0x91,0x95,0xb1,0x3b,0x30}, other[6]={2,0,0,0,0,9};
+    auto &e=gp.sync.dpeer[0]; memcpy(e.mac,phone,6); e.seq_valid=1; e.seq_us=9500000; const uint8_t idle[16]={149,0,149,0,0,0,0,0,6,0,149,0,0,0,0,0}; memcpy(e.seq,idle,16);
+    assert(iwx_awdl_gate_dest(&gp,phone,149,1,10000000)&&!iwx_awdl_gate_dest(&gp,phone,149,2,10000000)&&!iwx_awdl_gate_dest(&gp,phone,149,18,10000000)&&iwx_awdl_gate_dest(&gp,phone,149,17,10000000));
+    assert(!iwx_awdl_gate_dest(&gp,phone,149,1,9500000+IWX_AWDL_GATE_SEQ_US)); /* sequence too old */
+    auto &f=gp.sync.dpeer[1]; memcpy(f.mac,ipad,6); f.seq_valid=1; f.seq_us=9500000; const uint8_t eight[16]={149,149,149,0,0,0,0,149,0,149,149,149,0,0,0,149}; memcpy(f.seq,eight,16);
+    assert(!iwx_awdl_gate_dest(&gp,ipad,149,4,10000000)); /* 8 slots: never waits (13:24 regression: it waited for the phone) */
+    assert(!iwx_awdl_gate_dest(&gp,other,149,1,10000000)&&!iwx_awdl_gate_dest(&gp,nullptr,149,1,10000000)&&!iwx_awdl_gate_dest(&gp,phone,0,1,10000000));
+    memset(e.seq,0,16); assert(!iwx_awdl_gate_dest(&gp,phone,149,1,10000000)); /* no 149 slot at all: never held forever */
+    gp.roc.want=IWX_AWDL_ROC_F_GATE; gp.roc.gate_us=10000000; gp.roc.gate_chan=149; gp.roc.gate_k=0; gp.roc.slot_idx=1; memcpy(e.seq,idle,16);
+    const uint8_t mc[6]={1,0,0x5e,0,0,0xfb};
+    assert(iwx_awdl_roc_gate_check(&gp,phone,10000000)&&!iwx_awdl_roc_gate_check(&gp,ipad,10000000)&&!iwx_awdl_roc_gate_check(&gp,mc,10000000));
+    gp.roc.want=0; assert(!iwx_awdl_roc_gate_check(&gp,phone,10000000)); /* 1.2.22: off by default */
+    assert(IWX_AWDL_ROC_F_GATE==0x40000); }
+  /* 1.2.17 data-mode hold: no flow, no pad; a two-way flow pads to 8 until 4 s after; one-way traffic or a lone pair does not start it. */
+  { struct iwx_awdl_dmhold h; memset(&h,0,sizeof(h));
+    assert(iwx_awdl_dmhold_pad(&h,1000000,0,0,0,0)==0&&iwx_awdl_dmhold_pad(&h,1100000,20,0,20,0)==0&&iwx_awdl_dmhold_pad(&h,1200000,1,0,1,0)==0);
+    memset(&h,0,sizeof(h)); assert(iwx_awdl_dmhold_pad(&h,1000000,1,1,2,2)==0&&h.flows==0);
+    memset(&h,0,sizeof(h)); assert(iwx_awdl_dmhold_pad(&h,1000000,3,1,4,1)==3&&h.flows==1&&h.padded_reports==1&&h.padded_pkts==3);
+    assert(iwx_awdl_dmhold_pad(&h,1500000,0,0,0,0)==8&&iwx_awdl_dmhold_pad(&h,1600000,0,0,20,0)==0);
+    assert(iwx_awdl_dmhold_pad(&h,1000000+IWX_AWDL_HOLD_US-1,0,0,0,0)==8&&iwx_awdl_dmhold_pad(&h,1000000+IWX_AWDL_HOLD_US,0,0,0,0)==0);
+    assert(iwx_awdl_dmhold_pad(&h,9000000,2,2,4,0)==4&&h.flows==2);
+    assert(IWX_AWDL_HOLD_PKTS==8&&IWX_AWDL_HOLD_US==4000000&&IWX_AWDL_HOLD_FLOW_PKTS==4); }
+  /* 1.2.24 pause trigger: starts on 32 packets in a window, keeps on 8, ends 4 s after, at most 120 s, then 2 s cool. */
+  { struct iwx_awdl_pause_trig t; memset(&t,0,sizeof(t));
+    assert(!iwx_awdl_pause_trig_step(&t,1000000,10)&&!iwx_awdl_pause_trig_step(&t,1500000,10)); /* ASK-sized chatter */
+    assert(iwx_awdl_pause_trig_step(&t,1600000,12)&&t.starts==1); /* 32 in the window */
+    assert(iwx_awdl_pause_trig_step(&t,2700000,8)&&iwx_awdl_pause_trig_step(&t,2700000+IWX_AWDL_PAUSE_IDLE_US-1,0));
+    assert(!iwx_awdl_pause_trig_step(&t,2700000+IWX_AWDL_PAUSE_IDLE_US,0)); /* 4 s quiet: back to the router */
+    assert(!iwx_awdl_pause_trig_step(&t,2700000+IWX_AWDL_PAUSE_IDLE_US+100000,500)); /* cooling down */
+    assert(iwx_awdl_pause_trig_step(&t,2700000+IWX_AWDL_PAUSE_IDLE_US+IWX_AWDL_PAUSE_COOL_US+1000000,40)&&t.starts==2);
+    const uint64_t s0=t.since_us; for (uint64_t u=s0+1000000;u<s0+IWX_AWDL_PAUSE_MAX_US;u+=1000000) assert(iwx_awdl_pause_trig_step(&t,u,50));
+    assert(!iwx_awdl_pause_trig_step(&t,s0+IWX_AWDL_PAUSE_MAX_US,50)&&t.max_cuts==1); /* 120 s: one visit home */
+    assert(iwx_awdl_pause_width_ok(0)&&iwx_awdl_pause_width_ok(3)&&!iwx_awdl_pause_width_ok(4)&&!iwx_awdl_pause_width_ok(5)); /* 1.2.25: up to 80 MHz */
+    assert(iwx_awdl_lower40(149)&&!iwx_awdl_lower40(153)&&iwx_awdl_lower40(157)&&!iwx_awdl_lower40(161)&&iwx_awdl_lower40(36)&&!iwx_awdl_lower40(40)&&iwx_awdl_lower40(100)&&!iwx_awdl_lower40(104));
+    struct iwx_awdl_pause s; memset(&s,0,sizeof(s));
+    assert(!iwx_awdl_pause_drops(&s,false,true)); s.tuned=1;
+    assert(iwx_awdl_pause_drops(&s,false,true)&&!iwx_awdl_pause_drops(&s,true,true)&&!iwx_awdl_pause_drops(&s,false,false)); }
+  /* 1.2.21: a bulk flow holds 15 s after it, past the 4 s flow hold; a slow trickle does not. */
+  { struct iwx_awdl_dmhold h; memset(&h,0,sizeof(h));
+    assert(iwx_awdl_dmhold_pad(&h,1000000,200,120,20,8)==0&&h.bulk_holds==1); /* 320 in the window, a full report */
+    assert(iwx_awdl_dmhold_pad(&h,1000000+IWX_AWDL_HOLD_US+1,0,0,0,0)==8); /* past the flow hold, inside the bulk hold */
+    assert(iwx_awdl_dmhold_pad(&h,1000000+IWX_AWDL_HOLD_BULK_US-1,0,0,0,0)==8&&iwx_awdl_dmhold_pad(&h,1000000+IWX_AWDL_HOLD_BULK_US,0,0,0,0)==0);
+    memset(&h,0,sizeof(h)); for (int i=0;i<10;++i) iwx_awdl_dmhold_pad(&h,1000000+uint64_t(i)*1000000,2,2,4,0);
+    assert(h.bulk_holds==0&&iwx_awdl_dmhold_pad(&h,1000000+9000000+IWX_AWDL_HOLD_US,0,0,0,0)==0); /* 4 a second: flow hold only */
+    assert(IWX_AWDL_HOLD_BULK_PKTS==300&&IWX_AWDL_HOLD_BULK_US==15000000&&IWX_AWDL_DEST_SEQ_US==20000000); }
+  assert(!iwx_awdl_roc_requeue_ok(4,false,true,0,0)&&!iwx_awdl_roc_requeue_ok(3,false,false,0,0)&&!iwx_awdl_roc_requeue_ok(4,false,false,0,IWX_AWDL_ROC_REQUEUE_MAX));
+  /* 1.1.99: why a frame waits, when the family waits, the clamp rule, ordered insert. */
+  assert(iwx_awdl_roc_hold_why(true,4,0,false)==1&&iwx_awdl_roc_hold_why(false,4,3,false)==2&&iwx_awdl_roc_hold_why(false,4,0,true)==3&&iwx_awdl_roc_hold_why(false,4,0,false)==0);
+  assert(iwx_awdl_roc_hold_why(false,3,5,true)==0&&iwx_awdl_roc_hold_why(true,3,0,false)==1);
+  assert(iwx_awdl_roc_hold_busy(4,true,IWX_AWDL_ROC_HOLD_HIGH)&&!iwx_awdl_roc_hold_busy(4,true,IWX_AWDL_ROC_HOLD_HIGH-1)&&!iwx_awdl_roc_hold_busy(4,false,255)&&!iwx_awdl_roc_hold_busy(3,true,255));
+  assert(!iwx_awdl_roc_no_clamp(0x24)&&!iwx_awdl_roc_no_clamp(0x24|IWX_AWDL_ROC_F_DTIM)&&!iwx_awdl_roc_no_clamp(0x21)&&iwx_awdl_roc_no_clamp(0x21|IWX_AWDL_ROC_F_NO_DTIM)&&iwx_awdl_roc_no_clamp(0x24|IWX_AWDL_ROC_F_NO_DTIM)); /* 1.2.0: clamp by default */
+  { static struct iwx_awdl_roc hr; memset(&hr,0,sizeof(hr)); hr.hold_head=IWX_AWDL_ROC_HOLD_MAX-1; int v[6];
+    for (int k=0;k<3;++k){ const uint32_t t=iwx_awdl_roc_hold_tail(&hr); hr.hold_m[t]=&v[k]; hr.hold_rq[t]=0; ++hr.hold_n; }
+    iwx_awdl_roc_hold_insert(&hr,0,&v[3],NULL,1,1); iwx_awdl_roc_hold_insert(&hr,1,&v[4],NULL,1,1); iwx_awdl_roc_hold_insert(&hr,99,&v[5],NULL,1,0);
+    const int *want[6]={&v[3],&v[4],&v[0],&v[1],&v[2],&v[5]}; assert(hr.hold_n==6);
+    for (int k=0;k<6;++k) assert(hr.hold_m[(hr.hold_head+k)%IWX_AWDL_ROC_HOLD_MAX]==want[k]);
+    assert(hr.hold_rq[hr.hold_head]==1&&hr.hold_rq[(hr.hold_head+2)%IWX_AWDL_ROC_HOLD_MAX]==0); }
+  /* 1.2.1: the phone's run from its own sequence and AW timing. */
+  { static struct iwx_awdl_probe pp; memset(&pp,0,sizeof(pp)); struct iwx_awdl_peer_window w;
+    assert(iwx_awdl_peer_run(&pp,149,4,1000000,&w)==-1);
+    pp.sync.valid=1; pp.sync.aw_period=16; pp.sync.presence=4; pp.sync.host_us=1000000; pp.sync.ttn=10; pp.sync.aw_seq=4*2; /* next boundary: slot 3 in 10 TU */
+    const uint8_t sq[16]={157,0,149,149,0,0,0,0,6,0,149,0,0,0,0,0}; memcpy(pp.sync.seq,sq,16); pp.sync.seq_valid=1;
+    const uint64_t slot=64*IWX_AWDL_TU_US;
+    assert(iwx_awdl_peer_run(&pp,149,4,1000000,&w)==1&&w.cur==2&&w.slots==2&&w.start_us==1000000&&w.end_us==1000000+10*IWX_AWDL_TU_US+slot);
+    assert(iwx_awdl_peer_run(&pp,149,1,1000000,&w)==1&&w.slots==1&&w.end_us==1000000+10*IWX_AWDL_TU_US);
+    pp.sync.aw_seq=4*1; /* the slot now is 1 (0), slot 2 (149) starts in 10 TU */
+    assert(iwx_awdl_peer_run(&pp,149,4,1000000,&w)==1&&w.cur==1&&w.start_us==1000000+10*IWX_AWDL_TU_US&&w.end_us==w.start_us+2*slot);
+    pp.sync.aw_seq=4*5; assert(iwx_awdl_peer_run(&pp,149,4,1000000,&w)==0&&w.slots==0);
+    assert(iwx_awdl_peer_run(&pp,44,4,1000000,&w)==0);
+    assert(iwx_awdl_peer_k(2,40000,65536,2)==0&&iwx_awdl_peer_k(2,10000,65536,2)==1&&iwx_awdl_peer_k(1,40000,65536,15)==2);
+    assert(iwx_awdl_peer_lag(10000,65536)==10000&&iwx_awdl_peer_lag(60000,65536)==-5536&&iwx_awdl_peer_lag(5,0)==0);
+    static struct iwx_awdl_roc pr; memset(&pr,0,sizeof(pr)); pr.peer_timed=1; pr.peer_start_us=500;
+    assert(iwx_awdl_roc_peer_wait(&pr,499)&&!iwx_awdl_roc_peer_wait(&pr,500)); pr.peer_timed=0; assert(!iwx_awdl_roc_peer_wait(&pr,1)); }
+  /* 1.2.3: kick only a stuck ring inside an ROC; the missed-beacon pause. */
+  assert(iwx_awdl_roc_kick_due(3,7,7,true)&&!iwx_awdl_roc_kick_due(3,8,7,true)&&!iwx_awdl_roc_kick_due(0,7,7,true)&&!iwx_awdl_roc_kick_due(3,7,7,false));
+  assert(!iwx_awdl_roc_bmiss_paused(5,0)&&iwx_awdl_roc_bmiss_paused(5,6)&&!iwx_awdl_roc_bmiss_paused(6,6)&&IWX_AWDL_ROC_START_DELAY_US==2000&&IWX_AWDL_ROC_BMISS_MAX==6);
+  /* 1.2.4: release just after the boundary of an early ROC, at once when it was late, 2 ms after any other. */
+  assert(iwx_awdl_roc_release_at(1000,0)==1000+IWX_AWDL_ROC_START_DELAY_US&&iwx_awdl_roc_release_at(1000,8000)==8000+IWX_AWDL_ROC_AW_RELEASE_US&&iwx_awdl_roc_release_at(9000,8000)==9000+IWX_AWDL_ROC_AW_RELEASE_US);
+  assert(IWX_AWDL_ROC_PRE_LEAD_US==12000&&IWX_AWDL_ROC_F_NO_PRE==0x1000);
+  /* 1.2.5: QoS data only for the own queue's peer, and never while mode 4 sends through AUX. */
+  assert(iwx_awdl_data_qos(true,true,true,false)&&!iwx_awdl_data_qos(true,true,true,true)&&!iwx_awdl_data_qos(false,true,true,false)&&!iwx_awdl_data_qos(true,false,true,false)&&!iwx_awdl_data_qos(true,true,false,false));
+  /* 1.2.6: A-MSDU through AUX: its own TID, no block-ack test, a 3839-byte cap; 6 slots with the flag. */
+  assert(iwx_awdl_roc_run_max(0x24)==IWX_AWDL_ROC_RUN_MAX_SLOTS&&IWX_AWDL_ROC_RUN_MAX_SLOTS==7&&iwx_awdl_roc_run_max(0x24|IWX_AWDL_ROC_F_GAP1)==7&&iwx_awdl_roc_gap(0x24)==2&&iwx_awdl_roc_gap(0x24|IWX_AWDL_ROC_F_GAP1)==1&&iwx_awdl_roc_mode(IWX_AWDL_ROC_DEFAULT)==4&&iwx_awdl_roc_activity(IWX_AWDL_ROC_DEFAULT)==2&&IWX_AWDL_ROC_DEFAULT==0x10024&&iwx_awdl_roc_tid(0x24)==8&&iwx_awdl_roc_tid(0x24|IWX_AWDL_ROC_F_TID3)==3&&!iwx_awdl_amsdu_stuck(10,5,7,4)&&!iwx_awdl_amsdu_stuck(10,4,7,4)&&iwx_awdl_amsdu_stuck(11,4,7,4)&&IWX_AWDL_ROC_AMSDU_TID==3&&IWX_AWDL_ROC_AMSDU_MAX_BYTES==3839);
+  { static struct iwx_awdl_probe ap; memset(&ap,0,sizeof(ap)); const uint8_t dst[6]={2,1,2,3,4,5}, grp[6]={1,0,0x5e,0,0,1};
+    assert(!iwx_awdl_amsdu_ready_on(&ap,dst,true)); ap.tx.amsdu=1; ap.roc.rate_step=-1;
+    ap.roc.tid=8; assert(!iwx_awdl_amsdu_ready_on(&ap,dst,true)&&!iwx_awdl_amsdu_ready_on(&ap,grp,true)&&!iwx_awdl_amsdu_ready_on(&ap,dst,false)); /* 1.2.10: never on the TID 8 queue */
+    ap.roc.tid=3; assert(iwx_awdl_amsdu_ready_on(&ap,dst,true)&&!iwx_awdl_amsdu_ready_on(&ap,grp,true)); /* 1.2.11: TID 3 queue */ ap.tx.amsdu_gave_up=1; assert(!iwx_awdl_amsdu_ready_on(&ap,dst,true)); }
+  { static struct iwx_awdl_probe dp; memset(&dp,0,sizeof(dp)); const uint8_t ipad[6]={0x0a,0x91,0x95,0xb1,0x3b,0x30}, phone[6]={0x5a,0xa4,0xb6,0x85,0xb5,0x1e}, other[6]={2,9,9,9,9,9};
+    /* 1.2.15: the union takes every active peer's slots: data went to it lately, or its sequence is widened. */
+    const uint8_t idle[16]={149,149,149,0,0,0,0,0,6,149,149,0,0,0,0,0}, wide[16]={149,149,149,149,149,149,149,149,6,149,149,149,149,149,149,149};
+    assert(!iwx_awdl_union_seq(&dp,1000000,149));
+    iwx_awdl_note_dest_tx(&dp,ipad,1000000); iwx_awdl_note_dest_tx(&dp,phone,1000000);
+    auto *pi=iwx_awdl_dpeer_slot(&dp.sync,ipad); memcpy(pi->seq,wide,16); pi->seq_valid=1; pi->seq_us=1000000;
+    auto *pp=iwx_awdl_dpeer_slot(&dp.sync,phone); memcpy(pp->seq,idle,16); pp->seq_valid=1; pp->seq_us=1000000;
+    const uint8_t *u=iwx_awdl_union_seq(&dp,1500000,149); assert(u&&u[5]==149&&u[15]==149&&u[8]==0); /* the iPad's wide slots kept despite the idle iPhone */
+    assert(iwx_awdl_union_seq(&dp,1000000+IWX_AWDL_DEST_SEQ_US,149)==nullptr); /* stale sequences */
+    assert(iwx_awdl_union_seq(&dp,1000000+IWX_AWDL_DEST_SEQ_OLD_US,149,false,IWX_AWDL_DEST_SEQ_OLD_US)==nullptr&&IWX_AWDL_DEST_SEQ_OLD_US==2000000); /* 1.2.23: 0x80000 ages out at 2 s */
+    pi->seq_us=pp->seq_us=6000000; u=iwx_awdl_union_seq(&dp,6500000,149); assert(u&&u[5]==149); /* data 5.5 s ago, but the iPad is widened */
+    pi->seq_us=7000000; memcpy(pi->seq,idle,16); u=iwx_awdl_union_seq(&dp,7100000,149); assert(u&&u[0]==149&&u[5]==0); /* 1.2.16: within the intent window every fresh peer counts */
+    dp.sync.intent_us=0; assert(!iwx_awdl_union_seq(&dp,7100000,149)); /* no intent, no data, nobody widened: family only */
+    pi->tx_us=7000000; u=iwx_awdl_union_seq(&dp,7100000,149,true); assert(u&&u[5]==149&&u[8]==149); /* 0x20000: every slot of a data peer */
+    { static struct iwx_awdl_probe np; memset(&np,0,sizeof(np)); iwx_awdl_note_dest_tx(&np,ipad,123); assert(np.sync.intent_us==123); }
+    for (int i=0;i<4;++i) { uint8_t m[6]={2,0,0,0,0,uint8_t(i)}; iwx_awdl_note_dest_tx(&dp,m,8000000+i); }
+    assert(iwx_awdl_dpeer_slot(&dp.sync,other)->tx_us==0); assert(iwx_awdl_seq_count5(wide)==15&&iwx_awdl_seq_count(idle,149)==5); }
+  /* 1.2.8: the AUX rate step: up after 32 successes to the top given, down after 4 failures inside an ROC, floor HT MCS2. */
+  { static struct iwx_awdl_roc rr; memset(&rr,0,sizeof(rr)); rr.rate_step=IWX_AWDL_ROC_RATE_START;
+    for (int k=0;k<40;++k) iwx_awdl_roc_rate_note(&rr,false,false,-1); assert(rr.rate_step==-1&&rr.rate_downs==0);
+    for (int k=0;k<4;++k) iwx_awdl_roc_rate_note(&rr,false,true,-1); assert(rr.rate_step==0&&rr.rate_downs==1);
+    for (int k=0;k<12;++k) iwx_awdl_roc_rate_note(&rr,false,true,-1); assert(rr.rate_step==IWX_AWDL_ROC_RATE_FLOOR&&iwx_awdl_data_rate(rr.rate_step)>=0);
+    for (int k=0;k<32*3;++k) iwx_awdl_roc_rate_note(&rr,true,true,-1); assert(rr.rate_step==-1);
+    for (int k=0;k<32*3;++k) iwx_awdl_roc_rate_note(&rr,true,true,-1); assert(rr.rate_step==-1);
+    for (int k=0;k<32*2;++k) iwx_awdl_roc_rate_note(&rr,true,true,IWX_AWDL_RATE_TOP_STEP); assert(rr.rate_step==IWX_AWDL_RATE_TOP_STEP); }
+  /* 1.2.9: the union of the family's and the phone's slots on chan, the phone's shifted by k. */
+  { const uint8_t fam[16]={36,0,149,0,0,0,0,0,6,0,149,0,0,0,0,0}, ph[16]={153,0,149,149,149,149,0,0,6,149,149,149,0,0,0,0}; uint8_t u[16];
+    assert(iwx_awdl_seq_union(fam,ph,0,149,u)==5&&u[0]==36&&u[2]==149&&u[5]==149&&u[6]==0&&u[9]==149&&u[11]==149&&u[12]==0);
+    assert(iwx_awdl_seq_union(fam,NULL,0,149,u)==0&&!memcmp(u,fam,16));
+    assert(iwx_awdl_seq_union(fam,ph,1,149,u)==5&&u[1]==149&&u[4]==149&&u[5]==0&&u[8]==149);
+    uint8_t cov[16]; iwx_awdl_seq_union(fam,ph,0,149,u); iwx_awdl_roc_cover(u,149,5,cov,2); assert(cov[2]&&cov[5]&&!cov[6]&&cov[9]&&cov[11]); }
+  /* 1.2.10: a 15-slot run is covered 5 on, 2 off, 5 on, 2 off, 1 on. */
+  { uint8_t sq[16]; memset(sq,149,16); sq[8]=6; uint8_t cv[16]; iwx_awdl_roc_cover(sq,149,5,cv,2); unsigned n=0; for (int k=0;k<16;++k) n+=cv[k]?1:0;
+    assert(n==11&&cv[9]&&cv[13]&&!cv[14]&&!cv[15]&&cv[0]&&cv[4]&&!cv[5]&&!cv[6]&&cv[7]&&!cv[8]); }
+  /* 1.1.97: no ADD within IWX_AWDL_ROC_READD_US of the last end. */
+  assert(IWX_AWDL_ROC_READD_US==10000&&iwx_awdl_roc_readd_wait(5000,0,10000)==0&&iwx_awdl_roc_readd_wait(100000,100000,10000)==10000);
+  assert(iwx_awdl_roc_readd_wait(103000,100000,10000)==7000&&iwx_awdl_roc_readd_wait(110000,100000,10000)==0&&iwx_awdl_roc_readd_wait(99000,100000,10000)==10000);
+  /* The honest sequence in the sync TLVs: covered slots keep 149, the rest 0; without it every slot is the channel. */
+  { struct iwx_awdl_sync sy; memset(&sy,0,sizeof(sy)); sy.encoding=0; uint8_t buf[64]; const uint8_t seq[16]={149,0,0,0,0,0,0,0,0,149,0,0,0,0,0,0};
+    uint8_t *e=iwx_awdl_put_chanseq16(buf,&sy,6,seq); assert(e-buf==6+16&&buf[6]==149&&buf[7]==0&&buf[15]==149);
+    e=iwx_awdl_put_chanseq(buf,&sy,6); assert(buf[6]==6&&buf[21]==6); }
   /* 1.1.91 AUX TX diagnostics */
   assert(iwx_awdl_roc_status_bucket(0x82)==0&&iwx_awdl_roc_status_bucket(0x83)==1&&iwx_awdl_roc_status_bucket(0x85)==2&&iwx_awdl_roc_status_bucket(0x87)==3&&
          iwx_awdl_roc_status_bucket(0x88)==4&&iwx_awdl_roc_status_bucket(0x8e)==5&&iwx_awdl_roc_status_bucket(0x89)==6&&iwx_awdl_roc_status_bucket(0x92)==6&&
@@ -437,12 +600,16 @@ rq=reg[reg.index('struct iwx_roc_req {'):]; rq=rq[:rq.index('} __packed;')]
 assert [l.split()[-1].rstrip(';') for l in rq.splitlines()[1:] if l.strip()]==['action','activity','sta_id','channel_info','node_addr[6]','reserved','max_delay','duration'], 'ROC_CMD version 5 layout, as iwlmld for versions below 6'
 assert '#define IWX_ROC_CMD             0xe' in reg and '#define IWX_ROC_NOTIF           0xf8' in reg and 'struct iwx_aux_sta_cmd {' in reg
 tk=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_tick'):]; tk=tk[:tk.index('\n}\n')]
-assert 'chan == ap' in tk and 'IWX_CMD_ASYNC' in tk and 'memcpy(cmd.node_addr, p->tx.self, 6);' in tk and 'IWX_AWDL_ROC_STA_ID' in tk and 'if (r->pending)\n        return;' in tk, 'One ROC per run on the other 5 GHz channel, async from the tick, AUX station, AWDL address as filter'
+ad=cpp[cpp.index('int ItlIwx::iwx_awdl_roc_add(struct iwx_softc *sc'):]; ad=ad[:ad.index('\n}\n')]
+assert 'chan == ap' in tk and 'iwx_awdl_roc_add(sc, chan, duration, delay, disc, now_us);' in tk and 'if (r->pending)\n        return;' in tk, 'ROCs on the other 5 GHz channel only, one at a time, from the tick (1.1.96: through iwx_awdl_roc_add)'
+assert 'IWX_CMD_ASYNC' in ad and 'memcpy(cmd.node_addr, p->tx.self, 6);' in ad and 'IWX_AWDL_ROC_STA_ID' in ad and 'r->pending = 1;' in ad, 'async, AUX station, AWDL address as filter'
 assert tk.index('r->sent_us >= IWX_AWDL_ROC_STALE_US') < tk.index('if (r->pending)\n        return;'), 'A lost notification does not stop the test'
 rm=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_remove'):]; rm=rm[:rm.index('\n}\n')]
 assert rm.index('IWX_ROC_CMD') < rm.index('iwx_flush_sta_tids(sc, IWX_AWDL_ROC_STA_ID') < rm.index('iwx_mld_disable_txq(sc, IWX_AWDL_ROC_STA_ID') < rm.index('IWX_STA_REMOVE_CMD'), 'ROC, frames, queue, then station'
 su=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_setup'):]; su=su[:su.index('\n}\n')]
-assert su.index('IWX_AUX_STA_CMD') < su.index('iwx_tvqm_enable_txq(sc, IWX_AWDL_ROC_TID') and 'r->setup_failed = 1;' in su and 'iwx_awdl_roc_remove(sc);' in su, 'AUX station before its queue; a failure cleans up and stops'
+assert 'iwx_awdl_note_dest_seq(p, sender, &t);\n    if (!t.sync || t.sync_len < 31) return;' in (ROOT/'itlwm/hal_iwx/iwx_awdl_probe.h').read_text() and 'const uint8_t *useq = iwx_awdl_union_seq(&com.sc_awdl_probe, now / 1000, other,' in cpp and 'iwx_awdl_note_dest_tx(p, eth, ns / 1000);' in cpp and 'iwx_awdl_seq_union(r->fam, useq, k, other, seq);' in cpp, 'the union follows the data peer (1.2.13)'
+assert "iwx_awdl_roc_activity(r->want) != r->activity ||\n        iwx_awdl_roc_tid(r->want) != r->tid))) {" in cpp, 'the tick rebuilds on a new TID (1.2.12)'
+assert su.index('IWX_AUX_STA_CMD') < su.index('iwx_tvqm_enable_txq(sc, r->tid') and 'r->tid = iwx_awdl_roc_tid(r->want);' in su and 'r->setup_failed = 1;' in su and 'iwx_awdl_roc_remove(sc);' in su, 'AUX station before its queue; a failure cleans up and stops'
 rdy=cpp[cpp.index('static uint32_t iwx_awdl_roc_blocked'):]; rdy=rdy[:rdy.index('\n}\n')]
 assert 'p->ctx.mode != 6' in rdy and 'if (p->ctx.solo)' in rdy and 'if (p->tx.tripped)' in rdy and 'iwx_ap_port_open(ic, ic->ic_bss)' in rdy, 'Only beside a working AP link (as a mask since 1.1.82; open networks count, 1.1.83)'
 crm=cpp[cpp.index('iwx_awdl_ctx_remove(struct iwx_softc *sc)\n{'):]; crm=crm[:crm.index('\n}\n')]
@@ -471,7 +638,13 @@ assert 'iwx_awdl_peer_note(probe, frame, frameLength, awdlRssi, probe->rx_host_u
 assert 'iwx_awdl_note_bytes(p, eth, length);' in cpp and 'c->own_target = bulk;' in cpp and 'c->own_target >= 0 && uint32_t(c->own_target) < p->peer_added' in cpp, 'Bulk peer takes the own queue (1.1.77)'
 assert 'if (slot == 0)\n        self->restoreRunning();' in iface and 'self->reportDataStats();\n    self->postMessage(kAwStartMessage, event, sizeof(event), false);' in iface and '__asm__("__ZN23IO80211SkywalkInterface24updateInterfaceDataStatsEP36apple80211_data_path_interface_stats")' in iface, 'awdl0 traffic reaches the family before every AW event (1.1.81)'
 rd=iface[iface.index('void AirportItlwmAWDLInterface::reportDataStats()'):]; rd=rd[:rd.index('\n}\n')]
-assert 'memcpy(statsBuf + 0x08, &tx' in rd and 'memcpy(statsBuf + 0x18, &rx' in rd and 'if (!tx && !rx)' in rd and 'sizeof(statsBuf)' in rd
+assert 'memcpy(statsBuf + 0x08, &tx' in rd and 'memcpy(statsBuf + 0x18, &rx' in rd and 'if (!tx && !rx && !pad)' in rd and 'sizeof(statsBuf)' in rd
+# 1.2.17: the hold pads tx before it is copied, from unicast counts taken on both paths.
+assert rd.index('iwx_awdl_dmhold_pad(&dmHold') < rd.index('tx += pad;') < rd.index('memcpy(statsBuf + 0x08, &tx'), 'data-mode hold order (1.2.17)'
+# 1.2.18: both receive paths stamp the packet before it goes up, through the exported non-virtual setter.
+assert iface.count('be201StampRx(packet)') == 2 and iface.index('++*(be201StampRx(packet) ? &rxStamped : &rxUnstamped);') < iface.index('const IOReturn enqueued = be201RxCompEnqueue(queues[3], &packet, 1, 0);'), 'rx timestamp (1.2.18)'
+assert 'metaCast("IOSkywalkNetworkPacket")' in iface and '__ZN22IOSkywalkNetworkPacket12setTimestampEy' in open('AirportItlwm/BE201SkywalkFactories.hpp').read(), 'rx timestamp setter (1.2.18)'
+assert iface.count('++ucastTx;') == 1 and 'ucastTx += run;' in iface and iface.count('++ucastRx;') == 1, 'unicast counts (1.2.17)'
 wcl=(ROOT/'AirportItlwm/WCL/WCL.cpp').read_text()
 st=wcl[wcl.index('IOReturn AirportItlwmSkywalkInterface::startWCLScan'):]; st=st[:st.index('\n}\n')]
 assert st.index('fHalService->awdlBulkActive()') < st.index('ieee80211_begin_cache_bgscan') and 'nowUs - wclLastRealScanUs < 30000000ULL' in st and 'scanSource->setTimeoutMS(300);' in st and st.index('wclLastRealScanUs = nowUs;') < st.index('ieee80211_begin_cache_bgscan'), 'Background scans wait while AWDL carries bulk data, one real scan per 30 s (1.1.79)'
@@ -516,7 +689,8 @@ for _c in ['IWX_AUX_STA_CMD','IWX_ROC_CMD','IWX_STA_DISABLE_TX_CMD']:
 rt=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_task(void *arg)'):]; rt=rt[:rt.index('\n}\n')]
 assert rt.index('iwx_awdl_roc_activity(r->want) != r->activity') < rt.index('that->iwx_awdl_roc_remove(sc);') < rt.index('that->iwx_awdl_roc_setup(sc);'), 'A mode or activity change removes, then sets up again (1.1.85)'
 tk=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_tick('):]; tk=tk[:tk.index('\n}\n')]
-assert 'iwx_awdl_roc_disc_due(r, now_us)' in tk and 'duration = IWX_AWDL_ROC_DISC_TU;' in tk and 'cmd.max_delay = htole32(delay);' in tk and '++r->disc;' in tk, 'Discovery ROC (1.1.85)'
+ad=cpp[cpp.index('int ItlIwx::iwx_awdl_roc_add(struct iwx_softc *sc'):]; ad=ad[:ad.index('\n}\n')]
+assert 'iwx_awdl_roc_disc_due(r, now_us)' in tk and 'duration = IWX_AWDL_ROC_DISC_TU;' in tk and 'cmd.max_delay = htole32(delay);' in ad and '++r->disc;' in ad, 'Discovery ROC (1.1.85)'
 mq=cpp[cpp.index('iwx_rx_mpdu_mq(struct iwx_softc *sc, mbuf_t m, void *pktdata,'):]; mq=mq[:mq.index('\n}\n')]
 assert mq.index('IWX_RX_MPDU_RES_STATUS_CRC_OK') < mq.index('++r->rx_any;') < mq.index('len = le16toh(desc->mpdu_len);'), 'Every frame during an ROC is counted before any filter'
 assert 'probe->roc.heard_us = probe->rx_host_us;' in cpp and 'probe->rx_chan != uint32_t(ieee80211_chan2ieee(ic, ic->ic_bss->ni_chan))' in cpp
@@ -530,7 +704,7 @@ assert mv.index('++r->phy_cancels;') < mv.index('IWX_ROC_CMD') < mv.index('IWX_L
 assert 'cmd.action = htole32(IWX_FW_CTXT_ACTION_REMOVE);' in mv[:mv.index('iwx_phy_ctxt_update')] and ', 0, sizeof(cmd), &cmd) ?: err;' in mv, 'The removal waits for its answer'
 q=cpp[cpp.index('if (c->phy2_want != phy2) {'):]; q=q[:q.index('}')]
 assert 'c->phy2_moving = 1;' in q and q.index('c->phy2_moving = 1;') < q.index('iwx_add_task(sc, systq, &sc->awdl_phy2_task);'), 'A queued move holds ROCs before the task runs'
-assert tk.index('if (r->pending)\n        return;') < tk.index('if (c->phy2_moving) {\n        ++r->phy_holds;\n        return;\n    }') < tk.index('cmd.action = htole32(IWX_FW_CTXT_ACTION_ADD);'), 'No ROC is added during a move'
+assert tk.index('if (r->pending)\n        return;') < tk.index('if (c->phy2_moving) {\n        ++r->phy_holds;\n        return;\n    }') < tk.index('iwx_awdl_roc_add(sc, chan, duration, delay, disc, now_us);'), 'No ROC is added during a move'
 assert 'sc->sc_awdl_probe.ctx.phy2_chan = sc->sc_awdl_probe.ctx.phy2_want = 0;\n    sc->sc_awdl_probe.ctx.phy2_moving = 0;' in cpp, 'A restart clears the mark'
 ne=cpp[cpp.index('iwx_nic_error(struct iwx_softc *sc)\n{'):]; ne=ne[:ne.index('\n}\n')]
 assert ne.index('iwx_awdl_fault_roc(&sc->sc_awdl_probe.roc)') < ne.index('++sc->sc_fw_errors;') and 'setProperty("ItlwmAwdlFaultRoc"' in ne and 'setProperty("ItlwmAwdlFaultPhy2"' in ne
@@ -549,6 +723,287 @@ ra=cpp[cpp.index('void ItlIwx::setAwdlRadioTest('):]; ra=ra[:ra.index('if (phy2 
 assert ra.index('if (c->solo) {') < ra.index('phy2 = iwx_awdl_phy2_after_fault(&c->phy2_fault_hold, phy2);'), 'the hold applies before any move'
 assert ne.index('if (sc->sc_awdl_probe.ctx.phy2_moving) {\n        sc->sc_awdl_probe.ctx.phy2_fault_hold = 1;') < ne.index('++sc->sc_fw_errors;')
 assert 'phy2_fault_hold' not in cpp[cpp.index('sc->sc_awdl_probe.ctx.phy2_chan = sc->sc_awdl_probe.ctx.phy2_want = 0;'):][:300], 'a restart keeps the hold'
+# 1.1.94: the move keeps peer TLC valid for the link's PHY and quiesces the own queue both ways (12:20 assert at LINK_CONFIG).
+mv=cpp[cpp.index('void ItlIwx::iwx_awdl_phy2_move(struct iwx_softc *sc)'):cpp.index('void ItlIwx::setAwdlOwnQueue')]
+te=mv.index('if (c->phy2_chan) {\n        c->phy2_step = IWX_AWDL_MOVE_TE;'); own=mv.index('    if (c->own_qid > 0) {\n        c->phy2_step = IWX_AWDL_MOVE_OWN;')
+assert te < mv.index('++c->te_removed;\n    }\n') < own, 'the own queue is handled outside the second-channel-only block'
+assert own < mv.index('err = that->iwx_awdl_own_release(sc) ?: err;') < mv.index('++r->phy_cancels;'), 'own queue released before the ROC cancel'
+narrow=mv.index('if (iwx_awdl_move_tlc_narrow(want, c->phy2_chan) && p->peer_tlc) {')
+assert mv.index('++r->phy_cancels;') < narrow < mv.index('that->iwx_awdl_peers_tlc(sc, IEEE80211_CHAN_WIDTH_20)') < mv.index('IWX_LINK_CONTEXT_MODIFY_ACTIVE, 0) ?: err;'), 'TLC narrowed before the link is deactivated'
+withphy=mv.index('c->phy2_step = IWX_AWDL_MOVE_WITH_PHY;'); widen=mv.index('if (!err && iwx_awdl_move_tlc_widen(want, c->phy2_chan) && p->peer_tlc) {')
+assert mv.index('iwx_phy_ctxt_update(sc, &sc->sc_phyctxt[1]') < withphy < widen < mv.index('that->iwx_awdl_peers_tlc(sc, ic->ic_bss->ni_chw);') < mv.index('IWX_LINK_CONTEXT_MODIFY_ACTIVE | IWX_LINK_CONTEXT_MODIFY_RATES_INFO, 1);'), 'TLC widened with the AP PHY before activation'
+assert mv.index('IWX_LINK_CONTEXT_MODIFY_RATES_INFO, 1);') < mv.index('c->phy2_step = IWX_AWDL_MOVE_NONE;') < mv.index('err = err ?: active;'), 'step cleared when the move ends'
+for st in ['ROC','INACTIVE','NO_PHY','PHY','ACTIVE']:
+    assert f'c->phy2_step = IWX_AWDL_MOVE_{st};' in mv, st
+pa=cpp[cpp.index('iwx_awdl_peer_agg(struct iwx_softc *sc, uint32_t index)\n{'):]; pa=pa[:pa.index('\n}\n')]
+assert 'iwx_awdl_peer_tlc(sc, index, (c->phy2_chan || c->phy2_want) ? IEEE80211_CHAN_WIDTH_20 : ni->ni_chw);' in pa and 'own_tlc_err = err == ENOTSUP ? 0xffff' in pa
+pt1=cpp[cpp.index('iwx_awdl_peer_tlc(struct iwx_softc *sc, uint32_t index, uint8_t width)\n{'):]; pt1=pt1[:pt1.index('\n}\n')]
+assert pt1.index('IWX_TLC_MNG_CONFIG_CMD) != 4)') < pt1.index('tlc.max_ch_width = iwx_rs_fw_bw_from_sta_bw(width);') < pt1.index('p->peer_tlc = uint8_t(p->peer_tlc | (1u << index));')
+assert 'if (!err)\n        p->peer_tlc' in pt1 and 'return ECANCELED;' in pt1
+ps=cpp[cpp.index('iwx_awdl_peers_tlc(struct iwx_softc *sc, uint8_t width)\n{'):]; ps=ps[:ps.index('\n}\n')]
+assert 'if (!(p->peer_tlc & (1u << i)))\n            continue;' in ps and '++c->phy2_tlc_refreshes;' in ps and 'c->phy2_tlc_err =' in ps
+assert 'p->peer_tlc = uint8_t(p->peer_tlc & ~(1u << v));' in cpp, 'a replaced peer loses its TLC mark'
+assert cpp.count('peer_tlc = 0;') == 2, 'context removal and restart clear the TLC marks'
+assert 'sc->sc_awdl_probe.ctx.phy2_moving = 0;\n    sc->sc_awdl_probe.ctx.phy2_step = 0;' in cpp, 'a restart clears the step'
+oq=cpp[cpp.index('void ItlIwx::iwx_awdl_ownq_task(void *arg)'):]; oq=oq[:oq.index('/* The station data goes to;')]
+assert 'p->tx.tripped || c->phy2_moving ||' in oq, 'no own queue build during a move'
+ne=cpp[cpp.index('iwx_nic_error(struct iwx_softc *sc)\n{'):]; ne=ne[:ne.index('\n}\n')]
+assert ne.index('iwx_awdl_fault_link(sc->sc_awdl_probe.ctx.phy2_step,') < ne.index('setProperty("ItlwmAwdlFaultLink"') < ne.index('++sc->sc_fw_errors;')
+for k in ['ItlwmAwdlPhy2TlcRefreshes','ItlwmAwdlPhy2TlcErr','ItlwmAwdlPhy2OwnQuiesces','ItlwmAwdlPeerTlc']:
+    assert f'setProperty("{k}"' in cpp, k
+hpp=(ROOT/'itlwm/hal_iwx/ItlIwx.hpp').read_text()
+assert 'int iwx_awdl_peer_tlc(struct iwx_softc *, uint32_t index, uint8_t width);' in hpp and 'int iwx_awdl_peers_tlc(struct iwx_softc *, uint8_t width);' in hpp
+# 1.1.95: the AWDL unicast rate follows the PHY the frame leaves on; AUX unicast data counted apart.
+fc=cpp[cpp.index('iwx_tx_fill_cmd(struct iwx_softc *sc, struct iwx_node *in,'):]; fc=fc[:fc.index('\n}\n')]
+assert fc.index('const bool awdlRoc =') < fc.index('const bool roc80 = awdlRoc && (sc->sc_awdl_probe.roc.want & IWX_AWDL_ROC_F_80MHZ);') < fc.index('if (!iwx_awdl_rate_fits(rate, awdlRoc ? roc80 :\n                                ni->ni_chw == IEEE80211_CHAN_WIDTH_80 || ni->ni_chw == IEEE80211_CHAN_WIDTH_160,\n                                false, !awdlRoc && sc->sc_awdl_probe.ctx.phy2_chan != 0))\n            rate = iwx_awdl_data_rate(-1);') < fc.index('*flags |= IWX_TX_FLAGS_CMD_RATE;'), 'ROC frames at the ROC width (1.1.96), others at the AP width unless link 1 is on 149'
+assert 'ni->ni_chw != IEEE80211_CHAN_WIDTH_80 && ni->ni_chw != IEEE80211_CHAN_WIDTH_160' not in fc, 'the old AP-only check is gone'
+cs1=cpp[cpp.index('iwx_rx_tx_cmd_single(struct iwx_softc *sc'):]; cs1=cs1[:cs1.index('\n}\n')]
+assert cs1.index('iwx_awdl_roc_note_tx(&sc->sc_awdl_probe.roc') < cs1.index('if (txd->awdl_kind != 1 && txd->type == IEEE80211_FC0_TYPE_DATA)') < cs1.index('roc.txs.fail_ucast_data);')
+for k in ['ItlwmAwdlRocTxOkUcastData','ItlwmAwdlRocTxFailUcastData']:
+    assert f'{{"{k}"' in cpp, k
+roc=(ROOT.parent/'kit/roc_test.py').read_text()
+# 1.1.96 ROC tool: duty phases, mode 4 with the honest sequence, A-MSDU and 80 MHz probes, then the S probe.
+assert "TE = 'debug.be201_awdl_phy2_te'" in roc and "AMSDU = 'debug.be201_awdl_amsdu'" in roc and 'F80, FNODTIM = 0x100, 0x200' in roc
+main=roc[roc.index('def main():'):]
+order=["if full:\n            z, d = phase('基准（ROC 关闭）'", "'R1 模式 1：整段 ROC（不按 DTIM 限制）'", 'setv(PHY2, 1)', "if full:\n                z, d = phase('链路先移到 149", "setv(ROC, 4 + 16 * activity)\n", "z = wait_start(lines, faulted)", "'R2 模式 4：默认', 60", "'R2 模式 4：默认（继续）', 60", "'R2 模式 4：默认（再次）', 45", "finish(lines, faulted)"]
+assert [main.index(x) for x in order] == sorted(main.index(x) for x in order), 'phase order (1.2.17)'
+assert "'S 探测：" not in main and "'R2 模式 4：+ A-MSDU'" not in main and 'setv(AMSDU, 1)' not in main and 'if home in (6, 44):' in main
+ph=roc[roc.index('def phase('):roc.index('def main():')]
+assert ph.index('setv(ROC, 0)') < ph.index('setv(TE, 0)') < ph.index('setv(AMSDU, 0)') < ph.index('setv(PHY2, 0)'), 'a fault turns everything off, the link last'
+fin=main[main.index('finally:'):]
+assert 'restore()' in fin
+rs=roc[roc.index('def restore():'):roc.index('def gateway():')]
+assert rs.index('setv(ROC, 0)') < rs.index('setv(AMSDU, 0)') < rs.index('setv(PHY2, START.get(PHY2, 0))') < rs.index('setv(ROC, START[ROC])'), 'the tool puts the boot switches back, ROC last (1.2.15)'
+for k in ['RocCovSumMs','RocChainAdds','RocChainGapSumMs','RocDwell25','RocWideAdds','TxOkAway','AmsduSent']:
+    assert roc.count(f"'{k}'") >= 2, k
+# 1.1.96: chained ROCs over 64 TU slots, the DTIM cap, the bigger hold, the honest sequence.
+iface2=(ROOT/'AirportItlwm/AirportItlwmAWDLInterface.cpp').read_text()
+aw=iface2[iface2.index('awdlController->setAWDLSequence(fam, slot);')-400:]
+assert aw.index('fam[i] = self->awChannels[i] <= 255') < aw.index('awdlController->setAWDLSequence(fam, slot);') < aw.index('awdlController->setAWDLSlot(chan, run | (next5 << 8), seq5);'), 'the sequence reaches the HAL before the slot tick'
+hal=(ROOT/'include/HAL/ItlHalService.hpp').read_text(); v2h=(ROOT/'AirportItlwm/AirportItlwmV2.hpp').read_text(); hpp2=(ROOT/'itlwm/hal_iwx/ItlIwx.hpp').read_text()
+assert 'virtual void setAwdlSequence(const uint8_t *, uint32_t) {}' in hal and 'fHalService->setAwdlSequence(chans, slot)' in v2h and 'void setAwdlSequence(const uint8_t *, uint32_t) override;' in hpp2
+assert 'static void iwx_awdl_roc_chain_task(void *);' in hpp2 and 'int iwx_awdl_roc_add(struct iwx_softc *, uint32_t chan, uint32_t duration, uint32_t delay, bool disc, uint64_t now_us);' in hpp2
+v2c=(ROOT/'AirportItlwm/AirportItlwmV2.cpp').read_text()
+assert 'return value > 0 && value < 0x400000 ? static_cast<uint32_t>(value) : 0;' in v2c, 'the ROC switch takes the probe flags (1.2.23: 0x200000)'
+# 1.2.19: the gate holds in iwx_tx and stops the flush, and its state is set each slot from data peers only.
+assert '(r->want & IWX_AWDL_ROC_F_SEQ2S) ? IWX_AWDL_DEST_SEQ_OLD_US :' in cpp and '!(r->want & IWX_AWDL_ROC_F_NO_SLOT_FLUSH)' in cpp and 'AirportItlwm::awdlRocWanted() & IWX_AWDL_ROC_F_NO_STAMP' in iface, 'presence A/B switches (1.2.23)'
+assert 'value < 0x400000' in v2c, 'switch range takes the A/B flags (1.2.23)'
+# 1.2.24 pause mode wiring: link 1 held home, ROC blocked, beacons ignored and router data dropped only while tuned.
+ps=cpp[cpp.index('void ItlIwx::iwx_awdl_pause_run'):]; ps=ps[:ps.index('\n}\n')]
+assert ps.index('iwx_awdl_pause_null(sc, true);') < ps.index('s->tuned = 1;') < ps.index('iwx_pause_wide_chan = s->chan;') < ps.index('&ic->ic_channels[s->chan]'), 'pause enter order (1.2.25)'
+assert 'iwx_rs_init' not in ps and 'iwx_awdl_peers_tlc' not in ps, 'no rate control change in a pause (1.2.25: TLC asserted the firmware)'
+lv=ps[ps.index('IWX_AWDL_PAUSE_LEAVING'):]
+assert lv.index('in->in_ni.ni_chan') < lv.index('s->tuned = 0;') < lv.index('iwx_pause_wide_chan = 0;') < lv.index('iwx_awdl_pause_null(sc, false);') < lv.index('s->phy2_hold = 0;'), 'pause leave order (1.2.25)'
+assert 'const bool pauseWide = c != NULL && iwx_pause_wide_chan' in cpp and 'return iwx_awdl_ctrl_pos80(ch);' in cpp and '!iwx_awdl_pause_width_ok(ic->ic_bss->ni_chw)' in cpp, 'router width on the AWDL channel (1.2.25)'
+assert 'if (p->pause.phy2_hold)\n        phy2 = 0;' in cpp and 'if (p->pause.state != IWX_AWDL_PAUSE_OFF)\n        b |= 1u << 13;' in cpp and 'if (sc->sc_awdl_probe.pause.tuned) {' in cpp, 'pause hooks (1.2.24)'
+assert 'iwx_awdl_pause_drops(&sc->sc_awdl_probe.pause, awdlKind != 0, type == IEEE80211_FC0_TYPE_DATA)' in cpp and 'task_set(&sc->awdl_pause_task, iwx_awdl_pause_task' in cpp, 'pause drop and task (1.2.24)'
+assert 'awdlController->setAWDLPause(self->pauseWant && AirportItlwm::awdlPauseWanted());' in iface and 'pauseWant = iwx_awdl_pause_trig_step(&pauseTrig' in iface, 'pause trigger (1.2.24)'
+assert 'ItlAwdlFlag("be201_awdl_pause")' in v2c and 'sysctl_unregister_oid(&sysctl__debug_be201_awdl_pause);' in v2c, 'pause switch (1.2.24)'
+assert cpp.count('iwx_awdl_roc_gate_check(&sc->sc_awdl_probe, ') == 2 and 'r->gate_k = uint8_t(k);' in cpp, 'sparse-peer gate per destination (1.2.19)'
+assert cpp.index('r->gate_us = 0;') < cpp.index('r->gate_k = uint8_t(k);'), 'gate state cleared each slot (1.2.19)'
+assert 'com.sc_awdl_probe.sync.intent_us = now / 1000;' in cpp and '(r->want & IWX_AWDL_ROC_F_DPEER_ALL) != 0' in cpp, 'intent window and the all-slots flag (1.2.16)'
+assert 'if (ItlAwdlFlag("be201_awdl_xchan")) {' in v2c and '__atomic_store_n(&be201AwdlRocValue, 0x390024, __ATOMIC_RELEASE);' in v2c and '__atomic_store_n(&be201AwdlPhy2Value, 1, __ATOMIC_RELEASE);' in v2c, 'cross-channel on at boot (1.2.15)'
+assert 'if (iwx_awdl_roc_mode(p->roc.want) >= 4 && !p->ctx.phy2_chan)\n        b |= 1u << 11;' in cpp and 'IEEE80211_IS_CHAN_2GHZ(ic->ic_bss->ni_chan))\n        b |= 1u << 12;' in cpp, 'mode 4 waits for link 1; the default stays off on 2.4 GHz'
+sq=cpp[cpp.index('void ItlIwx::setAwdlSequence(const uint8_t *chans, uint32_t slot)'):]; sq=sq[:sq.index('\n}\n')]
+assert 'inGate()' in sq and 'memcpy(r->fam, chans, sizeof(r->fam));' in sq and 'r->fam_valid = 1;' in sq
+sl=cpp[cpp.index('void ItlIwx::setAwdlSlot(uint32_t chan, uint32_t run, uint32_t seq5)'):]; sl=sl[:sl.index('\n}\n')]
+assert sl.index('r->cap_tu = iwx_awdl_roc_cap(') < sl.index('iwx_awdl_roc_cover(seq, other, iwx_awdl_roc_run_max(r->want), r->cover, iwx_awdl_roc_gap(r->want));') < sl.index('r->announce_on = uint8_t((r->fam_valid || r->peer_timed) && iwx_awdl_roc_mode(r->want) >= 4 && r->sta_added') < sl.index('iwx_awdl_roc_tick(&com, now / 1000);'), 'cover and announce before the tick'
+tk2=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_tick('):]; tk2=tk2[:tk2.index('\n}\n')]
+assert tk2.index('if (r->fam_valid || r->peer_timed) {') < tk2.index('const bool disc = other && iwx_awdl_roc_disc_due(r, now_us);') < tk2.index('if (!disc && r->cap_tu && duration > r->cap_tu)') < tk2.index('iwx_awdl_roc_add(sc, chan, duration, delay, disc, now_us);'), 'covered time, discovery first, then the cap'
+ad2=cpp[cpp.index('int ItlIwx::iwx_awdl_roc_add(struct iwx_softc *sc'):]; ad2=ad2[:ad2.index('\n}\n')]
+assert 'const bool wide = !disc && (r->want & IWX_AWDL_ROC_F_80MHZ);' in ad2 and 'wide ? IWX_PHY_VHT_CHANNEL_MODE80 : IWX_PHY_VHT_CHANNEL_MODE20' in ad2 and 'wide ? iwx_awdl_ctrl_pos80(chan) : IWX_PHY_VHT_CTRL_POS_1_BELOW' in ad2
+ch=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_chain_task(void *arg)'):]; ch=ch[:ch.index('\n}\n')]
+for need in ['inGate()', 'r->pending ||', '!iwx_awdl_roc_ready(sc)', 'c->phy2_moving', 'iwx_awdl_roc_mode(r->want) != r->mode', '++r->chain_skips;', '++r->chain_adds;', 'duration > r->cap_tu', 'chan == ap']:
+    assert need in ch, need
+rn2=cpp[cpp.index('case IWX_WIDE_ID(IWX_MAC_CONF_GROUP, IWX_ROC_NOTIF): {'):]; rn2=rn2[:rn2.index('break;\n            }')]
+assert rn2.index('iwx_awdl_roc_note_dwell(r, now / 1000 - r->started_us, r->dur_tu);') < rn2.index('iwx_awdl_roc_note_end(r, now / 1000);') < rn2.index('r->last_end_us = now / 1000;\n                    /* 1.1.96: chain') < rn2.index('iwx_add_task(sc, systq, &sc->awdl_roc_chain_task);'), 'dwell, end, then the chain'
+assert '++r->chain_gap_n;' in rn2
+assert 'task_set(&sc->awdl_roc_chain_task, iwx_awdl_roc_chain_task, sc, "iwx_awdl_roc_chain_task");' in cpp and 'iwx_del_task(sc, systq, &sc->awdl_roc_chain_task);' in cpp
+assert cpp.count('iwx_awdl_roc_ring_cap(r->active)') == 3 and 'IWX_AWDL_TX_MAX_QUEUED)\n            break;' not in cpp, 'flush and iwx_tx use the ROC ring cap'
+cs2=cpp[cpp.index('iwx_rx_tx_cmd_single(struct iwx_softc *sc'):]; cs2=cs2[:cs2.index('\n}\n')]
+assert cs2.index('roc.txs.fail_ucast_data);') < cs2.index('1.2.0: the caller refills it at once (iwx_awdl_roc_flush)'), 'an AUX completion flushes the hold (1.2.0: from the caller)'
+assert 'r->announce_on = 0;' in cpp[cpp.index('void ItlIwx::iwx_awdl_roc_remove'):][:300]
+for k in ['ItlwmAwdlRocCovSumMs','ItlwmAwdlRocChainAdds','ItlwmAwdlRocChainGapSumMs','ItlwmAwdlRocDwell25','ItlwmAwdlRocDwellFull','ItlwmAwdlRocWideAdds','ItlwmAwdlRocCapTu','ItlwmAwdlRocAnnounce']:
+    assert f'{{"{k}"' in cpp, k
+pr=(ROOT/'itlwm/hal_iwx/iwx_awdl_probe.h').read_text()
+assert 'const uint8_t *announced = p->roc.announce_on ? p->roc.cover : NULL;' in pr and pr.count('iwx_awdl_put_chanseq16(w, s, chan, announced);') == 2, 'both sequence TLVs say only the covered slots in mode 4'
+# 1.1.97: the re-ADD guard on every path that adds, every end sets its start, and the last ADD in the fault snapshot.
+tk3=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_tick('):]; tk3=tk3[:tk3.index('\n}\n')]
+assert tk3.index('if (r->pending)\n        return;') < tk3.index('if (iwx_awdl_roc_readd_wait(now_us, r->last_end_us, IWX_AWDL_ROC_READD_US)) {\n        ++r->readd_waits;\n        return;') < tk3.index('const bool disc = other') < tk3.index('r->last_add_src = disc ? 3 : 1;') < tk3.index('iwx_awdl_roc_add(sc, chan, duration, delay, disc, now_us);'), 'the tick waits out the guard, discovery included'
+assert tk3.index('++r->stale;\n        r->last_end_us = now_us;') < tk3.index('if (r->pending)\n        return;')
+ch3=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_chain_task(void *arg)'):]; ch3=ch3[:ch3.index('\n}\n')]
+assert ch3.index('if (!that->getMainWorkLoop()->inGate()) {') < ch3.index('IOSleep((wait + 999) / 1000 + 1);') < ch3.index('getMainCommandGate()->runAction('), 'the chain sleeps outside the gate'
+assert ch3.index('iwx_awdl_roc_readd_wait(now_us, r->last_end_us, IWX_AWDL_ROC_READD_US) ||') < ch3.index('r->last_add_src = 2;') < ch3.index('++r->chain_adds;'), 'and checks again in the gate'
+rn3=cpp[cpp.index('case IWX_WIDE_ID(IWX_MAC_CONF_GROUP, IWX_ROC_NOTIF): {'):]; rn3=rn3[:rn3.index('break;\n            }')]
+assert rn3.index('++r->failed;') < rn3.index('r->last_end_us = now / 1000; /* 1.1.97') < rn3.index('++r->started;'), 'a failed ROC starts the guard'
+rm3=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_remove(struct iwx_softc *sc)'):]; rm3=rm3[:rm3.index('\n}\n')]
+assert rm3.index('++r->removes;') < rm3.index('r->last_end_us = ns / 1000;') < rm3.index('iwx_send_cmd_pdu(sc, iwx_cmd_id(IWX_ROC_CMD'), 'so does a REMOVE'
+ad3=cpp[cpp.index('int ItlIwx::iwx_awdl_roc_add(struct iwx_softc *sc'):]; ad3=ad3[:ad3.index('\n}\n')]
+assert ad3.index('r->sent_us = now_us;') < ad3.index('r->last_add_after_us = ') < ad3.index('r->readd_min_us = ')
+for k in ['ItlwmAwdlRocReaddWaits','ItlwmAwdlRocReaddMinUs']:
+    assert f'{{"{k}"' in cpp, k
+ft=cpp[cpp.index('setProperty("ItlwmAwdlFaultRoc", sc->sc_awdl_probe.tx.fault_roc, 32);'):][:600]
+assert 'setProperty("ItlwmAwdlFaultRocAfterUs", sc->sc_awdl_probe.roc.last_add_after_us, 32);' in ft and 'setProperty("ItlwmAwdlFaultRocAdd", uint32_t(sc->sc_awdl_probe.roc.last_add_src) |' in ft
+for k in ['RocReaddWaits','RocReaddMinUs','FaultRocAfterUs','FaultRocAdd']:
+    assert f"'{k}'" in roc, k
+assert roc.count("'RocReaddWaits'") >= 2 and 'def last_add(after_us, add):' in roc and "last_add(z.get('FaultRocAfterUs'), z.get('FaultRocAdd'))" in roc
+# 1.1.99: no drop on a full ring or behind held frames; the family waits on a high hold and is woken when it is low.
+tx5=cpp[cpp.index('iwx_tx(struct iwx_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)\n{'):]; tx5=tx5[:tx5.index('\n}\n')]
+hb5=tx5[tx5.index('/* 1.1.92, mode 4'):tx5.index('++r->tx_sent;')]
+assert hb5.index('iwx_awdl_roc_hold_why(') < hb5.index('sc->txq[r->qid].queued >= iwx_awdl_roc_ring_cap(r->active)) : 0;') < hb5.index('if (why) {') < hb5.index('if (why != 1)\n                    iwx_add_task(sc, systq, &sc->awdl_roc_flush_task);') < hb5.index('return 0;')
+gt=cpp[cpp.index('IOReturn ItlIwx::iwx_awdl_data_gate('):]; gt=gt[:gt.index('\n}\n')]
+assert gt.index('if (iwx_awdl_roc_hold_busy(p->roc.mode, p->roc.sta_added && p->roc.qid > 0, p->roc.hold_n)) {') < gt.index('p->roc.hold_stall_wait = 1;') < gt.index('++p->tx.data_stalls;\n        }\n        return kIOReturnBusy;') < gt.index('sc->txq[dataQid].queued >= IWX_AWDL_DATA_MAX_QUEUED')
+wk=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_wake(struct iwx_softc *sc)'):]; wk=wk[:wk.index('\n}\n')]
+assert 'p->roc.hold_n > IWX_AWDL_ROC_HOLD_LOW' in wk and 'controller->awdlTxRoom();' in wk and 'p->tx.data_stalled = 0;' in wk
+fl5=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_flush(struct iwx_softc *sc)'):]; fl5=fl5[:fl5.index('\n}\n')]
+assert fl5.rstrip().endswith('that->iwx_awdl_roc_wake(sc);')
+# 1.2.0: refill straight from the AUX completion and the ROC start; air time and rate of AUX unicast data.
+ft=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_flush_task(void *arg)'):]; ft=ft[:ft.index('\n}\n')]
+assert ft.rstrip().endswith('that->iwx_awdl_roc_flush(sc);')
+assert cpp.index('iwx_ampdu_txq_advance(sc, ring, idx);\n        iwx_clear_oactive(sc, ring);\n#ifdef AIRPORT_WCL\n        /* 1.2.0') < cpp.index('            ++sc->sc_awdl_probe.roc.flush_direct;\n            iwx_awdl_roc_flush(sc);')
+rn6=cpp[cpp.index('case IWX_WIDE_ID(IWX_MAC_CONF_GROUP, IWX_ROC_NOTIF): {'):]; rn6=rn6[:rn6.index('break;\n            }')]
+assert rn6.index('r->rq_batch = 0;') < rn6.index('if (r->hold_n && !r->flushing) {\n                        ++r->flush_direct;\n                        iwx_awdl_roc_flush(sc);') and 'awdl_roc_flush_task' not in rn6
+cs6=cpp[cpp.index('iwx_rx_tx_cmd_single(struct iwx_softc *sc'):]; cs6=cs6[:cs6.index('\n}\n')]
+assert 'r->air_us_lo + le16toh(tx_resp->wireless_media_time)' in cs6 and 'r->last_rate = le32toh(tx_resp->initial_rate);' in cs6 and 'awdl_roc_flush_task' not in cs6
+for k in ['ItlwmAwdlRocFlushDirect','ItlwmAwdlRocAirN','ItlwmAwdlRocAirMs','ItlwmAwdlRocLastRate','ItlwmAwdlRocSentPerRocMax']:
+    assert f'{{"{k}"' in cpp, k
+for k in ['RocFlushDirect','RocAirN','RocAirMs']:
+    assert roc.count(f"'{k}'") >= 2, k
+hc=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_hold_clear(struct iwx_softc *sc)'):]; hc=hc[:hc.index('\n}\n')]
+assert 'r->rq_batch = 0;' in hc and 'iwx_awdl_roc_wake(sc);' in hc
+rn5=cpp[cpp.index('case IWX_WIDE_ID(IWX_MAC_CONF_GROUP, IWX_ROC_NOTIF): {'):]; rn5=rn5[:rn5.index('break;\n            }')]
+assert 'iwx_awdl_roc_note_start(r, now / 1000);\n                    r->rq_batch = 0;' in rn5
+assert 'iwx_awdl_roc_no_clamp(r->want));' in cpp
+for k in ['ItlwmAwdlRocHoldOrder','ItlwmAwdlRocHoldRing','ItlwmAwdlRocHoldStalls','ItlwmAwdlRocHoldKicks','ItlwmAwdlRocHoldPeak']:
+    assert f'{{"{k}"' in cpp, k
+for k in ['RocHoldOrder','RocHoldRing','RocHoldStalls','RocHoldKicks']:
+    assert roc.count(f"'{k}'") >= 2, k
+assert "def switch(on):" in roc and "switch('--on' in sys.argv)" in roc
+kitdir=ROOT.parent/'kit'
+for f in ['开启跨信道隔空投送.command','关闭跨信道隔空投送.command']:
+    t=(kitdir/f).read_text(); assert 'roc_test.py --' in t and f in (kitdir/'package.py').read_text(), f
+# 1.2.1: mode 4 is timed by the phone's run; frames wait for its start; the family's timing with 0x800.
+sl6=cpp[cpp.index('void ItlIwx::setAwdlSlot(uint32_t chan, uint32_t run, uint32_t seq5)'):]; sl6=sl6[:sl6.index('\n}\n')]
+assert sl6.index('iwx_awdl_roc_cover(seq, other, iwx_awdl_roc_run_max(r->want), r->cover, iwx_awdl_roc_gap(r->want));') < sl6.index('(r->want & IWX_AWDL_ROC_F_PHONE) && other') < sl6.index('iwx_awdl_peer_run(&com.sc_awdl_probe, other, iwx_awdl_roc_run_max(r->want), now / 1000, &w);') < sl6.index('r->cover[j] = pc[(j + k) % 16];') < sl6.index('r->cov_end_us = w.end_us;') < sl6.index('r->cov_sum_ms += IWX_AWDL_ROC_SLOT_US / 1000;') < sl6.index('r->announce_on = uint8_t((r->fam_valid || r->peer_timed)') < sl6.index('iwx_awdl_roc_tick(&com, now / 1000);')
+assert 'r->cov_left = 0;\n                    r->cov_end_us = now / 1000;' in sl6, 'no phone run: no ROC'
+tk6=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_tick('):]; tk6=tk6[:tk6.index('\n}\n')]
+assert 'if (r->fam_valid || r->peer_timed) {' in tk6
+fl6=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_flush(struct iwx_softc *sc)'):]; fl6=fl6[:fl6.index('\n}\n')]
+assert 'iwx_awdl_roc_peer_wait(r, now / 1000) || (r->active' in fl6
+tx6=cpp[cpp.index('iwx_tx(struct iwx_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)\n{'):]; tx6=tx6[:tx6.index('\n}\n')]
+assert 'iwx_awdl_roc_peer_wait(r, holdNow / 1000) ||' in tx6 and '(awdlGate = iwx_awdl_roc_gate_check(&sc->sc_awdl_probe, wh->i_addr1, holdNow / 1000)),' in tx6
+rn7=cpp[cpp.index('case IWX_WIDE_ID(IWX_MAC_CONF_GROUP, IWX_ROC_NOTIF): {'):]; rn7=rn7[:rn7.index('break;\n            }')]
+assert rn7.index('if (iwx_awdl_roc_peer_wait(r, now / 1000)) {') < rn7.index('r->release_at_us = r->peer_start_us;') < rn7.index('timeout_add_msec(&sc->awdl_roc_kick_to, int(wait / 1000 + 1));')  # 1.2.3: the timer releases at the phone's start
+pt=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_peer_task(void *arg)'):]; pt=pt[:pt.index('\n}\n')]
+assert pt.index('inGate()') < pt.index('IOSleep(') < pt.index('runAction(') < pt.index('that->iwx_awdl_roc_flush(sc);') and 'IWX_AWDL_ROC_PEER_WAIT_MAX_US' in pt
+assert 'task_set(&sc->awdl_roc_peer_task, iwx_awdl_roc_peer_task, sc, "iwx_awdl_roc_peer_task");' in cpp and 'iwx_del_task(sc, systq, &sc->awdl_roc_peer_task);' in cpp
+assert 'setProperty("ItlwmAwdlRefSeq", (void *)sc->sc_awdl_probe.sync.seq, sizeof(sc->sc_awdl_probe.sync.seq));' in cpp
+for k in ['ItlwmAwdlRocPeerTicks','ItlwmAwdlRocPeerIdleTicks','ItlwmAwdlRocPeerK','ItlwmAwdlRocPeerLagAbsMs','ItlwmAwdlRocPeerLagUs','ItlwmAwdlRocPeerWaits']:
+    assert f'{{"{k}"' in cpp, k
+for k in ['RocPeerTicks','RocPeerIdleTicks','RocPeerLagN','RocPeerLagAbsMs','RocPeerWaits']:
+    assert roc.count(f"'{k}'") >= 2, k
+assert 'def ref_sequence(text=None):' in roc and 'FPHONE = 0x800' in roc
+# 1.2.2: flush stops counted by cause; multicast gets headroom on the AUX ring.
+fl7=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_flush(struct iwx_softc *sc)'):]; fl7=fl7[:fl7.index('\n}\n')]
+assert fl7.index('++r->flush_stop_rule;') < fl7.index('++r->flush_stop_ring;') < fl7.index('that->iwx_awdl_roc_hold_pop(sc, false, &m, &ni);')
+assert 'iwx_awdl_roc_ring_cap(r->active) + (awdlKind == 1 ? IWX_AWDL_ROC_MCAST_EXTRA : 0)' in cpp
+for k in ['ItlwmAwdlRocFlushStopRing','ItlwmAwdlRocFlushStopRule']:
+    assert f'{{"{k}"' in cpp, k
+for k in ['RocFlushStopRing','RocFlushStopRule']:
+    assert roc.count(f"'{k}'") >= 2, k
+# 1.2.3: the ROC timer: release 2 ms after the start, kick a stuck AUX ring, lives with the AUX station; bmiss pause.
+rn8=cpp[cpp.index('case IWX_WIDE_ID(IWX_MAC_CONF_GROUP, IWX_ROC_NOTIF): {'):]; rn8=rn8[:rn8.index('break;\n            }')]
+assert rn8.index('r->release_at_us = iwx_awdl_roc_release_at(now / 1000, r->aw_start_us);') < rn8.index('timeout_add_msec(&sc->awdl_roc_kick_to, int(wait / 1000 + 1));') and 'r->kick_armed = 0;' in rn8
+kk=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_kick(void *arg)'):]; kk=kk[:kk.index('\n}\n')]
+assert kk.index('if (!r->kick_armed || !r->active') < kk.index('that->iwx_awdl_roc_flush(sc);') < kk.index('iwx_awdl_roc_kick_due(') < kk.index('IWX_WRITE(sc, IWX_HBUS_TARG_WRPTR, ring->qid << 16 | ring->cur);') < kk.index('timeout_add_msec(&sc->awdl_roc_kick_to, IWX_AWDL_ROC_KICK_MS);')
+fl8=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_flush(struct iwx_softc *sc)'):]; fl8=fl8[:fl8.index('\n}\n')]
+assert '(r->active && now / 1000 < r->release_at_us)) {' in fl8
+st8=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_setup(struct iwx_softc *sc)'):]; st8=st8[:st8.index('\nfail:')]
+assert 'timeout_set(&sc->awdl_roc_kick_to, iwx_awdl_roc_kick, sc);' in st8
+assert cpp.count('timeout_free(&sc->awdl_roc_kick_to);') == 2 and cpp.count('timeout_free(&sc->awdl_roc_pre_to);') == 2, 'freed at the AUX teardown and at a stop'
+bm=cpp[cpp.index('iwx_rx_bmiss(struct iwx_softc *sc, struct iwx_rx_packet *pkt,'):]; bm=bm[:bm.index('\n}\n')]
+assert 'if (missed >= IWX_AWDL_ROC_BMISS_MAX && r->sta_added) {' in bm and 'r->bmiss_until_us = ns / 1000 + IWX_AWDL_ROC_BMISS_PAUSE_US;' in bm
+tk8=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_tick('):]; tk8=tk8[:tk8.index('\n}\n')]
+assert tk8.index('++r->readd_waits;') < tk8.index('if (iwx_awdl_roc_bmiss_paused(now_us, r->bmiss_until_us)) {') < tk8.index('iwx_awdl_roc_add(sc, chan, duration, delay, disc, now_us);')
+ch8=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_chain_task(void *arg)'):]; ch8=ch8[:ch8.index('\n}\n')]
+assert 'iwx_awdl_roc_bmiss_paused(now_us, r->bmiss_until_us)) {' in ch8
+for k in ['ItlwmAwdlRocKicks','ItlwmAwdlRocKickTicks','ItlwmAwdlRocKickReleases','ItlwmAwdlRocBmissPauses','ItlwmAwdlRocBmissSkips','ItlwmAwdlRocBmissLast']:
+    assert f'{{"{k}"' in cpp, k
+for k in ['RocKicks','RocKickTicks','RocKickReleases','RocBmissPauses','RocBmissSkips']:
+    assert roc.count(f"'{k}'") >= 2, k
+# 1.2.4: the early ROC before a 149 slot.
+sl9=cpp[cpp.index('void ItlIwx::setAwdlSlot(uint32_t chan, uint32_t run, uint32_t seq5)'):]; sl9=sl9[:sl9.index('\n}\n')]
+assert sl9.index('r->announce_on = uint8_t(') < sl9.index('!(r->want & IWX_AWDL_ROC_F_NO_PRE) && other && !r->cov_left') < sl9.index('iwx_awdl_roc_cover_left(r->cover, (r->slot_idx + 1u) % 16u);') < sl9.index('timeout_add_msec(&com.awdl_roc_pre_to, int((IWX_AWDL_ROC_SLOT_US - IWX_AWDL_ROC_PRE_LEAD_US) / 1000));') < sl9.index('iwx_awdl_roc_tick(&com, now / 1000);')
+pr9=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_pre(void *arg)'):]; pr9=pr9[:pr9.index('\n}\n')]
+for need in ['r->pending || r->active', 'iwx_awdl_roc_readd_wait(now_us, r->last_end_us, IWX_AWDL_ROC_READD_US)', 'iwx_awdl_roc_bmiss_paused(now_us, r->bmiss_until_us)', 'now_us >= r->pre_boundary_us', 'duration > r->cap_tu', 'r->aw_start_us = r->pre_boundary_us;', '++r->pre_skips;', '++r->pre_adds;']:
+    assert need in pr9, need
+st9=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_setup(struct iwx_softc *sc)'):]; st9=st9[:st9.index('\nfail:')]
+assert 'timeout_set(&sc->awdl_roc_pre_to, iwx_awdl_roc_pre, sc);' in st9
+for k in ['ItlwmAwdlRocPreArms','ItlwmAwdlRocPreAdds','ItlwmAwdlRocPreSkips','ItlwmAwdlRocPreOnTime','ItlwmAwdlRocPreLate']:
+    assert f'{{"{k}"' in cpp, k
+for k in ['RocPreArms','RocPreAdds','RocPreOnTime','RocPreLate']:
+    assert roc.count(f"'{k}'") >= 2, k
+# 1.2.5: mode 4 sends non-QoS data; the QoS-to-TID mapping never takes an AUX frame; pause after a failed ROC.
+sd=cpp[cpp.index('IOReturn ItlIwx::sendAwdlData(const uint8_t *eth, size_t length)'):]; sd=sd[:sd.index('\n}\n')]
+assert 'iwx_awdl_data_qos(p->ctx.own_active, p->ctx.own_agg, !memcmp(eth, p->ctx.own_peer, 6),' in sd and 'iwx_awdl_roc_mode(p->roc.mode) >= 4 && p->roc.sta_added && p->roc.qid > 0' in sd
+assert 'if (ieee80211_has_qos(wh) && awdlKind != 4 && awdlKind != 3 && !awdlRoc) {' in cpp
+tx9=cpp[cpp.index('iwx_tx(struct iwx_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)\n{'):]; tx9=tx9[:tx9.index('\n}\n')]
+assert tx9.index('&& !awdlRoc) {') < tx9.index('if (awdlRoc && qid != sc->sc_awdl_probe.roc.qid)\n        ++sc->sc_awdl_probe.roc.off_aux;') < tx9.index('    ring = &sc->txq[qid];')
+rn9=cpp[cpp.index('case IWX_WIDE_ID(IWX_MAC_CONF_GROUP, IWX_ROC_NOTIF): {'):]; rn9=rn9[:rn9.index('break;\n            }')]
+assert rn9.index('++r->failed;') < rn9.index('r->bmiss_until_us = now / 1000 + IWX_AWDL_ROC_FAIL_PAUSE_US;') < rn9.index('++r->fail_pauses;') < rn9.index('++r->started;')
+for k in ['ItlwmAwdlRocOffAux','ItlwmAwdlRocFailPauses']:
+    assert f'{{"{k}"' in cpp, k
+for k in ['RocOffAux','RocFailPauses']:
+    assert roc.count(f"'{k}'") >= 2, k
+# 1.2.6: A-MSDU on TID 3 through AUX, capped; the interface asks the driver for the cap; --full for the no-data phases.
+am=cpp[cpp.index('IOReturn ItlIwx::sendAwdlAmsdu('):]; am=am[:am.index('\n}\n')]
+assert 'iwx_awdl_amsdu_ready_on(p, eths[0], iwx_awdl_roc_aux_on(p))' in am and 'aux ? uint8_t(IWX_AWDL_ROC_AMSDU_TID) : uint8_t(0)' in am and 'aux ? size_t(IWX_AWDL_ROC_AMSDU_MAX_BYTES) : sizeof(p->tx.amsdu_buf)' in am
+assert 'return iwx_awdl_roc_aux_on(&com.sc_awdl_probe) ? IWX_AWDL_ROC_AMSDU_MAX_BYTES : IWX_AWDL_AMSDU_MAX_BYTES;' in cpp
+assert '*w++ = uint8_t(0x80 | (tid & 7));' in (ROOT/'itlwm/hal_iwx/iwx_awdl_probe.h').read_text()
+ifc=(ROOT/'AirportItlwm/AirportItlwmAWDLInterface.cpp').read_text()
+assert 'const size_t amsduMax = controller->awdlAmsduMaxBytes();' in ifc and 'bytes > amsduMax ||' in ifc
+assert 'virtual size_t awdlAmsduMaxBytes() { return 7900; }' in (ROOT/'include/HAL/ItlHalService.hpp').read_text()
+assert 'def wait_start(lines, faulted, limit=120):' in roc and 'z = wait_start(lines, faulted)' in roc and roc.index('z = wait_start(lines, faulted)') < roc.index("phase('R2 模式 4：默认', 60, lines)")
+assert "full = '--full' in sys.argv" in roc and "if full:\n        phase('关闭后', 20, lines)" in roc and 'roc_test.py --full' in (ROOT.parent/'kit/完整ROC实验.command').read_text()
+assert '完整ROC实验.command' in (ROOT.parent/'kit/package.py').read_text()
+# 1.2.6: the release comment becomes the OpenCore row comment, which ocvalidate allows in ASCII only.
+import json as _json
+assert _json.loads((ROOT.parent/'kit/release.json').read_text())['comment'].isascii(), 'release.json comment must be ASCII'
+# 1.2.8: AUX frames take the AUX rate step and leave the link-wide ladder alone.
+assert 'int32_t rate = iwx_awdl_data_rate(awdlRoc ? sc->sc_awdl_probe.roc.rate_step : sc->sc_awdl_probe.tx.rate_step);' in cpp
+assert 'static_cast<uint32_t>(status), tx_resp->failure_frame, !txd->awdl_roc);' in cpp
+cs10=cpp[cpp.index('iwx_rx_tx_cmd_single(struct iwx_softc *sc'):]; cs10=cs10[:cs10.index('\n}\n')]
+assert 'iwx_awdl_roc_rate_note(&sc->sc_awdl_probe.roc, status == IWX_TX_STATUS_SUCCESS, sc->sc_awdl_probe.roc.active,' in cs10
+st10=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_setup(struct iwx_softc *sc)'):]; st10=st10[:st10.index('\nfail:')]
+assert 'r->rate_step = IWX_AWDL_ROC_RATE_START;' in st10
+for k in ['ItlwmAwdlRocRateStep','ItlwmAwdlRocRateUps','ItlwmAwdlRocRateDowns']:
+    assert f'{{"{k}"' in cpp, k
+assert roc.count("'RocRateUps'") >= 2 and "'DataRateMcsStep'" in roc
+# 1.2.9: mode 4 covers the union of the family's and the phone's 149 slots; the tool reads sharingd's log.
+sl11=cpp[cpp.index('void ItlIwx::setAwdlSlot(uint32_t chan, uint32_t run, uint32_t seq5)'):]; sl11=sl11[:sl11.index('\n}\n')]
+assert sl11.index('!(r->want & IWX_AWDL_ROC_F_NO_UNION) && other') < sl11.index('iwx_awdl_seq_union(r->fam, useq, k, other, seq);') < sl11.index('iwx_awdl_roc_cover(seq, other, iwx_awdl_roc_run_max(r->want), r->cover, iwx_awdl_roc_gap(r->want));') < sl11.index('++r->union_ticks;')
+for k in ['ItlwmAwdlRocUnionTicks','ItlwmAwdlRocUnionSlots']:
+    assert f'{{"{k}"' in cpp, k
+assert 'def airdrop_log(since):' in roc and "line += '；' + airdrop_log(since)" in roc and 'FNOUNION = 0x4000' in roc and 'obytes() - b0 > 2_000_000:' in roc
+# 1.1.98: a unicast frame dropped at an ROC's end goes back to the hold, header restored, node reference kept.
+cs4=cpp[cpp.index('iwx_rx_tx_cmd_single(struct iwx_softc *sc'):]; cs4=cs4[:cs4.index('\n}\n')]
+assert cs4.index('iwx_awdl_roc_note_tx(&sc->sc_awdl_probe.roc') < cs4.index('if (txd->awdl_kind == 2 && txd->m && txd->in &&\n            iwx_awdl_roc_requeue_ok(') < cs4.index('txd->awdl_requeue = sc->sc_awdl_probe.roc.active ? 2 : 1;')
+assert 'if (txd->awdl_requeue == 2)\n        ++r->requeued_in;' in cpp and '{"ItlwmAwdlRocRequeuedIn", r->requeued_in}' in cpp, 'in-ROC requeue count (1.2.17)'
+assert 'iwx_rx_tx_cmd_single(sc, pkt, txd);\n#ifdef AIRPORT_WCL\n        if (txd->awdl_requeue)\n            iwx_awdl_roc_requeue_prep(sc, ring, (idx + ring->ring_count - 1) % ring->ring_count);' in cpp
+pp=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_requeue_prep('):]; pp=pp[:pp.index('\n}\n')]
+assert 'mbuf_leadingspace(txd->m) < hdrlen' in pp and 'sizeof(struct iwx_tx_cmd_gen3)' in pp and pp.index('mbuf_prepend(&m, hdrlen, MBUF_DONTWAIT)') < pp.index('memcpy(mbuf_data(m), wh, hdrlen);')
+tk4=cpp[cpp.index('bool ItlIwx::iwx_awdl_roc_requeue_take('):]; tk4=tk4[:tk4.index('\n}\n')]
+assert 'r->hold_n >= IWX_AWDL_ROC_HOLD_MAX' in tk4 and 'iwx_awdl_roc_hold_insert(r, r->rq_batch, txd->m, &txd->in->in_ni, now / 1000, uint8_t(txd->awdl_rq + 1));' in tk4 and '++r->rq_batch;' in tk4
+dn=cpp[cpp.index('iwx_txd_done(struct iwx_softc *sc, struct iwx_tx_data *txd)\n{'):]; dn=dn[:dn.index('\n}\n')]
+assert dn.index('if (txd->awdl_requeue && iwx_awdl_roc_requeue_take(sc, txd)) {') < dn.index('txd->in = NULL;\n') < dn.index('mbuf_freem(txd->m);'), 'a requeued frame is not freed, and its node reference moves to the hold'
+tx4=cpp[cpp.index('iwx_tx(struct iwx_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)\n{'):]; tx4=tx4[:tx4.index('\n}\n')]
+assert 'r->hold_rq[slot] = 0;' in tx4 and 'data->awdl_hdrlen = uint8_t(hdrlen);' in tx4 and 'data->awdl_requeue = 0;' in tx4 and 'sc->sc_awdl_probe.roc.flushing ? sc->sc_awdl_probe.roc.flush_rq : 0' in tx4
+fl4=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_flush(struct iwx_softc *sc)'):]; fl4=fl4[:fl4.index('\n}\n')]
+assert fl4.index('r->flush_rq = r->hold_rq[r->hold_head];') < fl4.index('that->iwx_awdl_roc_hold_pop(sc, false, &m, &ni);')
+for k in ['ItlwmAwdlRocRequeued','ItlwmAwdlRocRequeueDrop']:
+    assert f'{{"{k}"' in cpp, k
+for k in ['RocRequeued','RocRequeueDrop']:
+    assert roc.count(f"'{k}'") >= 2, k
 # 1.1.91: every AUX completion and ROC notification feeds the diagnostics.
 cs=cpp[cpp.index('iwx_rx_tx_cmd_single(struct iwx_softc *sc'):]; cs=cs[:cs.index('\n}\n')]
 assert 'iwx_awdl_roc_note_tx(&sc->sc_awdl_probe.roc, txd->awdl_kind != 1, status == IWX_TX_STATUS_SUCCESS,' in cs and 'iwx_awdl_peer_slot_chan(&sc->sc_awdl_probe, now / 1000)' in cs
@@ -561,26 +1016,27 @@ assert 'sc->sc_awdl_probe.roc.started_us = 0;' in cpp
 # 1.1.92: unicast AWDL frames wait in the host in mode 4 and leave only inside an ROC with time left.
 tx=cpp[cpp.index('iwx_tx(struct iwx_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)\n{'):]; tx=tx[:tx.index('\n}\n')]
 hb=tx[tx.index('/* 1.1.92, mode 4'):tx.index('++r->tx_sent;')]
-assert 'awdlKind == 2 && !r->flushing &&' in hb and 'iwx_awdl_roc_hold(r->mode, r->active, r->started_us, r->dur_tu, holdNow / 1000)' in hb
-assert hb.index('if (r->hold_n == IWX_AWDL_ROC_HOLD_MAX) {\n                    iwx_awdl_roc_hold_pop(sc, true);') < hb.index('r->hold_ni[slot] = ni;') < hb.index('return 0;') < hb.index('if (sc->txq[r->qid].queued >= IWX_AWDL_TX_MAX_QUEUED)'), 'held before the ring, oldest dropped when full'
-fl=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_flush_task(void *arg)'):]; fl=fl[:fl.index('\n}\n')]
+assert 'awdlKind == 2 && !r->flushing ?' in hb and 'iwx_awdl_roc_hold(r->mode, r->active, r->started_us, r->dur_tu, holdNow / 1000)' in hb
+assert hb.index('if (r->hold_n == IWX_AWDL_ROC_HOLD_MAX) {\n                    iwx_awdl_roc_hold_pop(sc, true);') < hb.index('r->hold_ni[slot] = ni;') < hb.index('return 0;') < hb.index('if (sc->txq[r->qid].queued >= iwx_awdl_roc_ring_cap(r->active) + (awdlKind == 1'), 'held before the ring, oldest dropped when full'
+fl=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_flush(struct iwx_softc *sc)'):]; fl=fl[:fl.index('\n}\n')]
 assert fl.index('iwx_awdl_roc_hold_stale(r, now / 1000)') < fl.index('iwx_awdl_roc_hold(r->mode, r->active, r->started_us, r->dur_tu, now / 1000)') < fl.index('r->flushing = 1;') < fl.index('that->iwx_tx(sc, m, ni, EDCA_AC_BE)') < fl.index('r->flushing = 0;')
-assert 'sc->txq[r->qid].queued >= IWX_AWDL_TX_MAX_QUEUED' in fl and 'ieee80211_release_node(&sc->sc_ic, ni); /* iwx_tx freed the frame */' in fl
+assert 'sc->txq[r->qid].queued >= iwx_awdl_roc_ring_cap(r->active)' in fl and 'ieee80211_release_node(&sc->sc_ic, ni); /* iwx_tx freed the frame */' in fl
 hp=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_hold_pop('):]; hp=hp[:hp.index('\n}\n')]
 assert 'mbuf_freem(hm);\n        ieee80211_release_node(&sc->sc_ic, hn);' in hp, 'a dropped frame frees its mbuf and node reference'
 rm=cpp[cpp.index('void ItlIwx::iwx_awdl_roc_remove(struct iwx_softc *sc)'):]; rm=rm[:rm.index('\n}\n')]
 assert rm.index('iwx_awdl_roc_hold_clear(sc);') < rm.index('if (r->pending || r->active)'), 'the test stopping frees held frames'
 assert 'sc->sc_awdl_probe.roc.started_us = 0;\n    container_of(sc, ItlIwx, com)->iwx_awdl_roc_hold_clear(sc);' in cpp, 'and so does a stop'
-assert rn.index('iwx_awdl_roc_note_start(r, now / 1000);') < rn.index('iwx_add_task(sc, systq, &sc->awdl_roc_flush_task);'), 'an ROC start releases held frames'
-assert 'if (r->hold_n)\n        iwx_add_task(sc, systq, &sc->awdl_roc_flush_task);' in tk and 'r->dur_tu = duration;' in tk
+assert rn.index('iwx_awdl_roc_note_start(r, now / 1000);') < rn.index('iwx_awdl_roc_flush(sc);'), 'an ROC start releases held frames'
+assert 'if (r->hold_n)\n        iwx_add_task(sc, systq, &sc->awdl_roc_flush_task);' in tk and 'r->dur_tu = duration;' in cpp[cpp.index('int ItlIwx::iwx_awdl_roc_add(struct iwx_softc *sc'):][:2500]
 assert 'iwx_del_task(sc, systq, &sc->awdl_roc_flush_task);' in cpp and 'task_set(&sc->awdl_roc_flush_task, iwx_awdl_roc_flush_task, sc,' in cpp
 for k in ['ItlwmAwdlRocHeld','ItlwmAwdlRocReleased','ItlwmAwdlRocHoldFull','ItlwmAwdlRocHoldExpired','ItlwmAwdlRocHoldFreed']:
     assert f'{{"{k}"' in cpp, k
 # The ROC tool: the link moves with ROC off before mode 4, and the first new firmware error switches both off.
 tool=(ROOT.parent/'kit/roc_test.py').read_text()
-m4=tool.index("setv(ROC, 4 + 16 * activity)")
-assert tool.index("setv(ROC, 0)\n            time.sleep(2)\n            setv(PHY2, 1)") < tool.index("if props().get('Phy2Chan'):") < m4, 'mode 4 starts after the move'
-assert "if not faulted(z) and z.get('Phy2Chan'):" in tool[:m4]
+tmain=tool[tool.index('def main():'):]  # 1.1.99: switch() above main has its own move
+m4=tmain.index("setv(ROC, 4 + 16 * activity)")
+assert tmain.index("setv(ROC, 0)\n            time.sleep(2)\n            setv(PHY2, 1)") < tmain.index("if props().get('Phy2Chan'):") < m4, 'mode 4 starts after the move'
+assert "if not faulted(z) and z.get('Phy2Chan'):" in tmain[:m4]
 w=tool[tool.index('fault_at = None'):tool.index('for j in jobs:\n        j.join()')]
 assert "props().get('FwErrors', 0) > FW0[0]" in w and w.index('setv(ROC, 0)') < w.index('setv(PHY2, 0)'), 'fault watch'
 assert "FW0[0] = props().get('FwErrors', 0)" in tool and "z.get('FwErrors', 0) > FW0[0]" in tool

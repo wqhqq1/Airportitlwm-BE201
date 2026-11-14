@@ -160,6 +160,14 @@ private:
     /* What the family's data mode monitor counts, reported as native drivers do (1.1.78). */
     uint8_t statsBuf[0x700] = {};
     uint32_t statsTxMark = 0, statsRxMark = 0, statsReports = 0;
+    /* 1.2.17: unicast packets each way, and the data-mode hold they drive (iwx_awdl_dmhold_pad). */
+    uint32_t ucastTx = 0, ucastRx = 0, ucastTxMark = 0, ucastRxMark = 0;
+    /* 1.2.18: received packets given a fresh receive timestamp, and those that could not take one. */
+    uint32_t rxStamped = 0, rxUnstamped = 0;
+    struct iwx_awdl_dmhold dmHold = {};
+    /* 1.2.24: whether file data flows now (pause mode). */
+    struct iwx_awdl_pause_trig pauseTrig = {};
+    bool pauseWant = false;
     int statsLast = 0;
     void reportDataStats();
     void inputDataFrame(const uint8_t *, size_t);
@@ -225,4 +233,5 @@ private:
     unsigned queuesOnLoop = 0;
     IOTimerEventSource *linkTimer = nullptr;
     uint32_t dataTx = 0, dataTxDropped = 0, dataRx = 0, dataRxDropped = 0, txCalls = 0;
+    uint32_t rxStamped = 0, rxUnstamped = 0;
 };

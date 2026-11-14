@@ -58,10 +58,15 @@ public:
     virtual IOReturn sendAwdlData(const uint8_t *, size_t) { return kIOReturnUnsupported; }
     virtual void setAwdlOwnQueue(bool, bool, uint32_t) {}
     virtual void setAwdlSlot(uint32_t, uint32_t, uint32_t) {}
+    virtual void setAwdlSequence(const uint8_t *, uint32_t) {}
     virtual void setAwdlRadioTest(bool, uint32_t, uint32_t, bool) {}
     virtual void setAwdlRoc(uint32_t) {}
+    /* 1.2.24: whether an AWDL transfer wants the whole radio (pause mode). */
+    virtual void setAwdlPause(bool) {}
     virtual bool awdlBulkActive() { return false; }
     virtual bool awdlAmsduReady(const uint8_t *) { return false; }
+    /* 1.2.6: the longest A-MSDU the driver takes now (shorter through the ROC AUX station). */
+    virtual size_t awdlAmsduMaxBytes() { return 7900; }
     virtual void awdlPeerCache(const uint8_t *, uint32_t) {}
     virtual void sendAwdlUmi(const uint8_t *, const uint8_t *, size_t) {}
     virtual IOReturn sendAwdlAmsdu(const uint8_t *const *, const size_t *, unsigned) { return kIOReturnUnsupported; }

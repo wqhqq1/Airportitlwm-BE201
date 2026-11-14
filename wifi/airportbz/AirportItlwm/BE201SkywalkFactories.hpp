@@ -22,6 +22,8 @@ void be201TxSubEnable(void *) __asm__("__ZN26IOSkywalkTxSubmissionQueue6enableEv
 void be201TxCompEnable(void *) __asm__("__ZN26IOSkywalkTxCompletionQueue6enableEv");
 void be201RxCompEnable(void *) __asm__("__ZN26IOSkywalkRxCompletionQueue6enableEv");
 IOReturn be201TxSubRequestDequeue(void *, void *, UInt32) __asm__("__ZN26IOSkywalkTxSubmissionQueue14requestDequeueEPvj");
+// 1.2.18: IOSkywalkNetworkPacket::setTimestamp(AbsoluteTime), non-virtual; AppleBCMWLAN imports it too.
+IOReturn be201NetPacketSetTimestamp(IOSkywalkPacket *, uint64_t) __asm__("__ZN22IOSkywalkNetworkPacket12setTimestampEy");
 }
 class IOSkywalkTxSubmissionQueue {
 public:

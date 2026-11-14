@@ -28,7 +28,7 @@ Built drivers are not kept in the repository. Build them as the [README](../READ
 
 | Driver | Version | Where |
 |---|---|---|
-| `AirportItlwm.kext` | 1.1.93 | `outputs/BE201-WiFi/` |
+| `AirportItlwm.kext` | 1.2.25 | `outputs/BE201-WiFi/` |
 | `BlueToolFixup.kext` | 2.7.12 | `outputs/BE201-WiFi/` or `build/bluetooth/bluetoolfixup/` |
 | `IntelBTPatcher.kext` | 2.5.10 | `outputs/BE201-WiFi/` or `build/bluetooth/intelbtpatcher/` |
 | `BE201BluetoothFirmware.kext` | 2.5.3 | `build/bluetooth/firmware/` |

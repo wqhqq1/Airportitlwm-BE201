@@ -102,26 +102,74 @@ static void nativeAddressPauseTest() {
     }
     assert(munmap(m,8192)==0);
 }
-int main(int argc,char **argv) {
-    assert(argc==2);nativeCallerTest();peerArgumentTest();nativeBaselinePredicatesTest();nativeAddressPauseTest();
-    std::ifstream f(argv[1],std::ios::binary);assert(f);
+// x86_64 slice of a fat or thin Mach-O: offset and size.
+static std::pair<size_t,size_t> x86Slice(const std::vector<unsigned char> &b) {
+    uint32_t magic;memcpy(&magic,b.data(),4);
+    if(magic==0xbebafecau) {
+        auto be=[&](size_t o){return uint32_t(b[o])<<24|uint32_t(b[o+1])<<16|uint32_t(b[o+2])<<8|b[o+3];};
+        for(uint32_t i=0;i<be(4);i++)if(be(8+20*i)==0x01000007u)return {be(8+20*i+8),be(8+20*i+12)};
+        assert(!"no x86_64 slice");
+    }
+    return {0,b.size()};
+}
+// One build: every patch exactly once over the code-signing pages, and only its own bytes change.
+static void buildTest(const char *path) {
+    std::ifstream f(path,std::ios::binary);assert(f);
     std::vector<unsigned char> b((std::istreambuf_iterator<char>(f)),{}), before=b;
-    assert(b.size()>0x8c0200); unsigned clocks=0,names=0,adverts=0,peers=0,baselines=0,pauses=0;
-    // The live host only executes the x86_64 slice. Simulate code-signing pages.
-    for(size_t i=0x4000;i+4096<=0xa8ca00;i+=4096) {
-        pauses+=be201Apply(b.data()+i,4096,kBE201AddressPauseOriginal,kBE201AddressPausePatched);
-        peers+=be201Apply(b.data()+i,4096,kBE201PeerAddressOriginal,kBE201PeerAddressPatched);
-        baselines+=be201Apply(b.data()+i,4096,kBE201LEBaselineOriginal,kBE201LEBaselinePatched);
-        clocks+=be201Apply(b.data()+i,4096,kBE201ClockOriginal,kBE201ClockPatched);
-        adverts+=be201Apply(b.data()+i,4096,kBE201LegacyAdvOriginal,kBE201LegacyAdvPatched);
+    auto [off,size]=x86Slice(b);
+    unsigned clocks=0,names=0,adverts=0,peers=0,baselines=0,pauses=0;
+    for(size_t i=off;i+4096<=off+size;i+=4096) {
+        pauses+=be201ApplyMasked(b.data()+i,4096,kBE201AddressPauseOriginal,kBE201AddressPauseMask,kBE201AddressPausePatched);
+        peers+=be201ApplyMasked(b.data()+i,4096,kBE201PeerAddressOriginal,kBE201PeerAddressMask,kBE201PeerAddressPatched);
+        baselines+=be201ApplyMasked(b.data()+i,4096,kBE201LEBaselineOriginal,kBE201LEBaselineMask,kBE201LEBaselinePatched);
+        clocks+=be201ApplyMasked(b.data()+i,4096,kBE201ClockOriginal,kBE201ClockMask,kBE201ClockPatched);
+        adverts+=be201ApplyMasked(b.data()+i,4096,kBE201LegacyAdvOriginal,kBE201LegacyAdvMask,kBE201LegacyAdvPatched);
         names+=be201Apply(b.data()+i,4096,kBE201NameOriginal,kBE201NamePatched);
     }
+    printf("  counts clock %u name %u adv %u peer %u base %u pause %u\n",clocks,names,adverts,peers,baselines,pauses);
     assert(clocks==1 && names==1 && adverts==1 && peers==1 && baselines==1 && pauses==1);
-    assert(!memcmp(b.data()+0x22db3d,before.data()+0x22db3d,72));
-    assert(!strcmp((char*)b.data()+0x8c015a,"Intel BE201"));
-    assert(!memcmp(b.data()+0x8c016d,before.data()+0x8c016d,200));
-    for(size_t i=0;i<b.size();++i)
-        if(b[i]!=before[i])assert(i==0x1ecd1a || i==0x1ecd1b || i==0x137c53 || i==0x137c64 || i==0x68f05f || i==0x68f060 || i==0x3ede52 || i==0x3ede54 || (i>=0x61c0da && i<0x61c0dd) || (i>=0x8c015a && i<0x8c016d));
+    // 2 clock + 18 name + 3 advertising + 2 peer + 2 baseline + 2 pause bytes, nothing else.
+    size_t changed=0;for(size_t i=0;i<b.size();++i)changed+=b[i]!=before[i];
+    assert(changed<=2+18+3+2+2+2 && changed>=2+3+2+2+2);
+    printf("  %s: x86_64 slice 0x%zx, all six patches once, %zu bytes changed\n",path,off,changed);
+}
+// The masked matcher on synthetic pages: wildcards may hold anything, exact bytes may not differ, two copies or a cut
+// copy change nothing, and the wildcard bytes are left as they were.
+template<size_t N> static void maskedTest(const unsigned char (&find)[N],const unsigned char (&mask)[N],const unsigned char (&repl)[N],std::mt19937 &rng) {
+    unsigned char page[4096];
+    for(unsigned round=0;round<2000;++round) {
+        for(auto &x:page)x=rng();
+        size_t at=rng()%(sizeof page-N);
+        for(size_t k=0;k<N;k++)page[at+k]=mask[k]?find[k]:uint8_t(rng());
+        unsigned char copy[4096];memcpy(copy,page,sizeof page);
+        assert(be201ApplyMasked(page,sizeof page,find,mask,repl)==1);
+        for(size_t k=0;k<sizeof page;k++) {
+            bool patched=k>=at && k<at+N && mask[k-at]==0xff && repl[k-at]!=find[k-at];
+            assert(page[k]==(patched?repl[k-at]:copy[k]));
+        }
+        memcpy(page,copy,sizeof page);
+        size_t exact=rng()%N;while(!mask[exact])exact=(exact+1)%N;
+        page[at+exact]^=uint8_t(1+rng()%255);
+        assert(be201ApplyMasked(page,sizeof page,find,mask,repl)==0 && !memcmp(page+at+exact+1,copy+at+exact+1,N-exact-1));
+        memcpy(page,copy,sizeof page);
+        size_t second=(at+N+rng()%(sizeof page-2*N))%(sizeof page-N);
+        if(second+N<=at || second>=at+N) {
+            memcpy(page+second,page+at,N);unsigned char two[4096];memcpy(two,page,sizeof page);
+            assert(be201ApplyMasked(page,sizeof page,find,mask,repl)==0 && !memcmp(page,two,sizeof page));
+        }
+        assert(be201ApplyMasked(copy+at,N-1,find,mask,repl)==0 && be201ApplyMasked(nullptr,4096,find,mask,repl)==0);
+    }
+    for(size_t k=0;k<N;k++)if(repl[k]!=find[k])assert(mask[k]==0xff);
+}
+int main(int argc,char **argv) {
+    assert(argc>=2);nativeCallerTest();peerArgumentTest();nativeBaselinePredicatesTest();nativeAddressPauseTest();
+    std::mt19937 mrng(213);
+    maskedTest(kBE201ClockOriginal,kBE201ClockMask,kBE201ClockPatched,mrng);
+    maskedTest(kBE201LegacyAdvOriginal,kBE201LegacyAdvMask,kBE201LegacyAdvPatched,mrng);
+    maskedTest(kBE201PeerAddressOriginal,kBE201PeerAddressMask,kBE201PeerAddressPatched,mrng);
+    maskedTest(kBE201LEBaselineOriginal,kBE201LEBaselineMask,kBE201LEBaselinePatched,mrng);
+    maskedTest(kBE201AddressPauseOriginal,kBE201AddressPauseMask,kBE201AddressPausePatched,mrng);
+    for(int i=1;i<argc;i++)buildTest(argv[i]);
     unsigned char peerGuard[256]={};
     memcpy(peerGuard+8,kBE201PeerAddressOriginal,sizeof kBE201PeerAddressOriginal);
     memcpy(peerGuard+100,kBE201PeerAddressOriginal,sizeof kBE201PeerAddressOriginal);
@@ -144,5 +192,5 @@ int main(int argc,char **argv) {
         assert(!be201Apply(guard,len,kBE201ClockOriginal,kBE201ClockPatched));
         assert(!be201Apply(guard,len,kBE201LegacyAdvOriginal,kBE201LegacyAdvPatched));
     }
-    printf("PASS: native address-pause branch (all 256 flag values, stop count and flag clearing), unique 26-byte context/two-byte-only change; native EDL/2M predicate instructions on all 256 byte values, two-byte-only fallback; exact peer bool argument instructions (200000 executions), native getter selection/cache/remove-key model, unique peer patch + existing LE/clock/name; binary diff allowlist; 100000 randomized bounds cases (ASan/UBSan).\n");
+    printf("PASS: masked matcher (5 patches x 2000 synthetic pages: wildcards, one exact byte off, two copies, cut copy); each bluetoothd given: all six patches once; native address-pause branch (all 256 flag values, stop count and flag clearing), unique 26-byte context/two-byte-only change; native EDL/2M predicate instructions on all 256 byte values, two-byte-only fallback; exact peer bool argument instructions (200000 executions), native getter selection/cache/remove-key model, unique peer patch + existing LE/clock/name; binary diff allowlist; 100000 randomized bounds cases (ASan/UBSan).\n");
 }

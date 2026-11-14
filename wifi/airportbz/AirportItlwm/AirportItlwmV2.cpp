@@ -1674,10 +1674,26 @@ SYSCTL_INT(_debug, OID_AUTO, be201_awdl_llw, CTLFLAG_RW | CTLFLAG_LOCKED, &be201
  */
 static int be201AwdlRocValue;
 SYSCTL_INT(_debug, OID_AUTO, be201_awdl_roc, CTLFLAG_RW | CTLFLAG_LOCKED, &be201AwdlRocValue, 0, "");
+/* 1.2.24: pause mode, the whole radio on the AWDL channel while file data flows (be201_awdl_pause=0 turns it off). */
+static int be201AwdlPauseValue;
+SYSCTL_INT(_debug, OID_AUTO, be201_awdl_pause, CTLFLAG_RW | CTLFLAG_LOCKED, &be201AwdlPauseValue, 0, "");
+bool AirportItlwm::awdlPauseWanted()
+{
+    return __atomic_load_n(&be201AwdlPauseValue, __ATOMIC_ACQUIRE) == 1;
+}
 uint32_t AirportItlwm::awdlRocWanted()
 {
     const int value = __atomic_load_n(&be201AwdlRocValue, __ATOMIC_ACQUIRE);
-    return value > 0 && value < 64 ? static_cast<uint32_t>(value) : 0;
+    /* 1.1.96: mode and activity in the low byte, probe flags 0x100 (80 MHz) and 0x200 (no DTIM clamp) above;
+     * 1.1.99: 0x400 asks for the DTIM clamp in mode 4. */
+    /* 1.2.1/1.2.2: 0x800 times mode 4 by the phone's own schedule instead of the family's slots. */
+    /* 1.2.4: 0x1000 turns the early ROC before a 149 slot off. */
+    /* 1.2.6: 0x2000 covers 6 slots of each 149 run. */
+    /* 1.2.9: 0x4000 covers the family's 149 slots only, not the phone's too. */
+    /* 1.2.11: 0x8000 puts the AUX queue on TID 3 for A-MSDU. 1.2.12: 7 slots by default. 1.2.15: 2 slots to the AP by
+     * default, 0x2000 leaves 1; 0x10000 marks the boot default (off while the AP is on 2.4 GHz). 1.2.16: 0x20000 covers
+     * every slot of a peer data goes to (test). */
+    return value > 0 && value < 0x400000 ? static_cast<uint32_t>(value) : 0;
 }
 
 bool AirportItlwm::awdlUmiOn()
@@ -1832,6 +1848,26 @@ void AirportItlwm::registerAWDLArmControl()
     sysctl_register_oid(&sysctl__debug_be201_awdl_umi);
     sysctl_register_oid(&sysctl__debug_be201_awdl_llw);
     sysctl_register_oid(&sysctl__debug_be201_awdl_roc);
+    sysctl_register_oid(&sysctl__debug_be201_awdl_pause);
+    /*
+     * 1.2.15: cross-channel AirDrop on at boot, as the tool's --on (be201_awdl_xchan=0 keeps it off): link 1 on the
+     * automatic second channel, and mode 4 once it is there (the driver waits for it). The RAM switches still change it.
+     */
+    if (ItlAwdlFlag("be201_awdl_xchan")) {
+        __atomic_store_n(&be201AwdlPhy2Value, 1, __ATOMIC_RELEASE);
+        /*
+         * IWX_AWDL_ROC_DEFAULT plus 0x380000 (1.2.24): the presence A/B of 2026-11-14 14:59 (presence-*.txt) found
+         * fewer peer absences (3.3 against 5.1 a minute) and half the aged-out services with 2 s sequence aging, no
+         * receive timestamps and no slot flush, as on 1.2.17, in both pairs of rounds.
+         */
+        __atomic_store_n(&be201AwdlRocValue, 0x390024, __ATOMIC_RELEASE);
+        setProperty("ItlwmAwdlXchanDefault", true);
+        /* 1.2.24: ROC finds peers and asks; file data takes the whole radio (be201_awdl_pause=0: ROC only). */
+        if (ItlAwdlFlag("be201_awdl_pause")) {
+            __atomic_store_n(&be201AwdlPauseValue, 1, __ATOMIC_RELEASE);
+            setProperty("ItlwmAwdlPauseDefault", true);
+        }
+    }
     awdlArmRegistered = true;
 }
 
@@ -2092,6 +2128,7 @@ void AirportItlwm::stopAWDLInterface()
         sysctl_unregister_oid(&sysctl__debug_be201_awdl_umi);
         sysctl_unregister_oid(&sysctl__debug_be201_awdl_llw);
         sysctl_unregister_oid(&sysctl__debug_be201_awdl_roc);
+        sysctl_unregister_oid(&sysctl__debug_be201_awdl_pause);
         awdlArmRegistered = false;
     }
     AirportItlwmAWDLInterface *interface = nullptr;

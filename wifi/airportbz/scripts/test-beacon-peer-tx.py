@@ -17,7 +17,7 @@ source=r'''
 #include <unistd.h>
 #define AIRPORT_WCL 1
 #include "ieee80211_wcl_rsn_diag.h"
-enum {IEEE80211_M_STA=1,IEEE80211_S_AUTH=2,IEEE80211_FC0_TYPE_MGT=0,IEEE80211_FC0_SUBTYPE_DEAUTH=0xc0,IEEE80211_FC0_SUBTYPE_DISASSOC=0xa0};
+enum {IEEE80211_M_STA=1,IEEE80211_S_AUTH=2,IEEE80211_FC0_TYPE_MGT=0,IEEE80211_FC0_TYPE_DATA=8,IEEE80211_FC0_SUBTYPE_DEAUTH=0xc0,IEEE80211_FC0_SUBTYPE_DISASSOC=0xa0};
 struct Node{uint8_t ni_macaddr[6]={2,1,2,3,4,5},ni_bssid[6]={2,1,2,3,4,5};};
 struct Netstat{unsigned outputErrors=0;};struct _ifnet{Netstat *netStat;};
 struct ieee80211com {
@@ -33,15 +33,16 @@ out:return false;
 }
 #define IC2IFP(ic) (&(ic)->iface)
 #define le16toh(x) (x)
+#define le32toh(x) (x)
 #define KASSERT(c,m) assert(c)
 #define DPRINTFN(...) ((void)0)
 #define IWX_TX_STATUS_MSK 255
 #define IWX_TX_STATUS_SUCCESS 1
-struct iwx_tx_resp{unsigned frame_count;struct{uint16_t status;}status;uint8_t failure_frame=0;};
+struct iwx_tx_resp{unsigned frame_count;struct{uint16_t status;}status;uint8_t failure_frame=0;uint32_t initial_rate=0;uint16_t wireless_media_time=0;};
 struct iwx_rx_packet {iwx_tx_resp data[1];};
-struct iwx_tx_data{unsigned type=8,wcl_rsn_cookie=0,wcl_rsn_kind=0;uint8_t awdl_kind=0,awdl_umi=0,awdl_phy2q=0,awdl_roc=0,awdl_umi_peer[6]={};};
-struct iwx_awdl_probe{ struct { unsigned own_ok,own_fail,phy2_chan,own_done_phy2,own_fail_phy2,own_last_status_phy2,phy2_q_done,phy2_q_fail; } ctx; struct { unsigned tx_ok,tx_fail; uint8_t active; } roc;};static inline uint64_t mach_absolute_time(){return 0;}static inline void absolutetime_to_nanoseconds(uint64_t,uint64_t*n){*n=0;}static inline uint8_t iwx_awdl_peer_slot_chan(iwx_awdl_probe*,uint64_t){return 0;}template<class R>static inline void iwx_awdl_roc_note_tx(R*,bool,bool,uint32_t,uint32_t,bool,uint8_t){}static inline void iwx_awdl_umi_note(iwx_awdl_probe*,const uint8_t*,bool){}static int systq;static inline void iwx_add_task(void*,int,void*){}static inline void iwx_awdl_tx_note_presence(struct iwx_softc*){}static inline void iwx_awdl_amsdu_note_done(iwx_awdl_probe*,bool){}static inline void iwx_awdl_tx_note_done(iwx_awdl_probe*,bool,bool,uint32_t,uint32_t){}
-struct iwx_softc{ieee80211com sc_ic;uint8_t sc_mgmt_last_antenna_idx=0;iwx_awdl_probe sc_awdl_probe;int awdl_umi_task=0;};
+struct iwx_tx_data{unsigned type=8,wcl_rsn_cookie=0,wcl_rsn_kind=0;void *m=nullptr,*in=nullptr;uint8_t awdl_kind=0,awdl_umi=0,awdl_phy2q=0,awdl_roc=0,awdl_umi_peer[6]={},awdl_hdrlen=0,awdl_rq=0,awdl_requeue=0;};
+struct iwx_awdl_probe{ struct { unsigned own_ok,own_fail,phy2_chan,own_done_phy2,own_fail_phy2,own_last_status_phy2,phy2_q_done,phy2_q_fail; } ctx; struct { unsigned tx_ok,tx_fail; uint8_t active; uint32_t mode=0, want=0; unsigned hold_n=0; uint32_t air_n=0,air_us_hi=0,air_us_lo=0,last_rate=0; struct { unsigned ok_ucast_data,fail_ucast_data; } txs; } roc;};static inline uint64_t mach_absolute_time(){return 0;}static inline void absolutetime_to_nanoseconds(uint64_t,uint64_t*n){*n=0;}static inline uint8_t iwx_awdl_peer_slot_chan(iwx_awdl_probe*,uint64_t){return 0;}template<class R>static inline void iwx_awdl_roc_note_tx(R*,bool,bool,uint32_t,uint32_t,bool,uint8_t){}static inline bool iwx_awdl_roc_requeue_ok(uint32_t,bool,bool,uint32_t,uint32_t){return false;}static inline void iwx_awdl_umi_note(iwx_awdl_probe*,const uint8_t*,bool){}static int systq;static inline void iwx_add_task(void*,int,void*){}static inline void iwx_awdl_tx_note_presence(struct iwx_softc*){}static inline void iwx_awdl_amsdu_note_done(iwx_awdl_probe*,bool){}static inline void iwx_awdl_tx_note_done(iwx_awdl_probe*,bool,bool,uint32_t,uint32_t,bool=true){}template<class R>static inline void iwx_awdl_roc_rate_note(R*,bool,bool,int32_t){}static const uint32_t IWX_AWDL_ROC_F_80MHZ=0x100;static const int32_t IWX_AWDL_RATE_TOP_STEP=-3;
+struct iwx_softc{ieee80211com sc_ic;uint8_t sc_mgmt_last_antenna_idx=0;iwx_awdl_probe sc_awdl_probe;int awdl_umi_task=0;int awdl_roc_flush_task=0;};
 struct ItlIwx{unsigned toggles=0;void iwx_toggle_tx_ant(iwx_softc *,uint8_t *){++toggles;}void iwx_rx_tx_cmd_single(iwx_softc *,iwx_rx_packet *,iwx_tx_data *);};
 ''' + single + r'''
 int main(){

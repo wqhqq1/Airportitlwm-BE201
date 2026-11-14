@@ -35,7 +35,7 @@ size_t strlcpy(char *d,const char *s,size_t n){auto z=strlen(s);if(n){auto k=std
 constexpr int APPLE80211_VERSION=1, APPLE80211_VIF_AWDL=6,kIOServiceRequired=1,kIOServiceSynchronous=2;
 void clock_get_uptime(uint64_t *t){*t=5000000;}void absolutetime_to_nanoseconds(uint64_t a,uint64_t *n){*n=a;}uint64_t mach_absolute_time(){return 5000000;}
 class IOSkywalkPacket;
-struct MockPacket {uint8_t data[2048];unsigned offset=0;unsigned length=0;bool prepared=true;};
+struct MockPacket {uint8_t data[2048];unsigned offset=0;unsigned length=0;bool prepared=true;bool stamped=false;};
 inline MockPacket *mp(const IOSkywalkPacket *p){return reinterpret_cast<MockPacket*>(const_cast<IOSkywalkPacket*>(p));}
 unsigned txEnabled=0,txCompEnabled=0,rxCompEnabled=0,txDeq=0,txCompleted=0,rxEnqueued=0,poolLive=0;int poolResult=0,rxEnqueueResult=0,prepareResult=0,setLengthResult=0;std::vector<MockPacket*> rxSeen;
 constexpr unsigned IFF_RUNNING=0x40;constexpr unsigned IFF_UP=0x1;unsigned ifRunning=0,ifFlags=0,ifIoctls=0;bool ifIoctlRuns=true;using ifnet_t=void*;int ifnet_set_flags(ifnet_t,unsigned v,unsigned m){ifRunning=v;ifFlags=(ifFlags&~m)|(v&m);return 0;}unsigned ifnet_flags(ifnet_t){return ifFlags;}struct ifreq{char ifr_name[16];short ifr_flags;};constexpr unsigned long SIOCSIFFLAGS=0x80206910;int ifnet_ioctl(ifnet_t,int,unsigned long c,void *a){assert(c==SIOCSIFFLAGS&&a&&(ifFlags&IFF_UP)&&(static_cast<ifreq*>(a)->ifr_flags&IFF_UP));++ifIoctls;if(ifIoctlRuns)ifFlags|=IFF_RUNNING;return 0;}extern "C" int be201UpdateInterfaceDataStats(void*,void*) __asm__("__ZN23IO80211SkywalkInterface24updateInterfaceDataStatsEP36apple80211_data_path_interface_stats");unsigned statsCalls=0,statsTx=0,statsRx=0;int be201UpdateInterfaceDataStats(void*,void*b){++statsCalls;memcpy(&statsTx,(char*)b+8,4);memcpy(&statsRx,(char*)b+0x18,4);return 0;}using ifnet_offload_t=unsigned;unsigned offloadCalls=0;int ifnet_set_offload(ifnet_t,ifnet_offload_t v){assert(!v);++offloadCalls;return 0;}
@@ -93,7 +93,7 @@ class AirportItlwm:public IO80211Controller {public:
  void registerAWDLArmControl();static bool awdlVifCapabilityArmed();static uint32_t awdlVifPoolFlags();static bool awdlVifAcceptSets();static bool awdlVifLinkAllowed();static bool awdlVifAwAllowed();
  static bool awdlUmiOn();static bool awdlLlwOn();void sendAWDLUmi(const uint8_t*p,const uint8_t*t,size_t n){memcpy(umiPeer,p,6);umiTlvs=t;umiLen=n;++umiSends;}uint8_t umiPeer[6]={};const uint8_t*umiTlvs=nullptr;size_t umiLen=0;unsigned umiSends=0;void awdlUmiDone(const uint8_t*,bool);
  IOReturn createLowLatencyInterface(AirportItlwmAWDLInterface*,const ether_addr&,char*,size_t);static IOReturn createLowLatencyInterfaceGated(OSObject*,void*,void*,void*,void*);AirportItlwmLowLatencyInterface *llwInterface=nullptr;bool llwCreating=false,llwFailed=false;
- void awdlTxRoom();void awdlPeerCache(const uint8_t*,uint32_t){}void awdlPeerCacheDone(const uint8_t*,bool);static bool awdlCacheOn();static bool awdlCacheRtgOn();void startAWDLAuto();static bool awdlLastBootPanicked();static bool awdlOwnQueueWanted();static bool awdlTxAggWanted();static uint32_t awdlOwnFixWanted();void setAWDLOwnQueue(bool,bool,uint32_t){} static void awdlRadioTest(bool*,uint32_t*,uint32_t*,bool*);void setAWDLSlot(uint32_t,uint32_t,uint32_t){}void setAWDLRadioTest(bool,uint32_t,uint32_t,bool){}static uint32_t awdlRocWanted();uint32_t rocSet=0;void setAWDLRoc(uint32_t v){rocSet=v;} bool amsduReadyMock=false;unsigned amsduCalls=0,amsduLast=0;IOReturn amsduResult=0;bool awdlAmsduReady(const uint8_t*){return amsduReadyMock;}IOReturn sendAWDLAmsdu(const uint8_t*const*,const size_t*,unsigned n){++amsduCalls;amsduLast=n;return amsduResult;} static bool awdlVifRadioAllowed();static bool awdlVifRxAllowed();static bool awdlVifTxAllowed();static bool awdlVifDataAllowed();IOReturn sendAWDLData(const uint8_t*,size_t);IOReturn setAWDLTemplate(bool,const uint8_t*,size_t);IOReturn enableAWDLTransmit();
+ void awdlTxRoom();void setAWDLPause(bool){}static bool awdlPauseWanted();void awdlPeerCache(const uint8_t*,uint32_t){}void awdlPeerCacheDone(const uint8_t*,bool);static bool awdlCacheOn();static bool awdlCacheRtgOn();void startAWDLAuto();static bool awdlLastBootPanicked();static bool awdlOwnQueueWanted();static bool awdlTxAggWanted();static uint32_t awdlOwnFixWanted();void setAWDLOwnQueue(bool,bool,uint32_t){} static void awdlRadioTest(bool*,uint32_t*,uint32_t*,bool*);void setAWDLSlot(uint32_t,uint32_t,uint32_t){}void setAWDLSequence(const uint8_t*,uint32_t){}void setAWDLRadioTest(bool,uint32_t,uint32_t,bool){}static uint32_t awdlRocWanted();uint32_t rocSet=0;void setAWDLRoc(uint32_t v){rocSet=v;} bool amsduReadyMock=false;unsigned amsduCalls=0,amsduLast=0;IOReturn amsduResult=0;bool awdlAmsduReady(const uint8_t*){return amsduReadyMock;}size_t awdlAmsduMaxBytes(){return 7900;}IOReturn sendAWDLAmsdu(const uint8_t*const*,const size_t*,unsigned n){++amsduCalls;amsduLast=n;return amsduResult;} static bool awdlVifRadioAllowed();static bool awdlVifRxAllowed();static bool awdlVifTxAllowed();static bool awdlVifDataAllowed();IOReturn sendAWDLData(const uint8_t*,size_t);IOReturn setAWDLTemplate(bool,const uint8_t*,size_t);IOReturn enableAWDLTransmit();
  void inputAWDLActionFrame(const uint8_t *,size_t,uint8_t,int,uint32_t);
  IOReturn requestAWDLMonitor(const ether_addr &);
  bool awdlSyncNext(uint16_t*,uint32_t*){return false;}
@@ -194,7 +194,7 @@ IO80211VirtualInterface *lastCreated=nullptr,*lastLlw=nullptr;
 class IO80211AWDLProtocol:public IO80211VirtualInterface {};
 #define OSSafeReleaseNULL(x) do {if(x)(x)->release();(x)=nullptr;}while(0)
 '''
-factory=''
+factory='struct OSMetaClassBase { const OSMetaClassBase *metaCast(const char *n) const { return n && !strcmp(n, "IOSkywalkNetworkPacket") ? this : nullptr; } };\n'
 for n in ['TxSubmission','TxCompletion','RxSubmission','RxCompletion']:
  t='IOSkywalkPacket *const *' if 'Submission' in n else 'IOSkywalkPacket **'
  extra='UInt32, ' if n=='RxSubmission' else ''
@@ -208,7 +208,8 @@ IOReturn be201PacketPrepare(IOSkywalkPacket *p,void *q,UInt32 d,UInt32 o){assert
 IOReturn be201PoolAllocate(IOSkywalkPacketBufferPool*,IOSkywalkPacket **o,UInt32 options){assert(options==1);if(poolResult)return poolResult;auto m=new MockPacket;m->prepared=false;++poolLive;*o=reinterpret_cast<IOSkywalkPacket*>(m);return 0;}
 void be201PoolDeallocate(IOSkywalkPacketBufferPool*,IOSkywalkPacket *p){delete mp(p);--poolLive;}
 IOReturn be201TxCompEnqueue(void*,IOSkywalkPacket *const*,UInt32 n,UInt32){txCompleted+=n;return 0;}
-IOReturn be201RxCompEnqueue(void*,IOSkywalkPacket *const *p,UInt32 n,UInt32){assert(mp(p[0])->prepared);if(rxEnqueueResult)return rxEnqueueResult;rxEnqueued+=n;rxSeen.push_back(mp(p[0]));return 0;}
+static unsigned rxStampCalls;IOReturn be201NetPacketSetTimestamp(IOSkywalkPacket *p,uint64_t t){assert(mp(p)->prepared&&t);mp(p)->stamped=true;++rxStampCalls;return 0;}
+IOReturn be201RxCompEnqueue(void*,IOSkywalkPacket *const *p,UInt32 n,UInt32){assert(mp(p[0])->prepared);assert(mp(p[0])->stamped||(AirportItlwm::awdlRocWanted()&0x100000)); /* 1.2.24: off by default (presence A/B) */if(rxEnqueueResult)return rxEnqueueResult;rxEnqueued+=n;rxSeen.push_back(mp(p[0]));return 0;}
 void be201TxSubEnable(void*){++txEnabled;}void be201TxCompEnable(void*){++txCompEnabled;}void be201RxCompEnable(void*){++rxCompEnabled;}
 IOReturn be201TxSubRequestDequeue(void*,void*,UInt32){++txDeq;return 0;}
 int main(){
@@ -260,7 +261,7 @@ int main(){
  // Unarmed, as on every boot: refused before anything is allocated, and no capability advertised.
  assert(!AirportItlwm::awdlVifCapabilityArmed());
  assert(controller.createAWDLInterface(&req)==kIOReturnUnsupported&&!controller.awdlInterface&&step==0&&controller.awdlUnarmedRefusals==1);
- controller.registerAWDLArmControl();controller.registerAWDLArmControl();assert(oidRegistered==21);
+ controller.registerAWDLArmControl();controller.registerAWDLArmControl();assert(oidRegistered==22); /* 1.2.24: be201_awdl_pause */
  assert(AirportItlwm::awdlVifPoolFlags()==0);be201AwdlVifPoolFlagsValue=3;assert(AirportItlwm::awdlVifPoolFlags()==1);be201AwdlVifPoolFlagsValue=0;
  be201AwdlVifArm=1;assert(AirportItlwm::awdlVifCapabilityArmed());
  assert(controller.createAWDLInterface(&req)==0&&lastPoolFlags==0&&be201AwdlVifArm==0&&controller.awdlAttempts==1&&AirportItlwm::awdlVifCapabilityArmed()&&controller.awdlInterface&&!strcmp(reinterpret_cast<char*>(req.bsd_name),"awdl0"));
