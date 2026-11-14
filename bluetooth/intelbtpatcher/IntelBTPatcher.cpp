@@ -104,8 +104,9 @@ PluginConfiguration ADDPR(config) {
     arrsize(bootargDebug),
     bootargBeta,
     arrsize(bootargBeta),
-    KernelVersion::MountainLion,
-    KernelVersion::Tahoe,
+    /* 2.5.11: a Sequoia build only; it was MountainLion to Tahoe. */
+    KernelVersion::Sequoia,
+    KernelVersion::Sequoia,
     []() {
         ibtPatcher.init();
     }

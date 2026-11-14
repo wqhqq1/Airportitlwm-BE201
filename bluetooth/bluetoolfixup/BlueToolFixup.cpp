@@ -448,7 +448,8 @@ PluginConfiguration ADDPR(config) {
     arrsize(bootargDebug),
     bootargBeta,
     arrsize(bootargBeta),
-    KernelVersion::Monterey,
+    /* 2.7.14: a Sequoia build; Tahoe and later get stock Bluetooth until a port (its patches match 24H241 code). */
+    KernelVersion::Sequoia,
     KernelVersion::Sequoia,
     pluginStart
 };

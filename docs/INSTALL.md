@@ -29,8 +29,8 @@
 | 驱动 | 版本 | 来源 |
 |---|---|---|
 | `AirportItlwm.kext` | 1.2.25 | `outputs/BE201-WiFi/` |
-| `BlueToolFixup.kext` | 2.7.12 | `outputs/BE201-WiFi/`，或 `build/bluetooth/bluetoolfixup/` |
-| `IntelBTPatcher.kext` | 2.5.10 | `outputs/BE201-WiFi/`，或 `build/bluetooth/intelbtpatcher/` |
+| `BlueToolFixup.kext` | 2.7.14 | `outputs/BE201-WiFi/`，或 `build/bluetooth/bluetoolfixup/` |
+| `IntelBTPatcher.kext` | 2.5.11 | `outputs/BE201-WiFi/`，或 `build/bluetooth/intelbtpatcher/` |
 | `BE201BluetoothFirmware.kext` | 2.5.3 | `build/bluetooth/firmware/` |
 
 另外需要 [Lilu](https://github.com/acidanthera/Lilu) 1.7.3 或更新的版本（用 RELEASE 版即可）。
@@ -83,6 +83,8 @@ AirportItlwm.kext
 | `AirportItlwm.kext` | `Contents/MacOS/AirportItlwm` | `24.2.0` | `24.99.99` |
 
 这四项的 `Arch` 都填 `x86_64`，`Enabled` 填 `true`，`PlistPath` 都填 `Contents/Info.plist`。
+
+这些是 Sequoia（Darwin 24）的版本。即使配置里没写内核范围，它们在别的内核上也不会工作：AirportItlwm 在 24.2 以前或 24 以外的内核上不启动；BlueToolFixup 2.7.14 和 IntelBTPatcher 2.5.11 只在 Sequoia 上由 Lilu 启动。BE201BluetoothFirmware 只负责上传固件，不含 Sequoia 专用代码，只靠上面的 `MaxKernel` 限制。
 
 ## 启动参数：默认不需要
 

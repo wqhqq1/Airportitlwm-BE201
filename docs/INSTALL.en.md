@@ -29,8 +29,8 @@ Built drivers are not kept in the repository. Build them as the [README](../READ
 | Driver | Version | Where |
 |---|---|---|
 | `AirportItlwm.kext` | 1.2.25 | `outputs/BE201-WiFi/` |
-| `BlueToolFixup.kext` | 2.7.12 | `outputs/BE201-WiFi/` or `build/bluetooth/bluetoolfixup/` |
-| `IntelBTPatcher.kext` | 2.5.10 | `outputs/BE201-WiFi/` or `build/bluetooth/intelbtpatcher/` |
+| `BlueToolFixup.kext` | 2.7.14 | `outputs/BE201-WiFi/` or `build/bluetooth/bluetoolfixup/` |
+| `IntelBTPatcher.kext` | 2.5.11 | `outputs/BE201-WiFi/` or `build/bluetooth/intelbtpatcher/` |
 | `BE201BluetoothFirmware.kext` | 2.5.3 | `build/bluetooth/firmware/` |
 
 You also need [Lilu](https://github.com/acidanthera/Lilu) 1.7.3 or later (RELEASE build).
@@ -83,6 +83,8 @@ Here are the four `Kernel/Add` entries. Note that the executable inside `BE201Bl
 | `AirportItlwm.kext` | `Contents/MacOS/AirportItlwm` | `24.2.0` | `24.99.99` |
 
 In all four entries, set `Arch` to `x86_64`, `Enabled` to `true` and `PlistPath` to `Contents/Info.plist`.
+
+These are Sequoia (Darwin 24) builds, and they stay out of the way on other kernels even without these ranges: AirportItlwm does not start before 24.2 or outside 24, and Lilu starts BlueToolFixup 2.7.14 and IntelBTPatcher 2.5.11 only on Sequoia. BE201BluetoothFirmware only uploads the firmware, has no Sequoia-specific code, and relies on the `MaxKernel` above.
 
 ## Boot arguments: none needed by default
 
