@@ -59,6 +59,7 @@ static_assert(sizeof(struct TxPacketRequest) == 0x60, "TxPacketRequest size erro
 class IO80211Controller;
 class CCLogStream;
 struct mloAddrArray;
+class IO80211VirtualInterface;
 
 class IO80211SkywalkInterface : public IOSkywalkEthernetInterface {
     OSDeclareAbstractStructors(IO80211SkywalkInterface)
@@ -151,7 +152,8 @@ private: virtual void _abi_0cd0() __asm__("__ZN23IO80211SkywalkInterface8findPee
     virtual void * getWorkerMatchingDict(OSString*);
     virtual bool init(IOService*, ether_addr*);
     virtual bool isInterfaceEnabled();
-    virtual ether_addr * getSelfMacAddr();
+    // 25G342 returns the address by value (in RAX, from the low-level object at +0x20/+0x24), as in 24G824.
+    virtual ether_addr getSelfMacAddr();
     virtual void * getPacketPool(OSString*);
     virtual CCLogStream * getLogger() const;
     virtual IOReturn handleSIOCSIFADDR();
@@ -202,6 +204,11 @@ public:
     OSString *setInterfaceRole(unsigned int);
     void *setInterfaceId(unsigned int);
     int getInterfaceRole();
+    // Non-virtual, present in 25G342 (the AWDL low-latency interface uses them as on 24G824).
+    unsigned getInterfaceId();
+    void setLowLatencyEnabled(bool);
+    void setParentInterface(IO80211VirtualInterface *);
+    void setCompanionInterfaceId(unsigned int);
 };
 static_assert(sizeof(IO80211SkywalkInterface) == 0x128, "WCL ABI size");
 #endif

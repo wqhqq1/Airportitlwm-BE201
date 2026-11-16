@@ -23,12 +23,23 @@ inline bool ItlDiagnosticFlag(const char *name)
  *   logging and the others are NAN, allocation-site tags and three AWDL bound checks (reportDataPathEvents,
  *   IO80211AWDLPeer::updateAwdlChanSeq, tlvCheckBounds) with the same member offsets. IOSkywalkFamily,
  *   IONetworkingFamily and corecapture keep their UUIDs; all 1116 imports resolve (research/awdl/abi-diff).
+ * - macOS 26.7.3 (25G342), 1.4.0, only in the Tahoe build (include/Airport/macOS26; outputs/tahoe-wifi tools):
+ *   the boot KC vtables of IO80211AWDLProtocol (568) and IO80211VirtualInterface (505) match the concrete classes
+ *   slot by slot (scripts/test-awdl-vif-abi-tahoe.py; the 63 AWDL handlers keep the 24G824 order 5 slots later, 51
+ *   confirmed by their dispatchers); object sizes 0x130/0x130/0x128; all 603 AWDL imports resolve. Against 24G824 the
+ *   native handlers of the request layouts the driver reads (AppleBCMWLAN createProxInterface, Proximity start,
+ *   sync frame template, peer traffic registration, OOB request, companion create, LowLatency initBSD) keep their
+ *   instruction counts and every small field offset (only their own ivars move by 0x10); events 41/51/69 are posted
+ *   by the same native functions; IO80211BufferPool::getBuffer stays slot 35; getSelfMacAddr returns by value.
  */
 inline bool ItlAwdlLayoutVerified()
 {
     static const char *const verified[] = {
         "xnu-11417.140.69.711.44~1/RELEASE_X86_64", /* 24G824 */
         "xnu-11417.140.69.713.47~2/RELEASE_X86_64", /* 24H241 */
+#if __IO80211_TARGET == __MAC_26_0
+        "xnu-12377.161.15.701.48~2/RELEASE_X86_64", /* 25G342 */
+#endif
     };
     for (const char *want : verified) {
         for (const char *p = version; *p; p++) {

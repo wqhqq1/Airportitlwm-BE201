@@ -470,7 +470,16 @@ struct ScanRequest {
     uint8_t bssid[6];
     uint32_t channelCount;
     uint8_t channels[32];
+    uint8_t ssidSource;     // 0 none, 1 the single SSID field, 2 the SSID list (Tahoe)
+    uint32_t ssidListCount; // raw list count field, for diagnostics
 };
+
+// Tahoe apple80211ScanRequest SSID list (25G342 IO80211ScanRequest::getScanRequestForDriver copies the
+// scan_data list: count at 0x1318, entries at 0x131c; IO80211.framework __getScanData writes each entry
+// as version 1, length, then the SSID bytes, 0x38 apart, up to 10 entries). Unused entries are left as
+// the framework's 0xaa fill, so only entries with version 1 and a length of 1-32 count.
+constexpr size_t kScanSsidListCount = 0x1318, kScanSsidList = 0x131c, kScanSsidListStride = 0x38;
+constexpr uint32_t kScanSsidListMax = 10;
 
 inline unsigned scanChannelCount(const uint8_t *channels) {
     unsigned bits = 0;
@@ -500,6 +509,25 @@ inline bool decodeScan(const void *buffer, size_t length, ScanRequest &out) {
     out.ssidLength = ssidLength;
     out.channelCount = count;
     memcpy(out.ssid, p + 0x20, ssidLength);
+    out.ssidSource = ssidLength ? 1 : 0;
+#if __IO80211_TARGET == __MAC_26_0 || defined(AIRPORT_WCL_SCAN_LIST_TEST)
+    // Tahoe can name the network only in the SSID list (an Instant Hotspot is hidden and answers
+    // only a probe that carries its name). Use the first valid entry when the single field is empty.
+    if (!ssidLength && length >= kScanSsidList + kScanSsidListMax * kScanSsidListStride) {
+        out.ssidListCount = read32(p + kScanSsidListCount);
+        uint32_t entries = out.ssidListCount < kScanSsidListMax ? out.ssidListCount : kScanSsidListMax;
+        for (uint32_t i = 0; i < entries; ++i) {
+            const uint8_t *entry = p + kScanSsidList + size_t(i) * kScanSsidListStride;
+            uint32_t version = read32(entry), len = read32(entry + 4);
+            if (version != 1 || !len || len > 32)
+                continue;
+            out.ssidLength = len;
+            memcpy(out.ssid, entry + 8, len);
+            out.ssidSource = 2;
+            break;
+        }
+    }
+#endif
     memcpy(out.bssid, p + 0x14, 6);
     // Native entries are apple80211_channel: version, channel, flags (12 bytes).
     for (uint32_t i = 0; i < count; ++i) {

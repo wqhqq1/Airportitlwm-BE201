@@ -16,9 +16,11 @@ G824 = dict(payload_vm=0x1009d9a10, state_vm=0x100a69f00, defines={})
 PAYLOAD_MAX = 0x5f0
 
 
-def build(defines, payload_vm, state_vm, out):
+def build(defines, payload_vm, state_vm, out, room=PAYLOAD_MAX):
     out = Path(out); out.mkdir(parents=True, exist_ok=True)
     flags = FLAGS + [f'-D{k}={v:#x}' for k, v in sorted(defines.items())] + [f'-DBE201_STATE={state_vm:#x}']
+    if 'BE201_QUIET' in defines:
+        flags.append('-fomit-frame-pointer')  # Tahoe: the quiet module must fit __TEXT's smaller zero tail
     subprocess.run(['clang++', *flags, '-c', str(W/'AuthenticatedRPA.cpp'), '-o', str(out/'authenticated-rpa.o')], check=True)
     subprocess.run(['ld', '-static', '-arch', 'x86_64', '-e', '_BE201ResolveRPA', '-no_uuid',
                     '-o', str(out/'authenticated-rpa.macho'), str(out/'authenticated-rpa.o')], check=True)
@@ -54,7 +56,7 @@ def build(defines, payload_vm, state_vm, out):
     code = code.replace(sentinel, struct.pack('<Q', preferred))
     marker = hashlib.sha256(code).digest()[:8] + bytes(8)
     payload = marker + code
-    assert len(payload) <= PAYLOAD_MAX, ('payload does not fit', len(payload))
+    assert len(payload) <= min(room, PAYLOAD_MAX), ('payload does not fit', len(payload), room)
     (out/'authenticated-rpa-code.bin').write_bytes(code)
     (out/'authenticated-rpa-payload.bin').write_bytes(payload)
     layout = {'text': text, 'entries': symbols, 'relocations': relocations, 'dependencies': dependencies,

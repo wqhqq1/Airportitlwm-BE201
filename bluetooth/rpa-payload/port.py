@@ -51,6 +51,10 @@ ANCHORS = {
 # OI_Time_Now sits this far below the OSAL allocator in the 24G824 OSAL object (0x1000d6f6d - 0x1000d5be3).
 ALLOC_TO_TIME = 0x138a
 ALLOC_CALL = ('scan', 0xb38)  # `mov edi, 0x50; call allocator` in the scan page
+# Tahoe (25G342) changed the code around several anchors: builds/BUILD/anchors.json then gives that build's anchors,
+# matched by hand to 24H241 (see its _about), and used only where the 24G824 context does not match exactly once.
+# Every structural check below still runs on them.
+OVERRIDE = {}
 
 
 class Image:
@@ -155,8 +159,15 @@ def find_masked(img, code, m):
 def anchor(img, name):
     page, s, e, at = ANCHORS[name]; ref, vm = REF[page]; code = (W/ref).read_bytes()[s:e]
     hits = find_masked(img, code, mask(code, vm + s))
-    if len(hits) != 1: raise SystemExit(f'{name}: {len(hits)} matches of the 24G824 context (need exactly 1)')
-    return hits[0] + (at - s)
+    if len(hits) == 1: return hits[0] + (at - s)
+    if name in OVERRIDE:
+        a = OVERRIDE[name]; first = img.read(a, 1)[0]
+        assert a in img.function_set or img.function(a)[0] < a, f'{name}: {a:#x} outside a function'
+        if name.endswith(('_call', '_call1', '_call2')): assert first == 0xe8, f'{name}: {a:#x} is not a call'
+        else: assert img.read(a, 3) in (b'\x48\x8d\x05', b'\x48\x8d\x3d') or first == 0xbf, f'{name}: {a:#x} block start'
+        print(f'{name}: 24G824 context matched {len(hits)} times; using the verified anchor {a:#x}')
+        return a
+    raise SystemExit(f'{name}: {len(hits)} matches of the 24G824 context (need exactly 1)')
 
 
 def branch_targets(img):
@@ -217,9 +228,12 @@ def stub_for(img, got):
 
 
 def oi_time_now(img, scan_call):
-    alloc_site = scan_call + (ALLOC_CALL[1] - ANCHORS['scan_call'][3])
-    assert img.read(alloc_site - 5, 5) == b'\xbf\x50\x00\x00\x00', 'allocator call context moved'
-    t = img.call_target(alloc_site) - ALLOC_TO_TIME
+    if 'time_now' in OVERRIDE:
+        t = OVERRIDE['time_now']
+    else:
+        alloc_site = scan_call + (ALLOC_CALL[1] - ANCHORS['scan_call'][3])
+        assert img.read(alloc_site - 5, 5) == b'\xbf\x50\x00\x00\x00', 'allocator call context moved'
+        t = img.call_target(alloc_site) - ALLOC_TO_TIME
     assert t in img.function_set, f'OI_Time_Now candidate {t:#x} is not a function start'
     f0, f1 = img.function(t); ins = img.instructions(f0, f1)
     ins = ins[:max(k for k, i in enumerate(ins) if i.mnemonic == 'ret') + 1]  # drop the alignment padding
@@ -233,10 +247,11 @@ def oi_time_now(img, scan_call):
     return t
 
 
-def free_tail(img, seg, need, align):
+def free_tail(img, seg, need, align, room=False):
     vm, vs, fo, fsz = img.segments[seg]
     last = max(a + s for g, n, a, s, o in img.sections if g == seg)
     start = (last + align - 1) // align * align
+    if room: return start, vm + vs - start
     assert start + need <= vm + vs, f'{seg}: {vm + vs - start} bytes after the last section, need {need}'
     return start
 
@@ -262,6 +277,9 @@ def locate(img):
 
 
 def port(build, path):
+    o = W/'builds'/build/'anchors.json'
+    if o.exists():
+        OVERRIDE.update({k: int(v, 16) for k, v in json.loads(o.read_text()).items() if not k.startswith('_')})
     img = Image(path); r = locate(img)
     targets = branch_targets(img)
     scan_skip = guard_block(img, r['scan_block'], 5 + GUARD, targets)
@@ -271,14 +289,18 @@ def port(build, path):
     for a in [r['build_call']] + r['multi_calls'] + [r['filter_block'] + 5 + 2 * GUARD - 1]:
         assert page(a) == page(r['filter_block']), 'filter call/guard pages'
     sys.path.insert(0, str(W)); import build as module
-    payload_vm = free_tail(img, '__TEXT', 0x5f0, 16)
+    # 25G342 leaves 1104 bytes after __TEXT's last section: then the quiet module (no log lines, see
+    # AuthenticatedRPA.cpp) is built, and must fit what is there.
+    payload_vm, room = free_tail(img, '__TEXT', 0, 16, room=True)
     state_vm = free_tail(img, '__DATA', STATE_SIZE, 256)
     assert state_vm >= img.segments['__DATA'][0] + img.segments['__DATA'][3], 'state must be zero-fill, past the file'
     defines = {'BE201_TIME_NOW': r['time_now'], 'BE201_LOG_IMPL': r['log_impl'], 'BE201_LOG_DEFAULT': r['log_default'],
                'BE201_FORMAT': r['format'], 'BE201_RESOLVER': r['resolver'], 'BE201_BUILD_FILTER': r['build_filter'],
                'BE201_INSERT_MULTI': r['insert_multi']}
+    if room < module.PAYLOAD_MAX:
+        defines['BE201_QUIET'] = 1; print(f'__TEXT tail {room} bytes: quiet module')
     out = W/'builds'/build
-    layout, payload = module.build(defines, payload_vm, state_vm, out)
+    layout, payload = module.build(defines, payload_vm, state_vm, out, room)
     assert payload_vm + len(payload) <= img.segments['__TEXT'][0] + img.segments['__TEXT'][3]
     assert page(payload_vm) == page(payload_vm + len(payload) - 1), 'payload crosses a page'
     assert not any(img.read(payload_vm, len(payload))), 'payload area is not zero'

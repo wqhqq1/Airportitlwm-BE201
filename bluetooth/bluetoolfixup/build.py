@@ -2,11 +2,14 @@ from pathlib import Path
 import subprocess,plistlib,json,os
 # Settings come from ../release.json; dependencies from deps/, output to build/bluetooth/<folder> (README.md).
 w=Path(__file__).resolve().parent;root=w.parents[1];rel=json.loads((w.parent/'release.json').read_text())[w.name]
+# Tahoe build (BE201_TARGET=tahoe): release.json's 'tahoe' settings, -DBE201_TAHOE, output build/bluetooth-tahoe.
+tahoe=os.environ.get('BE201_TARGET')=='tahoe'
+if tahoe:rel={**rel,**rel['tahoe']}
 sdk=Path(os.environ.get('MAC_KERNEL_SDK',str(root/'deps/MacKernelSDK-3f75008')));lilu=Path(os.environ.get('LILU_SOURCE',str(root/'deps/Lilu/Lilu')))
-out=Path(os.environ.get('BUILD_OUTPUT',str(root/'build/bluetooth'/w.name)));out.mkdir(parents=True,exist_ok=True)
+out=Path(os.environ.get('BUILD_OUTPUT',str(root/('build/bluetooth-tahoe' if tahoe else 'build/bluetooth')/w.name)));out.mkdir(parents=True,exist_ok=True)
 env=dict(os.environ,SOURCE_DATE_EPOCH=str(rel['source_date_epoch']))
 bundle=out/'BlueToolFixup.kext';(bundle/'Contents/MacOS').mkdir(parents=True,exist_ok=True)
-flags=['-target','x86_64-apple-macos10.12','-mkernel','-fno-common','-fstack-protector-strong','-mno-red-zone','-nostdinc','-isystem',str(sdk/'Headers'),'-I',str(lilu),'-I',str(w),'-DKERNEL','-DKERNEL_PRIVATE','-DDRIVER_PRIVATE','-DPRODUCT_NAME=BlueToolFixup','-DMODULE_VERSION='+rel['version'],'-DLILU_CUSTOM_IOKIT_INIT=1','-O2','-Wall','-Wextra','-Wno-unused-parameter','-Wno-unused-variable','-Wno-deprecated-declarations']
+flags=['-target','x86_64-apple-macos10.12','-mkernel','-fno-common','-fstack-protector-strong','-mno-red-zone','-nostdinc','-isystem',str(sdk/'Headers'),'-I',str(lilu),'-I',str(w),'-DKERNEL','-DKERNEL_PRIVATE','-DDRIVER_PRIVATE','-DPRODUCT_NAME=BlueToolFixup','-DMODULE_VERSION='+rel['version'],'-DLILU_CUSTOM_IOKIT_INIT=1','-O2','-Wall','-Wextra','-Wno-unused-parameter','-Wno-unused-variable','-Wno-deprecated-declarations']+(['-DBE201_TAHOE=1'] if tahoe else [])
 cmds=[];objs=[]
 for source in [w/'BlueToolFixup.cpp',lilu/'Library/plugin_start.cpp']:
  obj=out/(source.stem+'.o');cmd=['clang++',*flags,'-fapple-kext','-std=gnu++14','-fno-rtti','-fno-exceptions','-c',str(source),'-o',str(obj)];cmds.append(cmd);subprocess.run(cmd,check=True,env=env);objs.append(str(obj))

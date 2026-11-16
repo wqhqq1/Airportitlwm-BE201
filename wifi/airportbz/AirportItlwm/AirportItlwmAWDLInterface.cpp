@@ -776,9 +776,12 @@ bool AirportItlwmAWDLInterface::setLinkState(IO80211LinkState state, unsigned op
         restoreRunning();
     return done;
 }
+// 25G342 IO80211SkywalkInterface has no 4-argument setLinkState; only the IO80211VirtualInterface one exists.
+#if __IO80211_TARGET == __MAC_15_2
 bool AirportItlwmAWDLInterface::setLinkState(IO80211LinkState state, unsigned options, bool wait, unsigned timeout) {
     return (linkActive || state == kIO80211NetworkLinkDown) && IO80211SkywalkInterface::setLinkState(state, options, wait, timeout);
 }
+#endif
 IOReturn AirportItlwmAWDLInterface::setMacAddress(ether_addr &) { return unsupported(1003); }
 IOReturn AirportItlwmAWDLInterface::getSSID(apple80211_ssid_data *data) { return unsupported(500); }
 IOReturn AirportItlwmAWDLInterface::getCHANNEL(apple80211_channel_data *data) { return unsupported(501); }

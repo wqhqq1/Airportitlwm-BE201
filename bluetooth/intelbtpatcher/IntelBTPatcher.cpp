@@ -104,9 +104,19 @@ PluginConfiguration ADDPR(config) {
     arrsize(bootargDebug),
     bootargBeta,
     arrsize(bootargBeta),
+#ifdef BE201_TAHOE
+    /*
+     * Tahoe build. 2.6.0: the IOUSBHost hooks (deviceRequest, pipe io, pipe init with the 26.5+ ConfigurationDescriptor
+     * signature, all in 25G342's kernel collection). 2.7.0: the BE201 switches too (probe, native address, LE
+     * baseline: HCI transport level, BE201_KERNEL).
+     */
+    KernelVersion::Tahoe,
+    KernelVersion::Tahoe,
+#else
     /* 2.5.11: a Sequoia build only; it was MountainLion to Tahoe. */
     KernelVersion::Sequoia,
     KernelVersion::Sequoia,
+#endif
     []() {
         ibtPatcher.init();
     }
@@ -141,9 +151,9 @@ bool CIntelBTPatcher::_randomAddressInit = false;
 bool CIntelBTPatcher::init()
 {
     DBGLOG(DRV_NAME, "%s", __PRETTY_FUNCTION__);
-    be201ProbeEnabled = getKernelVersion() == KernelVersion::Sequoia && be201Switch("-be201btprobe");
-    be201NativeAddressEnabled = getKernelVersion() == KernelVersion::Sequoia && be201Switch("-be201nativeaddr");
-    be201LEBaselineEnabled = getKernelVersion() == KernelVersion::Sequoia && be201Switch("-be201lebaseline");
+    be201ProbeEnabled = getKernelVersion() == BE201_KERNEL && be201Switch("-be201btprobe");
+    be201NativeAddressEnabled = getKernelVersion() == BE201_KERNEL && be201Switch("-be201nativeaddr");
+    be201LEBaselineEnabled = getKernelVersion() == BE201_KERNEL && be201Switch("-be201lebaseline");
     callbackIBTPatcher = this;
     if (getKernelVersion() < KernelVersion::Monterey) {
         lilu.onKextLoadForce(&IntelBTPatcher_IOBluetoothInfo, 1,

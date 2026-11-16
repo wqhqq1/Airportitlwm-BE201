@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# Tahoe (macOS 26) build of the sources of build-sequoia-macos.sh (1.3.0: without the AWDL interface), against include/Airport/macOS26
+# (__IO80211_TARGET 260000). The Xcode Tahoe target leaves out AirportItlwmAWDLInterface.cpp; this build keeps it.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SDK=${MAC_KERNEL_SDK:?Set MAC_KERNEL_SDK to the MacKernelSDK directory}
+TOOLCHAIN=${DARWIN_TOOLCHAIN:-/Library/Developer/CommandLineTools/usr/bin}
+OUT=${BUILD_OUTPUT:-$ROOT/build-tahoe}
+VERSION=${BE201_BUILD_VERSION:-1.3.0}
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 2
+/bin/sh "$ROOT/scripts/prepare-mackernelsdk.sh" "$SDK"
+mkdir -p "$OUT/objects"
+cd "$ROOT"
+
+# Compile the Sequoia PBXSourcesBuildPhase (58 files, AWDL included); its null entry is not a file.
+python3 - <<'PY'
+from pathlib import Path
+import re, json
+root = Path.cwd()
+p = (root / 'itlwm.xcodeproj/project.pbxproj').read_text()
+phase = re.search(r'AFFBDFD057C2402C908ECB89 /\* Sources \*/ = \{(.*?)\n\t\t\};', p, re.S).group(1)
+files = []
+inventory = {}
+# Build output, deploy kits, backups and reference copies are not sources.
+local = {'build', 'build-tahoe', 'deploy-backups', 'deploy-staging', 'reference', 'tools'}
+for path in root.rglob('*'):
+    if path.is_file() and path.relative_to(root).parts[0] not in local:
+        inventory.setdefault(path.name, []).append(path)
+for name in re.findall(r'[A-F0-9]{24} /\* (.*?) in Sources \*/', phase):
+    if name == '(null)':
+        continue
+    matches = inventory.get(name, [])
+    assert len(matches) == 1, (name, matches)
+    files.append(matches[0].relative_to(root).as_posix())
+assert len(files) == 58, len(files)
+# 1.3.0-1.3.2 left out the AWDL interface; 1.4.0 builds it against include/Airport/macOS26 (BE201_AWDL_IFACE).
+(root / 'sources-tahoe.json').write_text(json.dumps(files, indent=2) + '\n')
+PY
+
+common=(-target x86_64-apple-macos15.2 -mkernel -fapple-kext
+  -fno-sized-deallocation -fno-use-cxa-atexit
+  -fstack-protector -fno-common -fno-builtin -mno-red-zone -mcmodel=kernel
+  -nostdinc -D__PRIVATE_SPI__ -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE
+  -DIEEE80211_STA_ONLY -DAIRPORT -DAIRPORT_WCL -DAIRPORT_VTD
+  -DIO80211FAMILY_V2 -D__IO80211_TARGET=260000
+  "-DITLWM_VERSION=\"$VERSION\"" '-DGIT_COMMIT="be201-mld-authorized-transition"'
+  -isystem "$SDK/Headers" -isystem "$(clang -print-resource-dir)/include"
+  -I . -I itlwm -I itlwm/hal_iwx
+  -I itl80211 -I itl80211/openbsd -I itl80211/linux -I include
+  -I include/Airport -I AirportItlwm -include itlwm/PrivateSPI.pch
+  -O1 -Wno-deprecated-register -Wno-multichar -Werror=return-type)
+
+python3 - "$OUT" "${common[@]}" <<'PY'
+import concurrent.futures, json, pathlib, subprocess, sys
+out = pathlib.Path(sys.argv[1])
+common = sys.argv[2:]
+sources = json.load(open('sources-tahoe.json'))
+assert len({pathlib.Path(s).stem for s in sources}) == len(sources)
+def compile_source(source):
+    stem = pathlib.Path(source).stem
+    with (out / 'objects' / (stem + '.log')).open('w') as log:
+        result = subprocess.run(['clang++', *common, '-x', 'c++', '-std=gnu++14',
+            '-fno-exceptions', '-fno-rtti', '-c', source, '-o',
+            str(out / 'objects' / (stem + '.o'))], stdout=log, stderr=log)
+    return source, result.returncode
+failed = []
+with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+    for source, rc in pool.map(compile_source, sources):
+        print(('FAIL' if rc else 'OK') + ' ' + source, flush=True)
+        if rc:
+            failed.append(source)
+if failed:
+    for source in failed:
+        print((out / 'objects' / (pathlib.Path(source).stem + '.log')).read_text())
+    sys.exit(1)
+PY
+
+cat > "$OUT/module.cpp" <<EOF
+#include <mach/mach_types.h>
+extern "C" {
+extern kern_return_t _start(kmod_info_t *, void *);
+extern kern_return_t _stop(kmod_info_t *, void *);
+KMOD_EXPLICIT_DECL(com.zxystd.AirportItlwm, "$VERSION", _start, _stop)
+__private_extern__ kmod_start_func_t *_realmain = 0;
+__private_extern__ kmod_stop_func_t *_antimain = 0;
+__private_extern__ int _kext_apple_cc = 1;
+}
+EOF
+clang++ "${common[@]}" -std=gnu++14 -fno-exceptions -fno-rtti \
+  -c "$OUT/module.cpp" -o "$OUT/objects/module.o"
+link() {
+  "$TOOLCHAIN/ld" -no_fixup_chains \
+    -arch x86_64 -kext -undefined dynamic_lookup -macos_version_min 15.2 \
+    -o "$OUT/AirportItlwm" "$OUT"/objects/*.o "$@" "$SDK/Library/x86_64/libkmod.a"
+}
+link
+# OpenCore skips a kext whose segments do not sit at their VM addresses once expanded ("Failed to fit ... Invalid
+# Parameter"). When __DATA's file content ends exactly on a page, ld leaves a page gap before __LINKEDIT (1.1.54,
+# 2026-11-08, Wi-Fi absent for a boot). A small initialized pad moves that end off the page.
+if ! python3 "$ROOT/scripts/oc_layout_check.py" "$OUT/AirportItlwm"; then
+  printf '__attribute__((used, section("__DATA,__data"))) static char be201_layout_pad[64] = {1};\n' > "$OUT/layout_pad.c"
+  clang -target x86_64-apple-macos15.2 -mkernel -c "$OUT/layout_pad.c" -o "$OUT/layout_pad.o"
+  link "$OUT/layout_pad.o"
+  python3 "$ROOT/scripts/oc_layout_check.py" "$OUT/AirportItlwm"
+fi
+printf 'Compiled %s Tahoe sources (with the AWDL interface) and linked %s\n' "$(python3 -c 'import json,sys;print(len(json.load(open(sys.argv[1]))))' "$ROOT/sources-tahoe.json")" "$OUT/AirportItlwm"

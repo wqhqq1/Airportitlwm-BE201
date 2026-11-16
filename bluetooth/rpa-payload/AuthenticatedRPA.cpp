@@ -55,12 +55,21 @@ static bool enter(State *p) {
  uint64_t expected=0;
  __atomic_compare_exchange_n(&p->magic,&expected,Magic,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE);
  if(__atomic_load_n(&p->magic,__ATOMIC_ACQUIRE)!=Magic)return false;
- if(__atomic_exchange_n(&p->lock,1,__ATOMIC_ACQUIRE)){__atomic_add_fetch(&p->busy,1,__ATOMIC_RELAXED);return false;}
+ if(__atomic_exchange_n(&p->lock,1,__ATOMIC_ACQUIRE)){
+#ifndef BE201_QUIET
+__atomic_add_fetch(&p->busy,1,__ATOMIC_RELAXED);
+#endif
+return false;}
  return true;
 }
 static void leave(State *p) {__atomic_store_n(&p->lock,0,__ATOMIC_RELEASE);}
 // Use an existing native public-string format. Unified logging copies this
 // fixed nonsecret string now; it must not defer decoding a new format offset.
+#ifdef BE201_QUIET
+// Tahoe 25G342: __TEXT's zero tail holds 1104 bytes, the logging build needs 1479. The routing is the same; only
+// the one-time "BE201RPA stage=N" log lines are left out (port.py chooses this when the full module does not fit).
+static void report(unsigned) {}
+#else
 static void report(unsigned stage) {
  volatile uint64_t message[3];
  message[0]=0x4150523130324542ULL;
@@ -73,14 +82,23 @@ static void report(unsigned stage) {
   *reinterpret_cast<void**>(uintptr_t(BE201_LOG_DEFAULT)+s),0,
   reinterpret_cast<const char*>(uintptr_t(BE201_FORMAT)+s),&buffer,12);
 }
+#endif
+#ifdef BE201_QUIET
+// Without the log lines nothing reads the counters or the first-report bits either.
+#define COUNT(x) ((void)0)
+static bool first(State *,unsigned) {return false;}
+static void note(unsigned) {}
+#else
+#define COUNT(x) (++(x))
 static bool first(State *p,unsigned stage) {uint32_t bit=1U<<stage;bool yes=!(p->reported&bit);p->reported|=bit;return yes;}
 static void note(unsigned stage) {State *p=state();if(!enter(p))return;bool yes=first(p,stage);leave(p);if(yes)report(stage);}
+#endif
 static void remember(uint64_t stable,uint64_t raw) {
  Time t=now();if(t.millis>=1000)return;
  State *p=state();if(!enter(p))return;
  unsigned slot=p->next++%8;
  for(unsigned i=0;i<8;i++)if(p->entries[i].identity==stable){slot=i;break;}
- p->entries[slot]={stable,raw,t};++p->remembered;bool yes=first(p,1);leave(p);if(yes)report(1);
+ p->entries[slot]={stable,raw,t};COUNT(p->remembered);bool yes=first(p,1);leave(p);if(yes)report(1);
 }
 static uint64_t route(uint64_t stable) {
  if(!identity(stable))return stable;
@@ -92,8 +110,8 @@ static uint64_t route(uint64_t stable) {
   // OI_Time_Now is monotonic seconds/milliseconds. Reject rollback/wrap and
   // entries older than 15s, including after a long sleep or controller restart.
   uint64_t cur=uint64_t(t.seconds)*1000+t.millis,old=uint64_t(e.time.seconds)*1000+e.time.millis;
-  if(cur>=old && cur-old<=15000 && rpa(e.raw)){result=e.raw;++p->routed;stage=2;}
-  else {++p->expired;stage=4;}
+  if(cur>=old && cur-old<=15000 && rpa(e.raw)){result=e.raw;COUNT(p->routed);stage=2;}
+  else {COUNT(p->expired);stage=4;}
   break;
  }
  bool yes=first(p,stage);leave(p);if(yes)report(stage);return result;

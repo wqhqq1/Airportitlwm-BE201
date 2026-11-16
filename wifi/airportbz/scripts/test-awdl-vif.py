@@ -8,11 +8,12 @@ h=(R/'AirportItlwm/AirportItlwmAWDLInterface.hpp').read_text()
 s=(R/'AirportItlwm/AirportItlwmAWDLInterface.cpp').read_text()
 f=(R/'AirportItlwm/BE201SkywalkFactories.hpp').read_text()
 # Keep actual functions/class, replace only kernel headers/meta constructor declarations for host execution.
-h='\n'.join(l for l in h.splitlines() if not l.startswith('#include') and not l.startswith('#pragma') and 'OSDeclareDefaultStructors' not in l).replace(' override','').replace('private:','public:')
+h='\n'.join(l for l in h.splitlines() if not l.startswith(('#include','#pragma','#if ','#else','#endif')) and 'OSDeclareDefaultStructors' not in l).replace(' override','').replace('private:','public:')
 f='\n'.join(l for l in f.splitlines() if not l.startswith('#pragma'))
 s=re.sub(r'^#include.*\n','',s,flags=re.M)
 s=re.sub(r'^OSDefineMetaClassAndStructors.*\n','',s,flags=re.M)
-s=re.sub(r'^#(?:ifn?def|define|endif).*\n','',s,flags=re.M)
+# 1.4.0: also the plain #if around the Sequoia-only setLinkState overload (this harness models Sequoia).
+s=re.sub(r'^#(?:if(?:n?def)?|define|endif)\b.*\n','',s,flags=re.M)
 types='\n'.join('struct '+t+' { uint32_t version=0, unk1=0, enabled=0, state=0; };' for t in sorted({m['type'] for m in meta['methods']}))
 pre=r'''
 #include "iwx_awdl_rx.h"
@@ -529,6 +530,6 @@ assert 'interface->release()' in ctl and ctl.index('holdsNativeState()')<ctl.ind
 assert 'IOMalloc' not in iface,'native registration owns the registration info copies'
 controller_source=controller_source[a:controller_source.rindex('#endif')]
 with tempfile.TemporaryDirectory() as td:
- p=Path(td);src=p/'test.cpp';src.write_text('#include <algorithm>\n'+pre+types+'\n'+h+'\n'+f+'\n'+factory+'\n#define super IO80211AWDLProtocol\n'+s+'\n'+controller_source+'\n'+main)
+ p=Path(td);src=p/'test.cpp';src.write_text('#include <algorithm>\n#define BE201_AWDL_IFACE 1\n'+pre+types+'\n'+h+'\n'+f+'\n'+factory+'\n#define super IO80211AWDLProtocol\n'+s+'\n'+controller_source+'\n'+main)
  subprocess.run(['clang++','-I',str(R/'itlwm/hal_iwx'),'-std=c++17','-fsanitize=address,undefined','-fno-omit-frame-pointer','-O1','-g',str(src),'-o',str(p/'test')],check=True)
  subprocess.run([str(p/'test')],check=True)

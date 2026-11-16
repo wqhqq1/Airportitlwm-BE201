@@ -15,7 +15,9 @@
 
 #include "AirportItlwmSkywalkInterface.hpp"
 #ifdef AIRPORT_WCL
+#if BE201_AWDL_IFACE
 #include "AirportItlwmAWDLInterface.hpp"
+#endif
 #ifdef AIRPORT_WCL
 #include <sys/sysctl.h>
 #endif
@@ -153,6 +155,7 @@ bool AirportItlwm::init(OSDictionary *properties)
     awdlSyncEnable = false;
     power_state = 0;
     memset(geo_location_cc, 0, sizeof(geo_location_cc));
+    memset(bss_cc, 0, sizeof(bss_cc));
     return ret;
 }
 
@@ -304,6 +307,12 @@ bool AirportItlwm::start(IOService *provider)
     ItlStartupStage(pciNub, "controller-start");
 #if __IO80211_TARGET == __MAC_15_2
     if (version_major != 24 || version_minor < 2) {
+        ItlStartupFailure(pciNub, "darwin-version", kIOReturnUnsupported);
+        return false;
+    }
+#elif __IO80211_TARGET == __MAC_26_0
+    /* 1.3.0: the Tahoe build, against the macOS 26 IO80211Family headers. */
+    if (version_major != 25) {
         ItlStartupFailure(pciNub, "darwin-version", kIOReturnUnsupported);
         return false;
     }
@@ -1144,6 +1153,17 @@ getCARD_CAPABILITIES(OSObject *object,
     // WCL uses this capability together with the BSS HE IE for PHY reporting.
     if (caps & IEEE80211_C_HE)
         cd->capabilities[17] |= 0x80;
+#if __IO80211_TARGET == __MAC_26_0
+    // 1.3.1: Tahoe IO80211.framework Apple80211Scan/ScanDynamic build a scan-multiple request whenever the
+    // scan names SSIDs (airportd's live scan before joining a Personal Hotspot) unless capabilities[9]
+    // bit 1 is set, and refuse that request with -3903 before any ioctl unless capabilities[2] bit 6 is
+    // set. Neither was set, so every hotspot join stopped at "Failed to scan for hotspot network".
+    // capabilities[9] bit 1 selects the single scan request instead (the one broadcast scans already use
+    // through WCL, carrying one SSID); bit 6 of [2] matches the original card table and is read only by
+    // that same check. Both values come from the legacy table below (capabilities[2] = 0xFF, [9] = 0x02).
+    cd->capabilities[2] |= 0x40;
+    cd->capabilities[9] |= 0x02;
+#endif
     // Capability bit 32 is what wifip2pd checks before VIRTUAL_IF_CREATE with role 6.
     // be201_awdl_vif alone stays silent until armed, so a normal boot behaves as if it were off.
     if (ItlDiagnosticFlag("be201_awdl_if") || (ItlAwdlFlag("be201_awdl_vif") && awdlVifCapabilityArmed()))
@@ -1236,9 +1256,29 @@ getCOUNTRY_CODE(OSObject *object,
     cd->version = APPLE80211_VERSION;
     memset(user_override_cc, 0, sizeof(user_override_cc));
     PE_parse_boot_argn("itlwm_cc", user_override_cc, 3);
-    /* user_override_cc > firmware_cc > geo_location_cc */
-    strncpy((char*)cd->cc, user_override_cc[0] ? user_override_cc : ((cc_fw[0] == 'Z' && cc_fw[1] == 'Z' && geo_location_cc[0]) ? geo_location_cc : cc_fw), sizeof(cd->cc));
+    /* user_override_cc > firmware_cc > geo_location_cc > bss_cc (1.4.4) */
+    const bool fwUnknown = cc_fw[0] == 'Z' && cc_fw[1] == 'Z';
+    const char *cc = user_override_cc[0] ? user_override_cc :
+        (fwUnknown && geo_location_cc[0]) ? geo_location_cc :
+        (fwUnknown && bss_cc[0]) ? bss_cc : cc_fw;
+    strncpy((char*)cd->cc, cc, sizeof(cd->cc));
     return kIOReturnSuccess;
+}
+
+// 1.4.4: true when the joined network's country is new and is now what getCOUNTRY_CODE reports.
+bool AirportItlwm::learnBssCountry(const uint8_t *cc)
+{
+    if (!cc || cc[0] < 'A' || cc[0] > 'Z' || cc[1] < 'A' || cc[1] > 'Z' ||
+        (bss_cc[0] == cc[0] && bss_cc[1] == cc[1]))
+        return false;
+    bss_cc[0] = cc[0];
+    bss_cc[1] = cc[1];
+    bss_cc[2] = 0;
+    setProperty("ItlwmBssCountry", bss_cc);
+    const char *cc_fw = fHalService->getDriverInfo()->getFirmwareCountryCode();
+    char user_override_cc[3] = {};
+    PE_parse_boot_argn("itlwm_cc", user_override_cc, 3);
+    return !user_override_cc[0] && cc_fw[0] == 'Z' && cc_fw[1] == 'Z' && !geo_location_cc[0];
 }
 
 IOReturn AirportItlwm::
@@ -1727,25 +1767,30 @@ bool AirportItlwm::awdlVifRxAllowed()
 void AirportItlwm::inputAWDLActionFrame(const uint8_t *frame, size_t length,
     uint8_t channel, int rssi, uint32_t device_us)
 {
+#if BE201_AWDL_IFACE
     // HAL RX and interface teardown use this same workloop gate. No cached child pointer in HAL.
     if (!getWorkLoop() || !getWorkLoop()->inGate() || awdlStopping || awdlCreating ||
         !awdlInterface || !awdlVifRxAllowed())
         return;
     awdlInterface->inputActionFrame(frame, length, channel, rssi, device_us);
+#endif
 }
 
 // A completion made room on the radio. Same gate as receive; the wake itself only signals the queue.
 void AirportItlwm::awdlTxRoom()
 {
+#if BE201_AWDL_IFACE
     if (!getWorkLoop() || !getWorkLoop()->inGate() || awdlStopping || awdlCreating || !awdlInterface)
         return;
     awdlInterface->txRoom();
     if (llwInterface)
         llwInterface->txRoom();
+#endif
 }
 
 void AirportItlwm::awdlUmiDone(const uint8_t *mac, bool acked)
 {
+#if BE201_AWDL_IFACE
     if (!getWorkLoop() || !getWorkLoop()->inGate() || awdlStopping || awdlCreating || !awdlInterface)
         return;
     /*
@@ -1761,13 +1806,16 @@ void AirportItlwm::awdlUmiDone(const uint8_t *mac, bool acked)
     }
     setProperty("ItlwmAwdlUmiFailStreak", be201UmiFailStreak, 32);
     awdlInterface->umiDone(mac, acked);
+#endif
 }
 
 void AirportItlwm::awdlPeerCacheDone(const uint8_t *mac, bool added)
 {
+#if BE201_AWDL_IFACE
     if (!getWorkLoop() || !getWorkLoop()->inGate() || awdlStopping || awdlCreating || !awdlInterface)
         return;
     awdlInterface->peerCacheDone(mac, added);
+#endif
 }
 
 bool AirportItlwm::awdlVifRadioAllowed()
@@ -1797,11 +1845,13 @@ bool AirportItlwm::awdlVifAwAllowed()
 
 void AirportItlwm::reloadAWDLCapabilities()
 {
+#if BE201_AWDL_IFACE
     if (!fNetIf)
         return;
     loadCardCapabilities(fNetIf);
     if (const uint8_t *cache = nativeCapabilityCache())
         setProperty("ItlwmAwdlCapabilityCache", const_cast<uint8_t *>(cache), 0x18);
+#endif
 }
 
 bool AirportItlwm::awdlVifLinkAllowed()
@@ -1853,7 +1903,13 @@ void AirportItlwm::registerAWDLArmControl()
      * 1.2.15: cross-channel AirDrop on at boot, as the tool's --on (be201_awdl_xchan=0 keeps it off): link 1 on the
      * automatic second channel, and mode 4 once it is there (the driver waits for it). The RAM switches still change it.
      */
-    if (ItlAwdlFlag("be201_awdl_xchan")) {
+    /*
+     * 1.4.3, Tahoe: on by default again. 1.4.0/1.4.1 panicked on the first AWDL action frame (IO80211Buffer is
+     * virtual on 25G342, fixed in 1.4.2); the step-by-step test of 2026-11-16 17:11 on 1.4.2 (awdl-step-*.log) brought
+     * awdl0 up, received 17856 frames, discovered peers, and ran the cross-channel defaults without a panic.
+     */
+    const bool xchanDefault = ItlAwdlFlag("be201_awdl_xchan");
+    if (xchanDefault) {
         __atomic_store_n(&be201AwdlPhy2Value, 1, __ATOMIC_RELEASE);
         /*
          * IWX_AWDL_ROC_DEFAULT plus 0x380000 (1.2.24): the presence A/B of 2026-11-14 14:59 (presence-*.txt) found
@@ -1875,7 +1931,7 @@ void AirportItlwm::registerAWDLArmControl()
 // After a panic the record is still in NVRAM at this point, read only here: a panic must not repeat every boot.
 void AirportItlwm::startAWDLAuto()
 {
-    if (!awdlArmRegistered || !ItlAwdlFlag("be201_awdl_auto")) return;
+    if (!awdlArmRegistered || !ItlAwdlFlag("be201_awdl_auto")) return;  // 1.4.3: Tahoe on by default again
     if (awdlLastBootPanicked()) {
         setProperty("ItlwmAwdlAutoSkippedAfterPanic", true);
         return;
@@ -1942,6 +1998,7 @@ IOReturn AirportItlwm::createAWDLInterface(apple80211_virt_if_create_data *reque
     return _fCommandGate->runAction(createAWDLInterfaceGated, request);
 }
 
+#if BE201_AWDL_IFACE
 IOReturn AirportItlwm::createAWDLInterfaceGated(OSObject *owner, void *arg0, void *, void *, void *)
 {
     auto controller = OSDynamicCast(AirportItlwm, owner);
@@ -2149,4 +2206,13 @@ void AirportItlwm::stopAWDLInterface()
     interface->stop(this); // Idempotent if IOKit already performed stop during termination.
     interface->release();
 }
+#else
+// 1.3.0, Tahoe: no AWDL interface yet. The 25G342 IO80211 AWDL classes (virtual interface, AWDL protocol, the
+// controller's AWDL interface calls) are not ported, so the family is told the interface is unsupported.
+IOReturn AirportItlwm::createAWDLInterfaceGated(OSObject *, void *, void *, void *, void *) { return kIOReturnUnsupported; }
+IOReturn AirportItlwm::createLowLatencyInterface(AirportItlwmAWDLInterface *, const ether_addr &, char *, size_t) { return kIOReturnUnsupported; }
+IOReturn AirportItlwm::createLowLatencyInterfaceGated(OSObject *, void *, void *, void *, void *) { return kIOReturnUnsupported; }
+IOReturn AirportItlwm::takeAWDLInterfaceGated(OSObject *, void *, void *, void *, void *) { return kIOReturnUnsupported; }
+void AirportItlwm::stopAWDLInterface() {}
+#endif
 #endif

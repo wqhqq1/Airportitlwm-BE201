@@ -1750,6 +1750,7 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
     const uint8_t *hecap;
     const uint8_t *heopmode;
     const uint8_t *he_mu_edca = NULL;
+    const uint8_t *country = NULL;
     u_int16_t capinfo, bintval;
     u_int8_t chan, bchan, erp, dtim_count, dtim_period;
     int is_new;
@@ -1806,6 +1807,9 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
         switch (frm[0]) {
             case IEEE80211_ELEMID_SSID:
                 ssid = frm;
+                break;
+            case IEEE80211_ELEMID_COUNTRY:
+                country = frm;
                 break;
             case IEEE80211_ELEMID_CSA:
                 csa = frm;
@@ -1986,6 +1990,13 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
     ni->ni_dtimperiod = dtim_period;
 #ifdef AIRPORT
     ni->ni_age_ts = airport_up_time();
+    /* 1.4.4: the AP's country IE (802.11d), for the country code when the firmware reports none (ZZ). */
+    if (country && country[1] >= 2 && country[2] >= 'A' && country[2] <= 'Z' &&
+        country[3] >= 'A' && country[3] <= 'Z') {
+        ni->ni_cc[0] = country[2];
+        ni->ni_cc[1] = country[3];
+        ni->ni_cc[2] = 0;
+    }
 #endif
     
     /*

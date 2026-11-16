@@ -14,7 +14,14 @@
     "source_date_epoch": 1794647650,
     "note": "Sequoia 24G824 and 24H241: BE201 A2DP clock, identity, single-advertisement LE, address pause, LE baseline, probe and recent RPA routing; -be201btstock turns them off; Sequoia (Darwin 24) only",
     "installed_sha256": "4e2346c708f299e6cd0a53e7388f04554e93cc2b72addd55a30c0170d6af3d57",
-    "installed_version": "2.7.14"
+    "installed_version": "2.7.14",
+    "tahoe": {
+      "version": "2.9.0",
+      "source_date_epoch": 1794670262,
+      "note": "Tahoe (Darwin 25) build: upstream bluetoothd patches plus the BE201 ones ported to 25G342 (A2DP clock, identity, single advertisement, address pause, LE baseline, probe and recent-RPA routing); -be201btstock turns them off",
+      "installed_sha256": null,
+      "installed_version": null
+    }
   },
   "intelbtpatcher": {
     "bundle": "IntelBTPatcher",
@@ -23,6 +30,14 @@
     "source_date_epoch": 1794647650,
     "note": "Sequoia: BE201 switches on by default (probe, native address, LE baseline); -be201btstock turns them off; Sequoia (Darwin 24) only",
     "installed_sha256": "4aeb78e996c9adb133b99a1a1a36e299b2aa55edae136dc55230b19a21c22014",
-    "installed_version": "2.5.11"
-  }
+    "installed_version": "2.5.11",
+    "tahoe": {
+      "version": "2.7.0",
+      "source_date_epoch": 1794670262,
+      "note": "Tahoe (Darwin 25) build: IOUSBHost hooks (26.5+ pipe init signature) and the BE201 switches (probe, native address, LE baseline); -be201btstock turns them off",
+      "installed_sha256": null,
+      "installed_version": null
+    }
+  },
+  "_tahoe": "BE201_TARGET=tahoe python3 <folder>/build.py builds the Tahoe variant into build/bluetooth-tahoe; BE201BluetoothFirmware 2.5.3 is used unchanged on Tahoe (its own config entry)."
 }

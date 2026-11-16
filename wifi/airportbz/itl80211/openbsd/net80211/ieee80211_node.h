@@ -338,6 +338,7 @@ struct ieee80211_node {
 	u_int8_t		ni_erp;		/* 11g only */
 #ifdef AIRPORT
     u_int64_t       ni_age_ts;
+    u_int8_t        ni_cc[3];       /* 1.4.4: alpha-2 of the country IE, "" if none */
 #endif
 
 	/* DTIM and contention free period (CFP) */

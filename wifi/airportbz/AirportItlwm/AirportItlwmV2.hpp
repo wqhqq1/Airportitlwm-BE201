@@ -49,6 +49,10 @@ extern "C" {
 const char *convertApple80211IOCTLToString(signed int cmd);
 }
 
+// 1.3.0: the AWDL interface (AirportItlwmAWDLInterface) is built only against the macOS 15 family; the Tahoe build
+// keeps the driver's AWDL radio code but answers the family's AWDL interface requests with unsupported.
+// 1.4.0: Tahoe too (include/Airport/macOS26 IO80211VirtualInterface/AWDLProtocol, 25G342 KC layouts).
+#define BE201_AWDL_IFACE (__IO80211_TARGET == __MAC_15_2 || __IO80211_TARGET == __MAC_26_0)
 class AirportItlwmAWDLInterface;
 class AirportItlwmLowLatencyInterface;
 
@@ -319,6 +323,14 @@ public:
     UInt32 currentStatus;
     bool disassocIsVoluntary;
     char geo_location_cc[3];
+    /*
+     * 1.4.4: country IE of the network we joined. The firmware reports a country only when its own detection (LAR)
+     * finds one, and after boot on 2026-11-16 it did not (ZZ until Wi-Fi was turned off and on). AWDL reads the
+     * country when it is configured: with ZZ the iPhone never confirmed it saw the Mac and AirDrop failed with
+     * "peer not discovered"; with CN (after the Wi-Fi restart) it worked.
+     */
+    char bss_cc[3];
+    bool learnBssCountry(const uint8_t *cc);
     
     //pm
     thread_call_t powerOnThreadCall;

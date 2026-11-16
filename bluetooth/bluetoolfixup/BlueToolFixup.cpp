@@ -309,7 +309,7 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
         }
         else if (strcmp(path + dirLength, "bluetoothd") == 0) {
             observed(patchPages);
-            if (getKernelVersion() == KernelVersion::Sequoia) {
+            if (getKernelVersion() == BE201_KERNEL) {
                 auto page = static_cast<unsigned char *>(const_cast<void *>(data));
                 if(shouldPatchBE201RPARoute) {
                     uint64_t h=be201RPAPageHash(page,PAGE_SIZE),kind=be201RPAKind(h);  // 2.7.13: every ported build
@@ -353,7 +353,7 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
                     SYSLOG(MODULE_SHORT, "[BE201PEER] native connection filter list prefers observed peer address; trust unchanged");
                     observed(peerPatchHits);
                 }
-                if (shouldPatchBE201LegacyAdv && be201ApplyMasked(page, PAGE_SIZE, kBE201LegacyAdvOriginal, kBE201LegacyAdvMask, kBE201LegacyAdvPatched)) {
+                if (shouldPatchBE201LegacyAdv && be201ApplyMasked(page, PAGE_SIZE, BE201_LEGACYADV)) {
                     SYSLOG(MODULE_SHORT, "[BE201LE] selected native single-advertisement backend; HCI status unchanged");
                     observed(legacyPatchHits);
                 }
@@ -386,17 +386,17 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
 #pragma mark - Patches on start/stop
 
 static void pluginStart() {
-    patchProbeEnabled=getKernelVersion()==KernelVersion::Sequoia && be201Switch("-be201btprobe");
+    patchProbeEnabled=getKernelVersion()==BE201_KERNEL && be201Switch("-be201btprobe");
     SYSLOG(MODULE_SHORT, "start");
     // There is no point in routing cs_validate_range, because this kext should only be running on Monterey+
     if (getKernelVersion() < KernelVersion::Monterey)
         return;
     lilu.onPatcherLoadForce([](void *user, KernelPatcher &patcher) {
-        shouldPatchBE201RPARoute=getKernelVersion()==KernelVersion::Sequoia && be201Switch("-be201rparoute") && be201Switch("-be201btprobe");
-        shouldPatchBE201PrivacyProbe=!shouldPatchBE201RPARoute && getKernelVersion()==KernelVersion::Sequoia && checkKernelArgument("-be201privacyprobe") && be201Switch("-be201btprobe");
-        shouldPatchBE201AddressPause=getKernelVersion()==KernelVersion::Sequoia && be201Switch("-be201addrpause") && be201Switch("-be201leadv");
-        shouldPatchBE201LEBaseline=getKernelVersion()==KernelVersion::Sequoia && be201Switch("-be201lebaseline");
-        shouldPatchBE201PeerAddress = !shouldPatchBE201RPARoute && getKernelVersion() == KernelVersion::Sequoia && checkKernelArgument("-be201peeraddr");
+        shouldPatchBE201RPARoute=getKernelVersion()==BE201_KERNEL && be201Switch("-be201rparoute") && be201Switch("-be201btprobe");
+        shouldPatchBE201PrivacyProbe=!shouldPatchBE201RPARoute && getKernelVersion()==BE201_KERNEL && checkKernelArgument("-be201privacyprobe") && be201Switch("-be201btprobe");
+        shouldPatchBE201AddressPause=getKernelVersion()==BE201_KERNEL && be201Switch("-be201addrpause") && be201Switch("-be201leadv");
+        shouldPatchBE201LEBaseline=getKernelVersion()==BE201_KERNEL && be201Switch("-be201lebaseline");
+        shouldPatchBE201PeerAddress = !shouldPatchBE201RPARoute && getKernelVersion() == BE201_KERNEL && checkKernelArgument("-be201peeraddr");
         shouldPatchBE201LegacyAdv = be201Switch("-be201leadv");
         shouldPatchBE201Name = be201Switch("-be201identity");
         shouldPatchBE201Clock = be201Switch("-btlfxa2dpcheck");
@@ -448,8 +448,19 @@ PluginConfiguration ADDPR(config) {
     arrsize(bootargDebug),
     bootargBeta,
     arrsize(bootargBeta),
+#ifdef BE201_TAHOE
+    /*
+     * Tahoe build. 2.8.0: the upstream bluetoothd patches (vendor, chipset range, 15.4 chipset check, all found in
+     * 25G342). 2.9.0: the BE201 patches too (BE201_KERNEL): A2DP clock, identity, LE baseline, address pause and peer
+     * address match 25G342 through their masks; single advertisement through its Tahoe pattern (BE201_LEGACYADV);
+     * recent-RPA routing through the 25G342 pages (rpa-payload/port.py, quiet module).
+     */
+    KernelVersion::Tahoe,
+    KernelVersion::Tahoe,
+#else
     /* 2.7.14: a Sequoia build; Tahoe and later get stock Bluetooth until a port (its patches match 24H241 code). */
     KernelVersion::Sequoia,
     KernelVersion::Sequoia,
+#endif
     pluginStart
 };

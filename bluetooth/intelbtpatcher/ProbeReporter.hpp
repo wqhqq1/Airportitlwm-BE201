@@ -94,7 +94,7 @@ public:
         if (!IOService::start(provider)) return false;
         setProperty("VersionInfo", kextVersion);
         setProperty("BE201BLEProbeEnabled", be201ProbeEnabled);
-        setProperty("BE201LEBaselineEnabled", getKernelVersion()==KernelVersion::Sequoia && be201Switch("-be201lebaseline"));
+        setProperty("BE201LEBaselineEnabled", getKernelVersion()==BE201_KERNEL && be201Switch("-be201lebaseline"));
         setProperty("BE201BLEProbeSemantics", "Numeric USB/HCI metadata; volatile private test-address comparison; no addresses or keys exported");
         if (be201ProbeEnabled) {
             probeLoop = IOWorkLoop::workLoop();

@@ -142,6 +142,10 @@ struct mloAddrArray;
 class IO80211Controller : public IOEthernetController {
     OSDeclareAbstractStructors(IO80211Controller)
 public:
+    // Non-virtual, present in 25G342 as in 24G824. Native createPeerManager stores a role 6 interface here.
+    IO80211VirtualInterface *getAwdlInterface();
+    void setAwdlInterface(IO80211VirtualInterface *);
+    void loadCardCapabilities(IO80211SkywalkInterface *);
     IOReturn postMessage(IO80211SkywalkInterface *, unsigned int, void *, unsigned long, bool);
     virtual void _RESERVEDIONetworkController6() __asm__("__ZN19IONetworkController20allocatePacketNoWaitEj");
     virtual void _RESERVEDIONetworkController7() __asm__("__ZN19IONetworkController18setHardwareAssistsEjj");

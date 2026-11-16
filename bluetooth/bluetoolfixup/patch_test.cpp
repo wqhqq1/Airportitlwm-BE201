@@ -123,7 +123,7 @@ static void buildTest(const char *path) {
         peers+=be201ApplyMasked(b.data()+i,4096,kBE201PeerAddressOriginal,kBE201PeerAddressMask,kBE201PeerAddressPatched);
         baselines+=be201ApplyMasked(b.data()+i,4096,kBE201LEBaselineOriginal,kBE201LEBaselineMask,kBE201LEBaselinePatched);
         clocks+=be201ApplyMasked(b.data()+i,4096,kBE201ClockOriginal,kBE201ClockMask,kBE201ClockPatched);
-        adverts+=be201ApplyMasked(b.data()+i,4096,kBE201LegacyAdvOriginal,kBE201LegacyAdvMask,kBE201LegacyAdvPatched);
+        adverts+=be201ApplyMasked(b.data()+i,4096,BE201_LEGACYADV);
         names+=be201Apply(b.data()+i,4096,kBE201NameOriginal,kBE201NamePatched);
     }
     printf("  counts clock %u name %u adv %u peer %u base %u pause %u\n",clocks,names,adverts,peers,baselines,pauses);
@@ -165,7 +165,7 @@ int main(int argc,char **argv) {
     assert(argc>=2);nativeCallerTest();peerArgumentTest();nativeBaselinePredicatesTest();nativeAddressPauseTest();
     std::mt19937 mrng(213);
     maskedTest(kBE201ClockOriginal,kBE201ClockMask,kBE201ClockPatched,mrng);
-    maskedTest(kBE201LegacyAdvOriginal,kBE201LegacyAdvMask,kBE201LegacyAdvPatched,mrng);
+    maskedTest(BE201_LEGACYADV,mrng);
     maskedTest(kBE201PeerAddressOriginal,kBE201PeerAddressMask,kBE201PeerAddressPatched,mrng);
     maskedTest(kBE201LEBaselineOriginal,kBE201LEBaselineMask,kBE201LEBaselinePatched,mrng);
     maskedTest(kBE201AddressPauseOriginal,kBE201AddressPauseMask,kBE201AddressPausePatched,mrng);

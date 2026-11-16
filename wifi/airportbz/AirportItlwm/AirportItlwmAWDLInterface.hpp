@@ -1,7 +1,11 @@
 // Experimental Sequoia AWDL object. A registered, DOWN interface is not an operational AWDL link.
 #pragma once
 #include <Airport/Apple80211.h>
+#if __IO80211_TARGET == __MAC_15_2
 #include <Airport/macOS15/IO80211AWDLProtocol.h>
+#else
+#include <Airport/macOS26/IO80211AWDLProtocol.h>
+#endif
 #include "iwx_awdl_probe.h"
 class AirportItlwm;
 class IOSkywalkPacketQueue;
@@ -38,7 +42,9 @@ public:
     SInt32 setRunningState(bool) override;
     IO80211LinkState linkState() override;
     bool setLinkState(IO80211LinkState, unsigned) override;
+#if __IO80211_TARGET == __MAC_15_2
     bool setLinkState(IO80211LinkState, unsigned, bool, unsigned) override;
+#endif
     IOReturn setMacAddress(ether_addr &) override;
     IOReturn unsupported(unsigned);
     // Takes a set request without acting on it, only if the test turned that on.

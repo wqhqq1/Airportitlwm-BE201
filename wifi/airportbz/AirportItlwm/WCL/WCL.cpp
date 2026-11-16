@@ -329,6 +329,20 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
 
     if (!AirportWCL::decodeScan(request, 0x1550, scan))
         return reject(1, kIOReturnBadArgument);
+    /* Diagnostics: whether directed scans (hotspot joins) carry a name, and from which field. */
+    static uint32_t namedScans, listNamedScans;
+    if (scan.ssidLength)
+        ++namedScans;
+    if (scan.ssidSource == 2)
+        ++listNamedScans;
+    if (probeDev) {
+        probeDev->setProperty("ItlwmWclScanNamed", namedScans, 32);
+        probeDev->setProperty("ItlwmWclScanListNamed", listNamedScans, 32);
+        probeDev->setProperty("ItlwmWclScanSsidSource", (uint32_t) scan.ssidSource, 32);
+        probeDev->setProperty("ItlwmWclScanListCount", scan.ssidListCount, 32);
+        if (scan.ssidLength)
+            probeDev->setProperty("ItlwmWclScanNamedLen", scan.ssidLength, 32);
+    }
     if (!(ic->ic_if.if_flags & IFF_RUNNING))
         return reject(2, kIOReturnNotReady);
     if (joinPending)
@@ -1293,6 +1307,9 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
             break;
         case IEEE80211_EVT_STA_ASSOC_DONE:
             WCL_RSN_NOTE(ic, 19, ic->ic_assoc_status);
+            // 1.4.4: country from the joined network's beacon when the firmware has none; AWDL re-reads it.
+            if (!ic->ic_assoc_status && ic->ic_bss && instance->learnBssCountry(ic->ic_bss->ni_cc))
+                deferWCLCountryUpdate();
             if (joinPending && !assocNotified) {
                 AirportWCL::AssociationEvent event = {};
                 event.status = ic->ic_assoc_status;
